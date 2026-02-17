@@ -454,6 +454,9 @@ class RuntimeState:
         blocked_video_id: str,
         enforcement_mode: str,
     ) -> tuple[bool, str, str]:
+        latest_settings = await self.db.all_settings()
+        if not await self.monitoring_enabled_now(latest_settings):
+            return False, "Monitoring is disabled.", ""
         queue = [v for v in self.up_next_candidates.get(device_id, []) if v and v != blocked_video_id]
         if not queue:
             return await self._play_safe_from_history(
@@ -464,6 +467,9 @@ class RuntimeState:
 
         last_error = ""
         for candidate_id in queue[:12]:
+            latest_settings = await self.db.all_settings()
+            if not await self.monitoring_enabled_now(latest_settings):
+                return False, "Monitoring is disabled.", ""
             meta = await fetch_video_metadata(candidate_id)
             video_url = f"https://www.youtube.com/watch?v={candidate_id}"
             try:
@@ -570,6 +576,9 @@ class RuntimeState:
         blocked_video_id: str,
         enforcement_mode: str,
     ) -> tuple[bool, str, str]:
+        latest_settings = await self.db.all_settings()
+        if not await self.monitoring_enabled_now(latest_settings):
+            return False, "Monitoring is disabled.", ""
         rows = await self.db.recent_video_decisions(limit=500)
         candidate_ids = self._randomized_history_candidates(
             device_id=device_id,
@@ -580,6 +589,9 @@ class RuntimeState:
 
         last_error = ""
         for candidate_id in candidate_ids:
+            latest_settings = await self.db.all_settings()
+            if not await self.monitoring_enabled_now(latest_settings):
+                return False, "Monitoring is disabled.", ""
             meta = await fetch_video_metadata(candidate_id)
             video_url = f"https://www.youtube.com/watch?v={candidate_id}"
             try:
@@ -851,56 +863,65 @@ class RuntimeState:
                     if now_mono < cooldown_until:
                         action = "none"
                     else:
-                        last_try = self.block_retry_at.get(retry_key, 0.0)
-                        if now_mono - last_try < 1.5:
+                        latest_settings = await self.db.all_settings()
+                        if not await self.monitoring_enabled_now(latest_settings):
+                            logger.info(
+                                "skip intervention because monitoring disabled during analysis device=%s video=%s",
+                                device_id,
+                                video_id,
+                            )
                             action = "none"
                         else:
-                            self.block_retry_at[retry_key] = now_mono
-                            ok, skip_error, safe_video_id = await self._play_safe_from_queue(
-                                device_id=device_id,
-                                blocked_video_id=video_id,
-                                enforcement_mode=enforcement_mode,
-                            )
-                            action = "play_safe" if ok else "none"
-                            if ok:
-                                self.last_safe_play[device_id] = (safe_video_id, monotonic())
-                                self.intervention_cooldown_until[device_id] = monotonic() + 10.0
-                                logger.info(
-                                    "intervention_play_safe device=%s blocked=%s safe=%s",
-                                    device_id,
-                                    video_id,
-                                    safe_video_id,
+                            last_try = self.block_retry_at.get(retry_key, 0.0)
+                            if now_mono - last_try < 1.5:
+                                action = "none"
+                            else:
+                                self.block_retry_at[retry_key] = now_mono
+                                ok, skip_error, safe_video_id = await self._play_safe_from_queue(
+                                    device_id=device_id,
+                                    blocked_video_id=video_id,
+                                    enforcement_mode=enforcement_mode,
                                 )
-                                old_task = self.reinforce_tasks.get(device_id)
-                                if old_task and not old_task.done():
-                                    old_task.cancel()
-                                self.reinforce_tasks[device_id] = asyncio.create_task(
-                                    self._reinforce_safe_play(device_id=device_id, safe_video_id=safe_video_id),
-                                    name=f"reinforce-safe-{device_id}",
-                                )
-                                # Clear stale retry markers for this device once skip succeeded.
-                                prefix = f"{device_id}:"
-                                for key in [k for k in self.block_retry_at.keys() if k.startswith(prefix)]:
-                                    self.block_retry_at.pop(key, None)
-                                await self.emit_live(
-                                    {
-                                        "event": "intervention_play_safe",
-                                        "device_id": device_id,
-                                        "blocked_video_id": video_id,
-                                        "safe_video_id": safe_video_id,
-                                        "timestamp": utc_now_iso(),
-                                    }
-                                )
-                            elif skip_error:
-                                await self.emit_live(
-                                    {
-                                        "event": "intervention_error",
-                                        "device_id": device_id,
-                                        "video_id": video_id,
-                                        "message": skip_error,
-                                        "timestamp": utc_now_iso(),
-                                    }
-                                )
+                                action = "play_safe" if ok else "none"
+                                if ok:
+                                    self.last_safe_play[device_id] = (safe_video_id, monotonic())
+                                    self.intervention_cooldown_until[device_id] = monotonic() + 10.0
+                                    logger.info(
+                                        "intervention_play_safe device=%s blocked=%s safe=%s",
+                                        device_id,
+                                        video_id,
+                                        safe_video_id,
+                                    )
+                                    old_task = self.reinforce_tasks.get(device_id)
+                                    if old_task and not old_task.done():
+                                        old_task.cancel()
+                                    self.reinforce_tasks[device_id] = asyncio.create_task(
+                                        self._reinforce_safe_play(device_id=device_id, safe_video_id=safe_video_id),
+                                        name=f"reinforce-safe-{device_id}",
+                                    )
+                                    # Clear stale retry markers for this device once skip succeeded.
+                                    prefix = f"{device_id}:"
+                                    for key in [k for k in self.block_retry_at.keys() if k.startswith(prefix)]:
+                                        self.block_retry_at.pop(key, None)
+                                    await self.emit_live(
+                                        {
+                                            "event": "intervention_play_safe",
+                                            "device_id": device_id,
+                                            "blocked_video_id": video_id,
+                                            "safe_video_id": safe_video_id,
+                                            "timestamp": utc_now_iso(),
+                                        }
+                                    )
+                                elif skip_error:
+                                    await self.emit_live(
+                                        {
+                                            "event": "intervention_error",
+                                            "device_id": device_id,
+                                            "video_id": video_id,
+                                            "message": skip_error,
+                                            "timestamp": utc_now_iso(),
+                                        }
+                                    )
             elif should_treat_as_current:
                 action = "allow"
 
