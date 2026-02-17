@@ -553,7 +553,7 @@ class RuntimeState:
                 if candidate_id != last_choice:
                     randomized[0], randomized[idx] = randomized[idx], randomized[0]
                     break
-        last_safe = self.last_safe_play.get(device_id)
+        last_safe = getattr(self, "last_safe_play", {}).get(device_id)
         if last_safe and len(randomized) > 1:
             last_safe_id, _last_safe_ts = last_safe
             if randomized[0] == last_safe_id:
