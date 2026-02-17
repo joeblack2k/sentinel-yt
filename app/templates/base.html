@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sentinel</title>
+  <link rel="stylesheet" href="/static/styles.css?v={{ (status.build_version if status is defined else 'v1') ~ '-ui4' }}">
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Sentinel</div>
+    <nav>
+      <a href="/" class="{% if page == 'home' %}active{% endif %}">Home</a>
+      <a href="/live" class="{% if page == 'live' %}active{% endif %}">Live</a>
+      <a href="/history" class="{% if page == 'history' %}active{% endif %}">History</a>
+      <a href="/blocklist" class="{% if page == 'blocklist' %}active{% endif %}">Blocklist</a>
+      <a href="/allowlist" class="{% if page == 'allowlist' %}active{% endif %}">Allowlist</a>
+      <a href="/schedule" class="{% if page == 'schedule' %}active{% endif %}">Schedule</a>
+      <a href="/sponsorblock" class="{% if page == 'sponsorblock' %}active{% endif %}">SponsorBlock</a>
+      <a href="/devices" class="{% if page == 'devices' %}active{% endif %}">Devices</a>
+      <a href="/settings" class="{% if page == 'settings' %}active{% endif %}">Settings</a>
+      <a href="/automation" class="{% if page == 'automation' %}active{% endif %}">Automation</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="status-strip">
+      <div><strong>Active:</strong> {{ 'Yes' if status.active else 'No' }}</div>
+      <div><strong>Schedule now:</strong> {{ 'Active' if status.schedule_active_now else 'Inactive' }}</div>
+      <div><strong>Mode now:</strong> {{ status.schedule_mode_now|default('blocklist') }}</div>
+      <div><strong>Devices:</strong> {{ status.devices_connected }}/{{ status.devices_total }}</div>
+      <div><strong>Judge:</strong> {{ 'OK' if status.judge_ok else 'FAIL' }}</div>
+      <div><strong>SponsorBlock:</strong> {{ 'On' if status.sponsorblock_active else 'Off' }}</div>
+      <div class="status-timezone"><strong>TZ:</strong> <span title="{{ status.timezone }}">{{ status.timezone }}</span></div>
+      <div><strong>Build:</strong> {{ status.build_version }}</div>
+    </section>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

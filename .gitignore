@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtualenvs
+.venv/
+venv/
+
+# Test/cache
+.pytest_cache/
+.mypy_cache/
+
+# Local runtime data
+.env
+*.db
+*.sqlite
+data/
+
+# IDE/OS
+.DS_Store
+.idea/
+.vscode/
+

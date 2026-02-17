@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Live Monitor</h2>
+  <div id="live-box">
+    <p><strong>Video:</strong> <span id="live-video">-</span></p>
+    <p><strong>Title:</strong> <span id="live-title">-</span></p>
+    <p><strong>Verdict:</strong> <span id="live-verdict">-</span></p>
+    <p><strong>Reason:</strong> <span id="live-reason">-</span></p>
+    <p><strong>Action:</strong> <span id="live-action">-</span></p>
+    <p><strong>System message:</strong> <span id="live-system">-</span></p>
+    <img id="live-thumb" alt="thumbnail" class="thumb" style="display:none;" />
+  </div>
+</section>
+
+<section class="card">
+  <h2>Recent Decisions</h2>
+  <table>
+    <thead><tr><th>Time</th><th>Video</th><th>Verdict</th><th>Reason</th><th>Action</th></tr></thead>
+    <tbody id="decision-body">
+      {% for row in decisions %}
+      <tr>
+        <td>{{ row.created_at }}</td>
+        <td>{{ row.title or row.video_id }}</td>
+        <td>{{ row.verdict }}</td>
+        <td>{{ row.reason }}</td>
+        <td>{{ row.action_taken }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<script>
+  const es = new EventSource('/api/live/events');
+  es.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    if (data.event === 'now_playing' || data.event === 'up_next') {
+      document.getElementById('live-video').textContent = data.video_id || '-';
+      document.getElementById('live-title').textContent = data.title || '-';
+      document.getElementById('live-verdict').textContent = data.verdict || '-';
+      document.getElementById('live-reason').textContent = data.reason || '-';
+      document.getElementById('live-action').textContent = data.action_taken || '-';
+      document.getElementById('live-system').textContent = '-';
+      const img = document.getElementById('live-thumb');
+      if (data.thumbnail_url) {
+        img.src = data.thumbnail_url;
+        img.style.display = 'block';
+      }
+    }
+    if (data.event === 'intervention_error') {
+      document.getElementById('live-system').textContent = data.message || 'Intervention failed.';
+    }
+    if (data.event === 'sponsorblock_skip') {
+      document.getElementById('live-system').textContent = `SponsorBlock skipped ${data.segment_start?.toFixed?.(2) ?? data.segment_start}s to ${data.segment_end?.toFixed?.(2) ?? data.segment_end}s`;
+    }
+    if (data.event === 'sponsorblock_error') {
+      document.getElementById('live-system').textContent = data.message || 'SponsorBlock error.';
+    }
+    if (data.event === 'device_status') {
+      if (data.status === 'offline' && data.error) {
+        document.getElementById('live-system').textContent = data.error;
+      }
+    }
+  };
+</script>
+{% endblock %}

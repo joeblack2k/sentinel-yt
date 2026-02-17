@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Scan Network</h2>
+  <button id="scan-btn" onclick="scanDevices()">Scan Network</button>
+  <p id="scan-status" class="muted">Ready to scan.</p>
+  <p id="pair-status" class="muted"></p>
+</section>
+
+<section class="card">
+  <h2>Manual Pair (TV Code Only)</h2>
+  <p class="muted">Use this when scan does not show your TV, but YouTube displays a valid link code.</p>
+  <div class="pair-inline">
+    <input id="manual-pair-code" type="text" placeholder="Enter TV pairing code" inputmode="numeric" autocomplete="off" />
+    <button type="button" id="manual-pair-btn" onclick="pairManualCode()">Pair by Code</button>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Discovered Devices</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Type</th>
+          <th>Screen ID</th>
+          <th>Host</th>
+          <th>Pair</th>
+        </tr>
+      </thead>
+      <tbody id="discovered-body">
+        {% for d in discovered %}
+        <tr>
+          <td>
+            <div><strong>{{ d.display_name or '-' }}</strong></div>
+            {% if d.probable_apple_tv %}<span class="badge">Apple TV candidate</span>{% endif %}
+          </td>
+          <td class="cell-wrap">{{ (d.manufacturer ~ ' ' ~ d.model_name).strip() or d.server or '-' }}</td>
+          <td class="mono cell-wrap">{{ d.screen_id or '-' }}</td>
+          <td class="cell-wrap">{{ d.host or d.location }}</td>
+          <td>
+            <div class="pair-inline">
+              <input type="text" placeholder="Pairing code" class="pair-code" inputmode="numeric" autocomplete="off" />
+              <button type="button" onclick="pairFromRow('{{ d.device_ref }}', this)">Pair</button>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Paired Devices</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>Name</th><th>Screen ID</th><th>Status</th><th>Error</th></tr></thead>
+      <tbody>
+        {% for d in devices %}
+        <tr>
+          <td>{{ d.id }}</td>
+          <td>{{ d.name }}</td>
+          <td class="mono cell-wrap">{{ d.screen_id }}</td>
+          <td>{{ d.status }}</td>
+          <td class="cell-wrap">{{ d.last_error }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+const discoveredInitial = {{ discovered|tojson }};
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function renderDiscovered(devices) {
+  const body = document.getElementById('discovered-body');
+  if (!devices || !devices.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">No DIAL devices found.</td></tr>';
+    return;
+  }
+
+  body.innerHTML = devices.map((d) => {
+    const displayName = escapeHtml(d.display_name || '-');
+    const type = escapeHtml(((d.manufacturer || '') + ' ' + (d.model_name || '')).trim() || d.server || '-');
+    const screenId = escapeHtml(d.screen_id || '-');
+    const host = escapeHtml(d.host || d.location || '-');
+    const badge = d.probable_apple_tv ? '<span class="badge">Apple TV candidate</span>' : '';
+    const deviceRef = escapeHtml(d.device_ref || '');
+    return `
+      <tr>
+        <td><div><strong>${displayName}</strong></div>${badge}</td>
+        <td class="cell-wrap">${type}</td>
+        <td class="mono cell-wrap">${screenId}</td>
+        <td class="cell-wrap">${host}</td>
+        <td>
+          <div class="pair-inline">
+            <input type="text" placeholder="Pairing code" class="pair-code" inputmode="numeric" autocomplete="off" />
+            <button type="button" onclick="pairFromRow('${deviceRef}', this)">Pair</button>
+          </div>
+        </td>
+      </tr>`;
+  }).join('');
+}
+
+async function readApiError(resp, fallbackMessage) {
+  const raw = await resp.text();
+  if (!raw) {
+    return fallbackMessage;
+  }
+  try {
+    const payload = JSON.parse(raw);
+    const detail = payload?.detail ?? payload;
+    if (typeof detail === 'string') return detail;
+    if (detail?.message) return detail.message;
+    if (Array.isArray(detail)) {
+      const msgs = detail.map((x) => x?.msg || x?.message || '').filter(Boolean);
+      if (msgs.length) return msgs.join('; ');
+    }
+    return raw;
+  } catch (_err) {
+    return raw;
+  }
+}
+
+async function scanDevices() {
+  const btn = document.getElementById('scan-btn');
+  const status = document.getElementById('scan-status');
+  const pairStatus = document.getElementById('pair-status');
+  btn.disabled = true;
+  btn.textContent = 'Scanning...';
+  status.textContent = 'Scanning network for YouTube lounge devices...';
+  pairStatus.textContent = '';
+
+  try {
+    const r = await fetch('/api/devices/scan', {method:'POST'});
+    if (!r.ok) {
+      const msg = await readApiError(r, 'Scan failed due to a server error.');
+      status.textContent = 'Scan failed: ' + msg;
+      return;
+    }
+    const data = await r.json();
+    renderDiscovered(data.devices || []);
+    status.textContent = `Scan complete: ${data.count || 0} device(s) found at ${data.scanned_at || ''}.`;
+  } catch (err) {
+    status.textContent = 'Scan failed: ' + (err?.message || err);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Scan Network';
+  }
+}
+
+async function pairFromRow(deviceRef, buttonEl) {
+  const pairStatus = document.getElementById('pair-status');
+  const row = buttonEl.closest('tr');
+  const input = row ? row.querySelector('.pair-code') : null;
+  const pairingCode = (input?.value || '').trim();
+  pairStatus.textContent = '';
+
+  if (!pairingCode) {
+    pairStatus.textContent = 'Enter the pairing code shown on the TV first.';
+    pairStatus.style.color = '#8a3a1c';
+    input?.focus();
+    return;
+  }
+
+  const normalizedCode = pairingCode.replace(/\D+/g, '');
+  if (normalizedCode.length < 6) {
+    pairStatus.textContent = 'The pairing code looks too short. Use the full code shown on the TV screen.';
+    pairStatus.style.color = '#8a3a1c';
+    input?.focus();
+    return;
+  }
+
+  buttonEl.disabled = true;
+  const oldLabel = buttonEl.textContent;
+  buttonEl.textContent = 'Pairing...';
+  pairStatus.textContent = 'Submitting pairing code...';
+  pairStatus.style.color = '#5f6d6f';
+
+  try {
+    const payload = { device_ref: deviceRef, pairing_code: normalizedCode };
+    const r = await fetch('/api/devices/pair', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const msg = await readApiError(r, 'Pairing failed. Please try again.');
+      pairStatus.textContent = msg;
+      pairStatus.style.color = '#8a3a1c';
+      return;
+    }
+    const data = await r.json();
+    const pairedName = data?.name || 'TV';
+    const extra = data?.warning ? ` (${data.warning})` : '';
+    pairStatus.textContent = `Paired successfully with ${pairedName}.${extra}`;
+    pairStatus.style.color = '#0e5f5f';
+    location.reload();
+  } catch (err) {
+    pairStatus.textContent = 'Pairing request failed due to a network error. Check connection and try again.';
+    pairStatus.style.color = '#8a3a1c';
+  } finally {
+    buttonEl.disabled = false;
+    buttonEl.textContent = oldLabel;
+  }
+}
+
+async function pairManualCode() {
+  const pairStatus = document.getElementById('pair-status');
+  const input = document.getElementById('manual-pair-code');
+  const buttonEl = document.getElementById('manual-pair-btn');
+  const pairingCode = (input?.value || '').trim();
+  pairStatus.textContent = '';
+
+  if (!pairingCode) {
+    pairStatus.textContent = 'Enter the pairing code shown on the TV first.';
+    pairStatus.style.color = '#8a3a1c';
+    input?.focus();
+    return;
+  }
+  const normalizedCode = pairingCode.replace(/\D+/g, '');
+  if (normalizedCode.length < 6) {
+    pairStatus.textContent = 'The pairing code looks too short. Use the full code shown on the TV screen.';
+    pairStatus.style.color = '#8a3a1c';
+    input?.focus();
+    return;
+  }
+
+  buttonEl.disabled = true;
+  const oldLabel = buttonEl.textContent;
+  buttonEl.textContent = 'Pairing...';
+  pairStatus.textContent = 'Submitting pairing code...';
+  pairStatus.style.color = '#5f6d6f';
+
+  try {
+    const r = await fetch('/api/devices/pair/code', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ pairing_code: normalizedCode }),
+    });
+    if (!r.ok) {
+      const msg = await readApiError(r, 'Pairing failed. Please try again.');
+      pairStatus.textContent = msg;
+      pairStatus.style.color = '#8a3a1c';
+      return;
+    }
+    const data = await r.json();
+    const pairedName = data?.name || 'TV';
+    const extra = data?.warning ? ` (${data.warning})` : '';
+    pairStatus.textContent = `Paired successfully with ${pairedName}.${extra}`;
+    pairStatus.style.color = '#0e5f5f';
+    location.reload();
+  } catch (_err) {
+    pairStatus.textContent = 'Pairing request failed due to a network error. Check connection and try again.';
+    pairStatus.style.color = '#8a3a1c';
+  } finally {
+    buttonEl.disabled = false;
+    buttonEl.textContent = oldLabel;
+  }
+}
+
+renderDiscovered(discoveredInitial);
+</script>
+{% endblock %}

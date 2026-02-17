@@ -1,0 +1,268 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Policy Toggles (Prompt Add-ons)</h2>
+  <p class="muted">Enable strict categories to force stronger blocking behavior in Gemini decisions.</p>
+  <form id="policy-form">
+    <div class="policy-grid">
+      {% for preset in policy_presets %}
+      <label class="policy-item">
+        <input
+          type="checkbox"
+          data-policy-key="{{ preset.key }}"
+          {% if policy_flags.get(preset.key) %}checked{% endif %}
+        >
+        <span>
+          <strong>{{ preset.label }}</strong><br>
+          <span class="muted">{{ preset.description }}</span>
+        </span>
+      </label>
+      {% endfor %}
+    </div>
+    <div class="inline-actions" style="margin-top:10px;">
+      <button type="button" class="small-btn" onclick="setAllPolicies(true)">Enable All</button>
+      <button type="button" class="small-btn" onclick="setAllPolicies(false)">Disable All</button>
+      <button type="submit">Save Policy Toggles</button>
+    </div>
+  </form>
+  <p id="policy-status" class="muted"></p>
+</section>
+
+<section class="card">
+  <h2>Recent Blocked Videos (Last 10)</h2>
+  <table>
+    <thead><tr><th>Time</th><th>Video</th><th>Source</th><th>Action</th></tr></thead>
+    <tbody>
+      {% for row in blocked_recent %}
+      <tr>
+        <td>{{ row.created_at }}</td>
+        <td>
+          {% if row.video_id %}
+          <a class="small-link" href="https://www.youtube.com/watch?v={{ row.video_id }}" target="_blank" rel="noopener noreferrer">{{ row.title or row.video_id }}</a>
+          {% else %}
+          {{ row.title }}
+          {% endif %}
+        </td>
+        <td>{{ row.source }}</td>
+        <td>{{ row.action_taken }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>Blocklist Sources (Adblock-style)</h2>
+  <p class="muted">Large lists are loaded in-memory for fast O(1) lookups. Share raw TXT/GitHub URLs here.</p>
+  <table>
+    <tbody>
+      <tr><th>Entries</th><td>{{ blocklist_summary.entries_count }}</td></tr>
+      <tr><th>Videos</th><td>{{ blocklist_summary.video_count }}</td></tr>
+      <tr><th>Channels</th><td>{{ blocklist_summary.channel_count }}</td></tr>
+      <tr><th>Loaded at</th><td>{{ blocklist_summary.loaded_at or '-' }}</td></tr>
+      <tr><th>Local file</th><td><code>{{ blocklist_summary.local_path }}</code></td></tr>
+    </tbody>
+  </table>
+
+  <form id="sources-form">
+    <label>Raw source URLs (one per line)
+      <textarea name="urls" rows="5">{% for s in blocklist_sources %}{{ s }}
+{% endfor %}</textarea>
+    </label>
+    <div class="inline-actions">
+      <button type="submit">Save Sources</button>
+      <button type="button" class="small-btn" onclick="reloadBlocklists()">Reload Sources</button>
+    </div>
+  </form>
+
+  <form id="local-blocklist-form">
+    <label>Local custom blocklist file (editable)
+      <textarea name="content" rows="14">{{ local_blocklist_content }}</textarea>
+    </label>
+    <button type="submit">Save Local Blocklist</button>
+  </form>
+  <p id="blocklist-status" class="muted"></p>
+</section>
+
+<section class="card">
+  <h2>Add Rule</h2>
+  <div class="grid2">
+    <form id="wl-form">
+      <h3>Whitelist</h3>
+      <label>Scope
+        <select name="scope">
+          <option value="video">video</option>
+          <option value="channel">channel</option>
+        </select>
+      </label>
+      <label>Video ID <input name="video_id"></label>
+      <label>Channel ID <input name="channel_id"></label>
+      <label>Label/Comment <input name="label" placeholder="Optional human title"></label>
+      <label>Link <input name="url" placeholder="https://www.youtube.com/..."></label>
+      <button type="submit">Add to Whitelist</button>
+    </form>
+
+    <form id="bl-form">
+      <h3>Blacklist</h3>
+      <label>Scope
+        <select name="scope">
+          <option value="video">video</option>
+          <option value="channel">channel</option>
+        </select>
+      </label>
+      <label>Video ID <input name="video_id"></label>
+      <label>Channel ID <input name="channel_id"></label>
+      <label>Label/Comment <input name="label" placeholder="Optional human title"></label>
+      <label>Link <input name="url" placeholder="https://www.youtube.com/..."></label>
+      <button type="submit">Add to Blacklist</button>
+    </form>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Current Rules (latest 200)</h2>
+  <table>
+    <thead><tr><th>ID</th><th>Type</th><th>Scope</th><th>Value</th><th>Label</th><th>Link</th><th>Source</th><th>Created</th><th>Action</th></tr></thead>
+    <tbody>
+      {% for rule in rules %}
+      <tr>
+        <td>{{ rule.id }}</td>
+        <td>{{ rule.rule_type }}</td>
+        <td>{{ rule.scope }}</td>
+        <td>{{ rule.value }}</td>
+        <td>{{ rule.label }}</td>
+        <td>
+          {% if rule.url %}
+            <a class="small-link" href="{{ rule.url }}" target="_blank" rel="noopener noreferrer">Open</a>
+          {% endif %}
+        </td>
+        <td>{{ rule.source_list }}</td>
+        <td>{{ rule.created_at }}</td>
+        <td><button onclick="deleteRule({{ rule.id }})">Delete</button></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<script>
+function collectPolicyFlags() {
+  const out = {};
+  document.querySelectorAll('#policy-form input[type=checkbox][data-policy-key]').forEach((cb) => {
+    out[cb.dataset.policyKey] = cb.checked;
+  });
+  return out;
+}
+
+function setAllPolicies(value) {
+  document.querySelectorAll('#policy-form input[type=checkbox][data-policy-key]').forEach((cb) => {
+    cb.checked = value;
+  });
+}
+
+document.getElementById('policy-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const status = document.getElementById('policy-status');
+  status.textContent = 'Saving policy toggles...';
+  status.style.color = '#5f6d6f';
+  const payload = {flags: collectPolicyFlags()};
+  const r = await fetch('/api/rules/policies', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  if (!r.ok) {
+    status.textContent = 'Failed to save policy toggles: ' + await r.text();
+    status.style.color = '#8a3a1c';
+    return;
+  }
+  status.textContent = 'Policy toggles saved.';
+  status.style.color = '#0e5f5f';
+});
+
+async function postRule(url, formId) {
+  const f = document.getElementById(formId);
+  const fd = new FormData(f);
+  const payload = {
+    scope: fd.get('scope'),
+    video_id: fd.get('video_id') || null,
+    channel_id: fd.get('channel_id') || null,
+    label: fd.get('label') || null,
+    url: fd.get('url') || null,
+  };
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  if (!r.ok) alert(await r.text());
+  else location.reload();
+}
+
+document.getElementById('wl-form').addEventListener('submit', (e) => { e.preventDefault(); postRule('/api/rules/whitelist', 'wl-form'); });
+document.getElementById('bl-form').addEventListener('submit', (e) => { e.preventDefault(); postRule('/api/rules/blacklist', 'bl-form'); });
+
+async function deleteRule(id) {
+  const r = await fetch('/api/rules/' + id, {method:'DELETE'});
+  if (!r.ok) alert(await r.text());
+  else location.reload();
+}
+
+async function saveSources() {
+  const status = document.getElementById('blocklist-status');
+  const fd = new FormData(document.getElementById('sources-form'));
+  const urls = String(fd.get('urls') || '').split('\n').map(x => x.trim()).filter(Boolean);
+  status.textContent = 'Saving sources...';
+  status.style.color = '#5f6d6f';
+  const r = await fetch('/api/rules/blocklists/sources', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({urls}),
+  });
+  if (!r.ok) {
+    status.textContent = await r.text();
+    status.style.color = '#8a3a1c';
+    return;
+  }
+  status.textContent = 'Sources saved and reloaded.';
+  status.style.color = '#0e5f5f';
+  location.reload();
+}
+
+async function reloadBlocklists() {
+  const status = document.getElementById('blocklist-status');
+  status.textContent = 'Reloading...';
+  status.style.color = '#5f6d6f';
+  const r = await fetch('/api/rules/blocklists/reload', {method:'POST'});
+  if (!r.ok) {
+    status.textContent = await r.text();
+    status.style.color = '#8a3a1c';
+    return;
+  }
+  status.textContent = 'Reload complete.';
+  status.style.color = '#0e5f5f';
+  location.reload();
+}
+
+async function saveLocalBlocklist() {
+  const status = document.getElementById('blocklist-status');
+  const fd = new FormData(document.getElementById('local-blocklist-form'));
+  status.textContent = 'Saving local blocklist...';
+  status.style.color = '#5f6d6f';
+  const r = await fetch('/api/rules/blocklists/local', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({content: fd.get('content') || ''}),
+  });
+  if (!r.ok) {
+    status.textContent = await r.text();
+    status.style.color = '#8a3a1c';
+    return;
+  }
+  status.textContent = 'Local blocklist saved and loaded.';
+  status.style.color = '#0e5f5f';
+}
+
+document.getElementById('sources-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  await saveSources();
+});
+
+document.getElementById('local-blocklist-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  await saveLocalBlocklist();
+});
+</script>
+{% endblock %}

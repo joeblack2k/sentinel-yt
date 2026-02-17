@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Schedule Windows</h2>
+  <p class="muted">
+    Add one or more schedule windows. Each window controls enforcement mode:
+    <strong>Block blocklist</strong> or <strong>Allow allowlist</strong>.
+  </p>
+</section>
+
+<section class="card">
+  <h2>Add Schedule</h2>
+  <form id="add-schedule-form">
+    <label>Name <input name="name" value="Schedule"></label>
+    <label>Enabled
+      <select name="enabled">
+        <option value="true" selected>true</option>
+        <option value="false">false</option>
+      </select>
+    </label>
+    <label>Start <input name="start" value="07:00"></label>
+    <label>End <input name="end" value="19:00"></label>
+    <label>Timezone
+      <select name="timezone">
+        {% for tz in timezones %}
+          <option value="{{ tz }}" {% if status.timezone == tz %}selected{% endif %}>{{ tz }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Mode
+      <select name="mode">
+        <option value="blocklist">Block blocklist</option>
+        <option value="whitelist">Allow allowlist</option>
+      </select>
+    </label>
+    <button type="submit">Add Schedule</button>
+  </form>
+  <p id="schedule-add-status" class="muted"></p>
+</section>
+
+<section class="card">
+  <h2>Current Schedules</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Name</th>
+        <th>Enabled</th>
+        <th>Start</th>
+        <th>End</th>
+        <th>Timezone</th>
+        <th>Mode</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in schedules %}
+      <tr>
+        <td>{{ row.id }}</td>
+        <td><input id="name-{{ row.id }}" value="{{ row.name }}"></td>
+        <td>
+          <select id="enabled-{{ row.id }}">
+            <option value="true" {% if row.enabled %}selected{% endif %}>true</option>
+            <option value="false" {% if not row.enabled %}selected{% endif %}>false</option>
+          </select>
+        </td>
+        <td><input id="start-{{ row.id }}" value="{{ row.start }}"></td>
+        <td><input id="end-{{ row.id }}" value="{{ row.end }}"></td>
+        <td>
+          <select id="timezone-{{ row.id }}">
+            {% for tz in timezones %}
+              <option value="{{ tz }}" {% if row.timezone == tz %}selected{% endif %}>{{ tz }}</option>
+            {% endfor %}
+          </select>
+        </td>
+        <td>
+          <select id="mode-{{ row.id }}">
+            <option value="blocklist" {% if row.mode == 'blocklist' %}selected{% endif %}>Block blocklist</option>
+            <option value="whitelist" {% if row.mode == 'whitelist' %}selected{% endif %}>Allow allowlist</option>
+          </select>
+        </td>
+        <td class="inline-actions">
+          <button class="small-btn" onclick="saveSchedule({{ row.id }})">Save</button>
+          <button class="small-btn" onclick="deleteSchedule({{ row.id }})">Remove</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p id="schedule-table-status" class="muted"></p>
+</section>
+
+<script>
+document.getElementById('add-schedule-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const status = document.getElementById('schedule-add-status');
+  const fd = new FormData(e.target);
+  const payload = {
+    name: fd.get('name') || 'Schedule',
+    enabled: fd.get('enabled') === 'true',
+    start: fd.get('start'),
+    end: fd.get('end'),
+    timezone: fd.get('timezone'),
+    mode: fd.get('mode'),
+  };
+  status.textContent = 'Adding schedule...';
+  status.style.color = '#5f6d6f';
+  const r = await fetch('/api/schedules/add', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    status.textContent = await r.text();
+    status.style.color = '#8a3a1c';
+    return;
+  }
+  location.reload();
+});
+
+async function saveSchedule(id) {
+  const status = document.getElementById('schedule-table-status');
+  const payload = {
+    name: document.getElementById(`name-${id}`).value || 'Schedule',
+    enabled: document.getElementById(`enabled-${id}`).value === 'true',
+    start: document.getElementById(`start-${id}`).value,
+    end: document.getElementById(`end-${id}`).value,
+    timezone: document.getElementById(`timezone-${id}`).value,
+    mode: document.getElementById(`mode-${id}`).value,
+  };
+  status.textContent = `Saving schedule #${id}...`;
+  status.style.color = '#5f6d6f';
+  const r = await fetch(`/api/schedules/${id}/update`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    status.textContent = await r.text();
+    status.style.color = '#8a3a1c';
+    return;
+  }
+  status.textContent = `Schedule #${id} saved.`;
+  status.style.color = '#0e5f5f';
+}
+
+async function deleteSchedule(id) {
+  const status = document.getElementById('schedule-table-status');
+  status.textContent = `Removing schedule #${id}...`;
+  status.style.color = '#5f6d6f';
+  const r = await fetch(`/api/schedules/${id}`, {method: 'DELETE'});
+  if (!r.ok) {
+    status.textContent = await r.text();
+    status.style.color = '#8a3a1c';
+    return;
+  }
+  location.reload();
+}
+</script>
+{% endblock %}

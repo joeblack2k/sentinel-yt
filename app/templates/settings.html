@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Global State</h2>
+  <button onclick="setActive(true)">Activate</button>
+  <button onclick="setActive(false)">Deactivate</button>
+</section>
+
+<section class="card">
+  <h2>Schedule</h2>
+  <p class="muted">Schedule management moved to the dedicated Schedule tab.</p>
+  <a href="/schedule">Open Schedule Tab</a>
+</section>
+
+<section class="card">
+  <h2>Gemini Runtime Key (Optional Override)</h2>
+  <form id="gemini-form">
+    <label>Gemini enabled
+      <select name="enabled">
+        <option value="true" {% if gemini_enabled %}selected{% endif %}>true</option>
+        <option value="false" {% if not gemini_enabled %}selected{% endif %}>false</option>
+      </select>
+    </label>
+    <label>API key
+      <input name="api_key" type="password" placeholder="optional runtime key">
+    </label>
+    <button type="submit">Save Runtime Key</button>
+  </form>
+  <p class="muted">When disabled, Sentinel uses local rules + blocklists only (no Gemini token usage).</p>
+</section>
+
+<section class="card">
+  <h2>Failure Webhook</h2>
+  <form id="webhook-form">
+    <label>Webhook URL
+      <input name="failure_webhook_url" value="{{ settings.failure_webhook_url }}" placeholder="http://homeassistant.local/api/webhook/...">
+    </label>
+    <button type="submit">Save Webhook</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Filter Brain (System Prompt)</h2>
+  <p>The text below controls Sentinel behavior. JSON output format is always enforced and cannot be removed.</p>
+  <p class="muted">
+    Current source:
+    {% if is_using_default_prompt %}
+      Safe default prompt
+    {% else %}
+      Custom prompt
+    {% endif %}
+  </p>
+  <form id="prompt-form">
+    <label>Editable Base Prompt (what Sentinel uses before policy addons)
+      <textarea name="custom_prompt" rows="14">{{ base_prompt }}</textarea>
+    </label>
+    <label>Effective Prompt Preview (base + policy addons + locked JSON contract)
+      <textarea rows="14" readonly>{{ effective_prompt }}</textarea>
+    </label>
+    <label>Locked JSON Contract
+      <textarea rows="4" readonly>{{ output_contract }}</textarea>
+    </label>
+    <button type="submit">Save Prompt</button>
+  </form>
+  <button type="button" onclick="resetPrompt()">Reset to Default</button>
+</section>
+
+<section class="card">
+  <h2>Database</h2>
+  <table>
+    <tbody>
+      <tr><th>SQLite file</th><td>{{ db_stats.db_file_bytes }} bytes</td></tr>
+      <tr><th>WAL file</th><td>{{ db_stats.wal_file_bytes }} bytes</td></tr>
+      <tr><th>Total size</th><td>{{ db_stats.total_bytes }} bytes</td></tr>
+      <tr><th>Cached Gemini decisions</th><td>{{ db_stats.analysis_cache }}</td></tr>
+      <tr><th>History rows</th><td>{{ db_stats.video_decisions }}</td></tr>
+      <tr><th>Rules rows</th><td>{{ db_stats.rules }}</td></tr>
+    </tbody>
+  </table>
+  <div class="inline-actions">
+    <button type="button" class="small-btn" onclick="purgeDb('analysis_cache')">Purge Gemini Cache</button>
+    <button type="button" class="small-btn" onclick="purgeDb('history')">Purge History</button>
+  </div>
+  <p id="db-status" class="muted"></p>
+</section>
+
+<script>
+async function setActive(active) {
+  const r = await fetch('/api/control/state', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({active})});
+  if (!r.ok) alert(await r.text());
+  else location.reload();
+}
+
+document.getElementById('gemini-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const r = await fetch('/api/settings/gemini', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      api_key: fd.get('api_key') || '',
+      enabled: fd.get('enabled') === 'true'
+    })
+  });
+  if (!r.ok) alert(await r.text());
+  else location.reload();
+});
+
+document.getElementById('webhook-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const r = await fetch('/api/settings/webhook', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({failure_webhook_url: fd.get('failure_webhook_url') || ''})});
+  if (!r.ok) alert(await r.text());
+  else alert('Saved');
+});
+
+document.getElementById('prompt-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const r = await fetch('/api/settings/prompt', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({custom_prompt: fd.get('custom_prompt') || ''})});
+  if (!r.ok) alert(await r.text());
+  else alert('Saved');
+});
+
+async function resetPrompt() {
+  const r = await fetch('/api/settings/prompt/reset', {method:'POST'});
+  if (!r.ok) alert(await r.text());
+  else location.reload();
+}
+
+async function purgeDb(target) {
+  const status = document.getElementById('db-status');
+  status.textContent = 'Purging...';
+  status.style.color = '#5f6d6f';
+  const r = await fetch('/api/admin/purge', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({target})
+  });
+  if (!r.ok) {
+    status.textContent = await r.text();
+    status.style.color = '#8a3a1c';
+    return;
+  }
+  const data = await r.json();
+  status.textContent = `Purge done. Deleted rows: ${data.deleted}`;
+  status.style.color = '#0e5f5f';
+  location.reload();
+}
+</script>
+{% endblock %}

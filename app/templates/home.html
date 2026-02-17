@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% block content %}
+{% set totals = dashboard.totals %}
+{% set total = totals.total_count %}
+{% set allow_count = totals.allow_count %}
+{% set block_count = totals.block_count %}
+{% set allow_pct = ((allow_count * 100.0) / total) if total else 0 %}
+{% set source_totals = dashboard.source_breakdown | map(attribute='total') | list %}
+{% set source_max = (source_totals | max) if source_totals else 1 %}
+{% set trend_totals = dashboard.trend | map(attribute='total') | list %}
+{% set trend_max = (trend_totals | max) if trend_totals else 1 %}
+
+<section class="card home-hero">
+  <div class="hero-grid">
+    <div class="hero-art">
+      <img
+        src="/static/images/sentinel-hero-v5.png?v=20260217e"
+        alt="Sentinel guardian character"
+        class="hero-image"
+        onerror="this.onerror=null;this.src='/static/images/sentinel-hero.svg';"
+      >
+    </div>
+    <div>
+      <p class="home-eyebrow">YouTube AI Guardian</p>
+      <h2>Sentinel Mission Control</h2>
+      <p>
+        Sentinel watches YouTube sessions in real time, applies your family policy, and intervenes when needed.
+        Think of it as an adblocker-style safety dashboard for kid viewing behavior.
+      </p>
+      <div class="inline-actions">
+        <a class="small-btn" href="/live">Open Live Monitor</a>
+        <a class="small-btn" href="/history">Review History</a>
+        <a class="small-btn" href="/settings">Tune Policy Brain</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="home-kpi-grid">
+  <article class="card kpi-card">
+    <p class="kpi-label">Videos Reviewed</p>
+    <p class="kpi-value">{{ total }}</p>
+    <p class="muted">All-time decisions</p>
+  </article>
+  <article class="card kpi-card">
+    <p class="kpi-label">Blocked</p>
+    <p class="kpi-value">{{ block_count }}</p>
+    <p class="muted">{{ totals.block_rate_percent }}% of all reviewed videos</p>
+  </article>
+  <article class="card kpi-card">
+    <p class="kpi-label">Allowed</p>
+    <p class="kpi-value">{{ allow_count }}</p>
+    <p class="muted">Passed by rules, policy, or Gemini</p>
+  </article>
+  <article class="card kpi-card">
+    <p class="kpi-label">Unique Videos</p>
+    <p class="kpi-value">{{ totals.unique_videos }}</p>
+    <p class="muted">Distinct video IDs seen</p>
+  </article>
+  <article class="card kpi-card">
+    <p class="kpi-label">SponsorBlock Skips</p>
+    <p class="kpi-value">{{ totals.sponsorblock_ok }}</p>
+    <p class="muted">{{ totals.sponsorblock_total }} attempts total</p>
+  </article>
+  <article class="card kpi-card">
+    <p class="kpi-label">Rule Engine</p>
+    <p class="kpi-value">{{ totals.rule_blacklist_count }}/{{ totals.rule_whitelist_count }}</p>
+    <p class="muted">Blacklist / Whitelist entries</p>
+  </article>
+</section>
+
+<section class="chart-grid">
+  <article class="card">
+    <h2>Allow vs Block</h2>
+    <div class="donut-wrap">
+      <div class="home-donut" style="--allow-pct: {{ '%.2f'|format(allow_pct) }}%;">
+        <div class="home-donut-center">
+          <strong>{{ total }}</strong>
+          <span>Total</span>
+        </div>
+      </div>
+      <div class="donut-legend">
+        <div><span class="swatch swatch-allow"></span> Allow: {{ allow_count }}</div>
+        <div><span class="swatch swatch-block"></span> Block: {{ block_count }}</div>
+      </div>
+    </div>
+  </article>
+
+  <article class="card">
+    <h2>Decision Sources</h2>
+    {% if dashboard.source_breakdown %}
+      <div class="source-bars">
+        {% for row in dashboard.source_breakdown %}
+          {% set width_pct = ((row.total * 100.0) / source_max) if source_max else 0 %}
+          <div class="source-row">
+            <div class="source-label">{{ row.source }}</div>
+            <div class="source-track">
+              <div class="source-fill" style="width: {{ '%.1f'|format(width_pct) }}%;">
+                <span>{{ row.total }}</span>
+              </div>
+            </div>
+            <div class="source-meta">A {{ row.allow_count }} / B {{ row.block_count }}</div>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="muted">No source data yet. Start watching and Sentinel will populate this chart.</p>
+    {% endif %}
+  </article>
+</section>
+
+<section class="card">
+  <h2>Last 7 Days</h2>
+  <div class="trend-bars">
+    {% for row in dashboard.trend %}
+      {% set allow_h = ((row.allow_count * 100.0) / trend_max) if trend_max else 0 %}
+      {% set block_h = ((row.block_count * 100.0) / trend_max) if trend_max else 0 %}
+      <div class="trend-day">
+        <div class="trend-columns">
+          <div class="trend-col allow" style="height: {{ '%.1f'|format(allow_h) }}%;" title="Allow: {{ row.allow_count }}"></div>
+          <div class="trend-col block" style="height: {{ '%.1f'|format(block_h) }}%;" title="Block: {{ row.block_count }}"></div>
+        </div>
+        <div class="trend-label">{{ row.day[5:] }}</div>
+      </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="grid2">
+  <article class="card">
+    <h2>Top Blocked Videos</h2>
+    {% if dashboard.top_blocked %}
+      <table>
+        <thead><tr><th>Video</th><th>Hits</th></tr></thead>
+        <tbody>
+          {% for row in dashboard.top_blocked %}
+          <tr>
+            <td>
+              {% if row.url %}
+              <a class="small-link" href="{{ row.url }}" target="_blank" rel="noopener noreferrer">{{ row.title }}</a>
+              {% else %}
+              {{ row.title }}
+              {% endif %}
+            </td>
+            <td>{{ row.block_count }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">Nothing blocked yet.</p>
+    {% endif %}
+  </article>
+
+  <article class="card">
+    <h2>About Sentinel</h2>
+    <p>
+      Sentinel was built as a strict but flexible digital nanny for Apple TV YouTube sessions.
+      It combines realtime lounge monitoring, optional Gemini analysis, and local rule lists so you can choose
+      between AI-driven decisions and deterministic block/allow controls.
+    </p>
+    <p>
+      The goal is simple: less algorithmic junk, fewer harmful surprises, and clearer control for parents.
+      You decide the policy, Sentinel enforces it.
+    </p>
+    <p class="muted">
+      Database size: {{ db_stats.total_bytes }} bytes (decisions: {{ db_stats.video_decisions }}, cache: {{ db_stats.analysis_cache }})
+    </p>
+  </article>
+</section>
+{% endblock %}

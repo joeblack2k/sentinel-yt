@@ -1,0 +1,198 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="sponsorblock-page compact-ui">
+  <section class="card sb-hero">
+    <div class="sb-hero-copy">
+      <h1>SponsorBlock</h1>
+      <p class="muted">Runs independently from Sentinel filtering. This module only skips known sponsor segments.</p>
+      <p id="sb-status" class="muted"></p>
+    </div>
+    <div class="sb-hero-meta">
+      <div class="sb-meta-item">
+        <span class="sb-meta-label">Remote release until</span>
+        <code>{{ settings.sponsorblock_release_until or '-' }}</code>
+      </div>
+      <div class="sb-meta-item">
+        <span class="sb-meta-label">Webhook</span>
+        <code>POST /api/webhook/sponsorblock/release</code>
+      </div>
+    </div>
+  </section>
+
+  <div class="sb-grid">
+    <section class="card sb-card">
+      <h2>SponsorBlock Control</h2>
+      <form id="sb-state-form" class="sb-form-inline">
+        <label>Enabled
+          <select name="active">
+            <option value="true" {% if settings.sponsorblock_active == 'true' %}selected{% endif %}>true</option>
+            <option value="false" {% if settings.sponsorblock_active != 'true' %}selected{% endif %}>false</option>
+          </select>
+        </label>
+        <button type="submit">Save State</button>
+      </form>
+    </section>
+
+    <section class="card sb-card">
+      <h2>Schedule</h2>
+      <p class="muted">SponsorBlock schedule only.</p>
+      <form id="sb-schedule-form" class="sb-form-grid">
+        <label>Schedule enabled
+          <select name="enabled">
+            <option value="true" {% if settings.sponsorblock_schedule_enabled == 'true' %}selected{% endif %}>true</option>
+            <option value="false" {% if settings.sponsorblock_schedule_enabled != 'true' %}selected{% endif %}>false</option>
+          </select>
+        </label>
+        <label>Timezone
+          <select name="timezone" class="tz-select sb-tz-select">
+            {% for tz in timezones %}
+              <option value="{{ tz }}" {% if settings.sponsorblock_timezone == tz %}selected{% endif %}>{{ tz }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Start
+          <input name="start" value="{{ settings.sponsorblock_schedule_start }}">
+        </label>
+        <label>End
+          <input name="end" value="{{ settings.sponsorblock_schedule_end }}">
+        </label>
+        <button type="submit">Save Schedule</button>
+      </form>
+    </section>
+
+    <section class="card sb-card">
+      <h2>Temporary Remote Release</h2>
+      <p class="muted">Disable skip/seek interventions for Shorts or manual watching.</p>
+      <form id="sb-release-form" class="sb-form-inline">
+        <label>Minutes
+          <input type="number" min="0" max="240" name="minutes" value="10">
+        </label>
+        <button type="submit">Set Release</button>
+        <button type="button" class="small-btn" onclick="clearRelease()">Clear</button>
+      </form>
+      <p class="muted">Payload example: <code>{"minutes":15,"source":"home_assistant","reason":"shorts"}</code></p>
+    </section>
+
+    <section class="card sb-card">
+      <h2>Skip Config</h2>
+      <form id="sb-config-form" class="sb-form-stack">
+        <label>Categories (comma separated)
+          <input name="categories" value="{{ categories|join(',') }}">
+        </label>
+        <label>Minimum segment length (seconds)
+          <input name="min_length_seconds" type="number" min="0" max="30" step="0.1" value="{{ settings.sponsorblock_min_length_seconds or '1.0' }}">
+        </label>
+        <button type="submit">Save Config</button>
+      </form>
+    </section>
+  </div>
+
+  <section class="card sb-table-card">
+    <h2>Recent SponsorBlock Actions</h2>
+    <div class="table-wrap">
+      <table class="compact-table">
+        <thead><tr><th>Time</th><th>Device</th><th>Video</th><th>Segment</th><th>Category</th><th>Action</th><th>Status</th><th>Error</th></tr></thead>
+        <tbody>
+          {% for row in actions %}
+          <tr>
+            <td>{{ row.created_at }}</td>
+            <td>{{ row.device_id }}</td>
+            <td>
+              {% if row.video_id %}
+              <a class="small-link" href="https://www.youtube.com/watch?v={{ row.video_id }}" target="_blank" rel="noopener noreferrer">{{ row.title or row.video_id }}</a>
+              {% else %}
+              {{ row.title }}
+              {% endif %}
+            </td>
+            <td>{{ '%.2f'|format(row.segment_start or 0) }} - {{ '%.2f'|format(row.segment_end or 0) }}</td>
+            <td>{{ row.category }}</td>
+            <td>{{ row.action_taken }}</td>
+            <td>{{ row.status }}</td>
+            <td>{{ row.error }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+async function postJson(url, payload) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const txt = await r.text();
+  if (!r.ok) throw new Error(txt || 'Request failed');
+  try { return JSON.parse(txt); } catch { return {ok:true}; }
+}
+
+function setStatus(msg, ok=true) {
+  const el = document.getElementById('sb-status');
+  el.textContent = msg;
+  el.style.color = ok ? '#0e5f5f' : '#8a3a1c';
+}
+
+document.getElementById('sb-state-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  try {
+    await postJson('/api/sponsorblock/state', {active: fd.get('active') === 'true'});
+    setStatus('SponsorBlock state saved.');
+    location.reload();
+  } catch (err) {
+    setStatus('Failed to save state: ' + err.message, false);
+  }
+});
+
+document.getElementById('sb-schedule-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  try {
+    await postJson('/api/sponsorblock/schedule', {
+      enabled: fd.get('enabled') === 'true',
+      start: fd.get('start'),
+      end: fd.get('end'),
+      timezone: fd.get('timezone'),
+    });
+    setStatus('SponsorBlock schedule saved.');
+  } catch (err) {
+    setStatus('Failed to save schedule: ' + err.message, false);
+  }
+});
+
+document.getElementById('sb-release-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const minutes = Number(fd.get('minutes') || 0);
+  try {
+    await postJson('/api/sponsorblock/release', {minutes, reason: 'manual release', source: 'dashboard'});
+    setStatus(minutes > 0 ? `Remote release enabled for ${minutes} minutes.` : 'Remote release cleared.');
+    location.reload();
+  } catch (err) {
+    setStatus('Failed to set release: ' + err.message, false);
+  }
+});
+
+async function clearRelease() {
+  try {
+    await postJson('/api/sponsorblock/release', {minutes: 0, reason: 'manual clear', source: 'dashboard'});
+    setStatus('Remote release cleared.');
+    location.reload();
+  } catch (err) {
+    setStatus('Failed to clear release: ' + err.message, false);
+  }
+}
+
+document.getElementById('sb-config-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const categories = String(fd.get('categories') || '').split(',').map(x => x.trim()).filter(Boolean);
+  const minLen = Number(fd.get('min_length_seconds') || 1.0);
+  try {
+    await postJson('/api/sponsorblock/config', {categories, min_length_seconds: minLen});
+    setStatus('SponsorBlock config saved.');
+  } catch (err) {
+    setStatus('Failed to save config: ' + err.message, false);
+  }
+});
+</script>
+{% endblock %}

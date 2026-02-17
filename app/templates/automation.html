@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>Automation Endpoints</h2>
+  <ul>
+    <li><code>POST /api/control/state</code> payload: <code>{"active": true|false}</code></li>
+    <li><code>GET /api/status</code></li>
+    <li><code>POST /api/webhook/control</code> payload: <code>{"active": true|false, "source":"home_assistant"}</code></li>
+    <li><code>POST /api/webhook/sponsorblock/state</code> payload: <code>{"active": true|false, "source":"home_assistant"}</code></li>
+    <li><code>POST /api/webhook/sponsorblock/release</code> payload: <code>{"minutes": 15, "source":"home_assistant", "reason":"shorts"}</code></li>
+  </ul>
+  <p>Webhook security mode for v1: LAN trust only.</p>
+</section>
+{% endblock %}

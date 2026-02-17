@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 720" role="img" aria-labelledby="title desc">
+  <title id="title">Sentinel Guardian</title>
+  <desc id="desc">Stylized guardian shield placeholder for Sentinel homepage.</desc>
+  <defs>
+    <linearGradient id="cloak" x1="0" x2="1">
+      <stop offset="0%" stop-color="#103d68"/>
+      <stop offset="100%" stop-color="#2f74a8"/>
+    </linearGradient>
+    <linearGradient id="plate" x1="0" x2="1">
+      <stop offset="0%" stop-color="#a8f1f1"/>
+      <stop offset="100%" stop-color="#7cd3ff"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="720" height="720" fill="none"/>
+
+  <g transform="translate(120 65)">
+    <path d="M160 585 C95 545 70 486 70 404 L70 216 C70 96 141 20 240 20 C339 20 410 96 410 216 L410 404 C410 486 385 545 320 585 Z"
+      fill="url(#cloak)" stroke="#0d2a49" stroke-width="8"/>
+    <circle cx="240" cy="140" r="68" fill="#e5c2a4" stroke="#7c4e3a" stroke-width="6"/>
+    <path d="M180 120 C196 84 284 84 300 120" fill="none" stroke="#5d3a2c" stroke-width="16" stroke-linecap="round"/>
+    <rect x="155" y="210" width="170" height="230" rx="20" fill="#1b4f7d" stroke="#8cb7d6" stroke-width="4"/>
+
+    <g transform="translate(300 210)">
+      <rect x="0" y="0" width="210" height="290" rx="22" fill="url(#plate)" stroke="#4ba4c8" stroke-width="6"/>
+      <circle cx="105" cy="120" r="48" fill="none" stroke="#d14f52" stroke-width="12"/>
+      <line x1="70" y1="120" x2="140" y2="120" stroke="#d14f52" stroke-width="12" stroke-linecap="round"/>
+      <line x1="105" y1="85" x2="105" y2="155" stroke="#d14f52" stroke-width="12" stroke-linecap="round"/>
+      <path d="M56 238 L154 238" stroke="#3f89b0" stroke-width="9" stroke-linecap="round"/>
+    </g>
+
+    <g opacity="0.86">
+      <polygon points="545,235 566,248 551,271 529,258" fill="#49e2a3"/>
+      <polygon points="574,282 598,288 590,312 567,305" fill="#e6c05f"/>
+      <polygon points="530,294 548,307 535,326 518,312" fill="#bd7fff"/>
+    </g>
+  </g>
+</svg>

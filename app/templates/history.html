@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>History</h2>
+  <p class="muted">Showing page {{ pager.page }} of {{ pager.page_count }} (max 500 rows retained in UI).</p>
+  <p id="history-rule-status" class="muted"></p>
+  <table>
+    <thead><tr><th>Time</th><th>Device</th><th>Video</th><th>Links</th><th>Verdict</th><th>Confidence</th><th>Reason</th><th>Action</th><th>Rules</th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>{{ row.created_at }}</td>
+        <td>{{ row.device_id }}</td>
+        <td>{{ row.title or row.video_id }}</td>
+        <td>
+          <div class="inline-actions">
+            {% if row.video_id %}
+            <a class="small-link" href="https://www.youtube.com/watch?v={{ row.video_id }}" target="_blank" rel="noopener noreferrer">Watch</a>
+            {% endif %}
+            {% if row.channel_id %}
+            <a class="small-link" href="https://www.youtube.com/channel/{{ row.channel_id }}" target="_blank" rel="noopener noreferrer">Channel</a>
+            {% endif %}
+          </div>
+        </td>
+        <td>{{ row.verdict }}</td>
+        <td>{{ row.confidence }}</td>
+        <td>{{ row.reason }}</td>
+        <td>{{ row.action_taken }}</td>
+        <td>
+          <div class="inline-actions">
+              <button
+                type="button"
+                class="small-btn"
+                onclick="addBlacklist('video', '{{ row.video_id }}', '{{ row.channel_id or '' }}', {{ (row.title or row.video_id or '')|tojson }})"
+                {% if not row.video_id %}disabled{% endif %}
+              >
+                Blacklist Video
+              </button>
+              <button
+                type="button"
+                class="small-btn"
+                onclick="addBlacklist('channel', '{{ row.video_id }}', '{{ row.channel_id or '' }}', {{ (row.title or row.video_id or '')|tojson }})"
+                {% if not row.channel_id %}disabled{% endif %}
+              >
+                Blacklist Channel
+              </button>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <div class="inline-actions">
+    {% if pager.has_prev %}
+      <a class="small-btn" href="/history?page={{ pager.page - 1 }}">Previous</a>
+    {% endif %}
+    {% for p in range(1, pager.page_count + 1) %}
+      {% if p <= 10 %}
+        <a class="small-btn {% if p == pager.page %}active{% endif %}" href="/history?page={{ p }}">{{ p }}</a>
+      {% endif %}
+    {% endfor %}
+    {% if pager.has_next %}
+      <a class="small-btn" href="/history?page={{ pager.page + 1 }}">Next</a>
+    {% endif %}
+  </div>
+</section>
+
+<script>
+async function addBlacklist(scope, videoId, channelId, title) {
+  const status = document.getElementById('history-rule-status');
+  const payload = {
+    scope,
+    video_id: scope === 'video' ? (videoId || '') : '',
+    channel_id: scope === 'channel' ? (channelId || '') : '',
+    label: title || '',
+    url: scope === 'video'
+      ? (videoId ? `https://www.youtube.com/watch?v=${videoId}` : '')
+      : (channelId ? `https://www.youtube.com/channel/${channelId}` : ''),
+  };
+
+  if (scope === 'video' && !payload.video_id) {
+    status.textContent = 'Video ID is missing for this history row.';
+    status.style.color = '#8a3a1c';
+    return;
+  }
+  if (scope === 'channel' && !payload.channel_id) {
+    status.textContent = 'Channel ID is missing for this history row.';
+    status.style.color = '#8a3a1c';
+    return;
+  }
+
+  status.textContent = 'Saving blacklist rule...';
+  status.style.color = '#5f6d6f';
+  try {
+    const r = await fetch('/api/rules/blacklist', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const msg = await r.text();
+      status.textContent = `Failed to save blacklist rule: ${msg}`;
+      status.style.color = '#8a3a1c';
+      return;
+    }
+    status.textContent = `Blacklist ${scope} rule saved.`;
+    status.style.color = '#0e5f5f';
+  } catch (err) {
+    status.textContent = 'Network error while saving blacklist rule.';
+    status.style.color = '#8a3a1c';
+  }
+}
+</script>
+{% endblock %}

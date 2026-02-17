@@ -1,0 +1,15 @@
+services:
+  sentinel:
+    image: sentinel:latest
+    container_name: sentinel
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SENTINEL_PORT: ${SENTINEL_PORT:-8090}
+      SENTINEL_DB_PATH: /data/sentinel.db
+      SENTINEL_BUILD_VERSION: ${SENTINEL_BUILD_VERSION:-v1}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./data:/data
