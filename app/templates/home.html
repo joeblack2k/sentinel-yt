@@ -27,6 +27,22 @@
         Sentinel watches YouTube sessions in real time, applies your family policy, and intervenes when needed.
         Think of it as an adblocker-style safety dashboard for kid viewing behavior.
       </p>
+      <div class="card home-master-control">
+        <h3>Master Power</h3>
+        <p class="muted">
+          Configured Sentinel state:
+          <strong id="home-active-value">{{ 'ON' if status.active else 'OFF' }}</strong>
+          <span class="muted">| Effective now:</span>
+          <strong id="home-effective-value">{{ 'ON' if status.monitoring_effective else 'OFF' }}</strong>
+        </p>
+        <div class="inline-actions">
+          <button id="home-active-on" type="button" class="small-btn" onclick="setSentinelActive(true)">Turn ON</button>
+          <button id="home-active-off" type="button" class="small-btn" onclick="setSentinelActive(false)">Turn OFF</button>
+          <button id="home-sb-on" type="button" class="small-btn" onclick="setSponsorBlockActive(true)">SponsorBlock ON</button>
+          <button id="home-sb-off" type="button" class="small-btn" onclick="setSponsorBlockActive(false)">SponsorBlock OFF</button>
+        </div>
+        <p id="home-active-status" class="muted"></p>
+      </div>
       <div class="inline-actions">
         <a class="small-btn" href="/live">Open Live Monitor</a>
         <a class="small-btn" href="/history">Review History</a>
@@ -168,4 +184,90 @@
     </p>
   </article>
 </section>
+<script>
+async function postJson(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    let message = `HTTP ${r.status}`;
+    try {
+      const payload = await r.json();
+      if (payload?.detail?.message) message = payload.detail.message;
+      else if (payload?.message) message = payload.message;
+      else message = JSON.stringify(payload);
+    } catch (_) {
+      message = await r.text();
+    }
+    throw new Error(message || 'Request failed');
+  }
+  return await r.json();
+}
+
+function setHomeButtonsBusy(busy) {
+  for (const id of ['home-active-on', 'home-active-off', 'home-sb-on', 'home-sb-off']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = busy;
+  }
+}
+
+async function refreshHomeStatusFromApi() {
+  try {
+    const statusResp = await fetch('/api/status', {cache: 'no-store'});
+    if (!statusResp.ok) return;
+    const status = await statusResp.json();
+    const configured = document.getElementById('home-active-value');
+    const effective = document.getElementById('home-effective-value');
+    if (configured) configured.textContent = status.active ? 'ON' : 'OFF';
+    if (effective) effective.textContent = status.monitoring_effective ? 'ON' : 'OFF';
+  } catch (_) {
+    // no-op; local status label already updated from POST response
+  }
+}
+
+async function setSentinelActive(active) {
+  const status = document.getElementById('home-active-status');
+  const label = document.getElementById('home-active-value');
+  const effective = document.getElementById('home-effective-value');
+  status.textContent = 'Saving Sentinel state...';
+  status.style.color = '#5f6d6f';
+  setHomeButtonsBusy(true);
+  try {
+    const data = await postJson('/api/control/state', {active});
+    label.textContent = data.active ? 'ON' : 'OFF';
+    if (effective) effective.textContent = data.monitoring_effective ? 'ON' : 'OFF';
+    status.textContent = `Sentinel configured state is now ${data.active ? 'ON' : 'OFF'}.`;
+    status.style.color = '#0e5f5f';
+    await refreshHomeStatusFromApi();
+    setTimeout(() => location.reload(), 350);
+  } catch (err) {
+    status.textContent = `Failed to change Sentinel state: ${err.message}`;
+    status.style.color = '#8a3a1c';
+  } finally {
+    setHomeButtonsBusy(false);
+  }
+}
+
+async function setSponsorBlockActive(active) {
+  const status = document.getElementById('home-active-status');
+  status.textContent = 'Saving SponsorBlock state...';
+  status.style.color = '#5f6d6f';
+  setHomeButtonsBusy(true);
+  try {
+    const data = await postJson('/api/sponsorblock/state', {active});
+    const effectiveText = data.effective_active ? 'ON' : 'OFF';
+    status.textContent = `SponsorBlock configured: ${data.active ? 'ON' : 'OFF'} (effective now: ${effectiveText}).`;
+    status.style.color = '#0e5f5f';
+    await refreshHomeStatusFromApi();
+    setTimeout(() => location.reload(), 350);
+  } catch (err) {
+    status.textContent = `Failed to change SponsorBlock state: ${err.message}`;
+    status.style.color = '#8a3a1c';
+  } finally {
+    setHomeButtonsBusy(false);
+  }
+}
+</script>
 {% endblock %}

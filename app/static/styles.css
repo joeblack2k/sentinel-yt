@@ -329,6 +329,21 @@ button:hover { background: var(--accent-dark); }
   margin-bottom: 10px;
 }
 
+.home-master-control {
+  margin: 8px 0;
+  background: #f8fcfc;
+  border: 1px dashed #9fc6c6;
+}
+
+.home-master-control h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.home-master-control .inline-actions {
+  margin: 6px 0;
+}
+
 .kpi-card {
   margin-bottom: 0;
 }
@@ -651,6 +666,51 @@ button:hover { background: var(--accent-dark); }
   white-space: normal;
 }
 
+.mqtt-page {
+  display: grid;
+  gap: 10px;
+}
+
+.mqtt-page .card {
+  padding: 10px;
+  margin-bottom: 0;
+}
+
+.mqtt-page h1 {
+  margin: 0 0 6px;
+  font-size: 1.2rem;
+}
+
+.mqtt-page h2 {
+  margin: 0 0 6px;
+  font-size: 1rem;
+}
+
+.mqtt-page p {
+  margin: 4px 0;
+}
+
+.mqtt-page .muted {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.mqtt-page .sb-form-grid {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(170px, 1fr));
+}
+
+.mqtt-page .compact-table {
+  table-layout: auto;
+  font-size: 11px;
+}
+
+.mqtt-page .compact-table th,
+.mqtt-page .compact-table td {
+  padding: 4px 5px;
+}
+
 @media (max-width: 700px) {
   .topbar { display:block; }
   .topbar nav { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
@@ -686,6 +746,14 @@ button:hover { background: var(--accent-dark); }
   }
   .sponsorblock-page button,
   .sponsorblock-page .small-btn {
+    width: 100%;
+    min-width: 0;
+  }
+  .mqtt-page .sb-form-grid {
+    grid-template-columns: 1fr;
+  }
+  .mqtt-page .small-btn,
+  .mqtt-page button {
     width: 100%;
     min-width: 0;
   }

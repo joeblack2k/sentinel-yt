@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="mqtt-page compact-ui">
+  <section class="card">
+    <h1>MQTT Bridge</h1>
+    <p>
+      Publish Sentinel switches and sensors to Home Assistant using MQTT Discovery.
+      This enables native HA entities for Sentinel active state, SponsorBlock state, counters, and health.
+    </p>
+    <p class="muted">
+      Bridge status:
+      <strong>{{ 'Connected' if mqtt.connected else ('Enabled (not connected)' if mqtt.enabled else 'Disabled') }}</strong>
+      {% if mqtt.last_error %}
+      <br>{{ mqtt.last_error }}
+      {% endif %}
+    </p>
+    <div class="inline-actions">
+      <button type="button" class="small-btn" onclick="setMqttEnabled(true)">Enable MQTT</button>
+      <button type="button" class="small-btn" onclick="setMqttEnabled(false)">Disable MQTT</button>
+      <button type="button" class="small-btn" onclick="publishMqttNow()">Publish Discovery + State Now</button>
+    </div>
+    <p id="mqtt-status" class="muted"></p>
+  </section>
+
+  <section class="card">
+    <h2>Broker Settings</h2>
+    <form id="mqtt-config-form" class="sb-form-grid">
+      <label>Enabled
+        <select name="enabled">
+          <option value="true" {% if settings.get('mqtt_enabled', 'false') == 'true' %}selected{% endif %}>true</option>
+          <option value="false" {% if settings.get('mqtt_enabled', 'false') != 'true' %}selected{% endif %}>false</option>
+        </select>
+      </label>
+      <label>Host
+        <input name="host" value="{{ settings.get('mqtt_host', '') }}" placeholder="192.168.2.2 or mqtt.local">
+      </label>
+      <label>Port
+        <input name="port" type="number" min="1" max="65535" value="{{ settings.get('mqtt_port', '1883') }}">
+      </label>
+      <label>Username
+        <input name="username" value="{{ settings.get('mqtt_username', '') }}" placeholder="optional">
+      </label>
+      <label>Password
+        <input name="password" type="password" value="{{ settings.get('mqtt_password', '') }}" placeholder="optional">
+      </label>
+      <label>Base topic
+        <input name="base_topic" value="{{ settings.get('mqtt_base_topic', 'sentinel') }}" placeholder="sentinel">
+      </label>
+      <label>Discovery prefix
+        <input name="discovery_prefix" value="{{ settings.get('mqtt_discovery_prefix', 'homeassistant') }}" placeholder="homeassistant">
+      </label>
+      <label>Retain
+        <select name="retain">
+          <option value="true" {% if settings.get('mqtt_retain', 'true') == 'true' %}selected{% endif %}>true</option>
+          <option value="false" {% if settings.get('mqtt_retain', 'true') != 'true' %}selected{% endif %}>false</option>
+        </select>
+      </label>
+      <label>TLS
+        <select name="tls">
+          <option value="false" {% if settings.get('mqtt_tls', 'false') != 'true' %}selected{% endif %}>false</option>
+          <option value="true" {% if settings.get('mqtt_tls', 'false') == 'true' %}selected{% endif %}>true</option>
+        </select>
+      </label>
+      <label>Publish interval (seconds)
+        <input name="publish_interval_seconds" type="number" min="5" max="3600" value="{{ settings.get('mqtt_publish_interval_seconds', '30') }}">
+      </label>
+      <button type="submit">Save MQTT Settings</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Home Assistant Topics</h2>
+    <table class="compact-table">
+      <tbody>
+        <tr><th>Base topic</th><td><code>{{ mqtt.base_topic }}</code></td></tr>
+        <tr><th>Discovery prefix</th><td><code>{{ mqtt.discovery_prefix }}</code></td></tr>
+        <tr><th>Sentinel command topic</th><td><code>{{ mqtt.command_topics.active }}</code></td></tr>
+        <tr><th>SponsorBlock command topic</th><td><code>{{ mqtt.command_topics.sponsorblock_active }}</code></td></tr>
+        <tr><th>Remote release command topic</th><td><code>{{ mqtt.command_topics.remote_release_minutes }}</code></td></tr>
+        <tr><th>State branch</th><td><code>{{ mqtt.base_topic }}/state/*</code></td></tr>
+      </tbody>
+    </table>
+    <p class="muted">
+      Auto-created HA entities include switches for Sentinel and SponsorBlock, plus sensors like blocked_today, allowed_today,
+      reviewed_today, blocked_7d, allowed_7d, reviewed_7d, devices_connected, devices_total, schedule_mode, schedule_active,
+      judge_ok, db_size_bytes, release_minutes, timezone, build_version, and last_error.
+    </p>
+  </section>
+</div>
+
+<script>
+async function readApiError(resp, fallbackMessage) {
+  try {
+    const payload = await resp.json();
+    if (payload?.detail?.message) return payload.detail.message;
+    if (payload?.message) return payload.message;
+    return JSON.stringify(payload);
+  } catch (_) {
+    return fallbackMessage;
+  }
+}
+
+function setMqttStatus(text, ok = true) {
+  const el = document.getElementById('mqtt-status');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = ok ? '#0e5f5f' : '#8a3a1c';
+}
+
+async function postJson(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    throw new Error(await readApiError(r, `HTTP ${r.status}`));
+  }
+  return await r.json();
+}
+
+async function setMqttEnabled(enabled) {
+  setMqttStatus('Saving MQTT state...', true);
+  try {
+    await postJson('/api/mqtt/state', {enabled});
+    setMqttStatus(`MQTT ${enabled ? 'enabled' : 'disabled'}.`, true);
+    setTimeout(() => location.reload(), 350);
+  } catch (err) {
+    setMqttStatus(`Failed to update MQTT state: ${err.message}`, false);
+  }
+}
+
+async function publishMqttNow() {
+  setMqttStatus('Publishing MQTT discovery/state...', true);
+  try {
+    await postJson('/api/mqtt/publish', {});
+    setMqttStatus('MQTT discovery/state published.', true);
+  } catch (err) {
+    setMqttStatus(`Failed to publish MQTT state: ${err.message}`, false);
+  }
+}
+
+document.getElementById('mqtt-config-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  setMqttStatus('Saving MQTT configuration...', true);
+  const fd = new FormData(e.target);
+  const payload = {
+    enabled: fd.get('enabled') === 'true',
+    host: (fd.get('host') || '').toString(),
+    port: Number(fd.get('port') || 1883),
+    username: (fd.get('username') || '').toString(),
+    password: (fd.get('password') || '').toString(),
+    base_topic: (fd.get('base_topic') || 'sentinel').toString(),
+    discovery_prefix: (fd.get('discovery_prefix') || 'homeassistant').toString(),
+    retain: fd.get('retain') === 'true',
+    tls: fd.get('tls') === 'true',
+    publish_interval_seconds: Number(fd.get('publish_interval_seconds') || 30),
+  };
+  try {
+    await postJson('/api/mqtt/config', payload);
+    setMqttStatus('MQTT settings saved.', true);
+    setTimeout(() => location.reload(), 350);
+  } catch (err) {
+    setMqttStatus(`Failed to save MQTT settings: ${err.message}`, false);
+  }
+});
+</script>
+{% endblock %}

@@ -49,6 +49,23 @@ class SponsorBlockReleaseRequest(BaseModel):
     source: str = "dashboard"
 
 
+class MqttStateRequest(BaseModel):
+    enabled: bool
+
+
+class MqttConfigRequest(BaseModel):
+    enabled: bool = False
+    host: str = ""
+    port: int = Field(default=1883, ge=1, le=65535)
+    username: str = ""
+    password: str = ""
+    base_topic: str = "sentinel"
+    discovery_prefix: str = "homeassistant"
+    retain: bool = True
+    tls: bool = False
+    publish_interval_seconds: int = Field(default=30, ge=5, le=3600)
+
+
 class PairDeviceRequest(BaseModel):
     device_ref: str
     pairing_code: str = Field(min_length=4, max_length=32)

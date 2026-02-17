@@ -22,6 +22,9 @@ def test_api_status_and_control(tmp_path, monkeypatch):
         control = client.post("/api/control/state", json={"active": False})
         assert control.status_code == 200
         assert control.json()["active"] is False
+        status_after = client.get("/api/status")
+        assert status_after.status_code == 200
+        assert status_after.json()["active"] is False
 
 
 def test_api_sponsorblock_and_blocklists(tmp_path, monkeypatch):
@@ -68,6 +71,28 @@ def test_api_sponsorblock_and_blocklists(tmp_path, monkeypatch):
             },
         )
         assert add_schedule.status_code == 200
+
+        mqtt_cfg = client.post(
+            "/api/mqtt/config",
+            json={
+                "enabled": False,
+                "host": "",
+                "port": 1883,
+                "username": "",
+                "password": "",
+                "base_topic": "sentinel",
+                "discovery_prefix": "homeassistant",
+                "retain": True,
+                "tls": False,
+                "publish_interval_seconds": 30,
+            },
+        )
+        assert mqtt_cfg.status_code == 200
+        assert mqtt_cfg.json()["ok"] is True
+
+        mqtt_state = client.post("/api/mqtt/state", json={"enabled": False})
+        assert mqtt_state.status_code == 200
+        assert mqtt_state.json()["ok"] is True
 
 
 def test_api_manual_pair_validation_message(tmp_path, monkeypatch):
