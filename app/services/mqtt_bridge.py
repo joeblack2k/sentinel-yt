@@ -260,6 +260,7 @@ class MQTTBridge:
         except Exception:
             payload = ""
         topic = str(getattr(msg, "topic", "") or "")
+        retained = bool(getattr(msg, "retain", False))
         commands = self.command_topics()
         command_name = ""
         if topic == commands["active"]:
@@ -269,6 +270,11 @@ class MQTTBridge:
         elif topic == commands["remote_release_minutes"]:
             command_name = "remote_release_minutes"
         if not command_name:
+            return
+        # Ignore retained commands to avoid replaying stale ON/OFF actions on reconnect.
+        if retained:
+            return
+        if not payload:
             return
 
         if self._loop is not None:

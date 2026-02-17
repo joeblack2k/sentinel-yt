@@ -86,6 +86,9 @@ class RuntimeState:
     up_next_candidates: dict[int, list[str]] = field(default_factory=dict)
     reinforce_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     last_history_choice: dict[int, str] = field(default_factory=dict)
+    last_safe_play: dict[int, tuple[str, float]] = field(default_factory=dict)
+    device_event_locks: dict[int, asyncio.Lock] = field(default_factory=dict)
+    intervention_cooldown_until: dict[int, float] = field(default_factory=dict)
     mqtt_publish_due_at: float = 0.0
 
     async def emit_live(self, payload: dict[str, Any]) -> None:
@@ -245,16 +248,19 @@ class RuntimeState:
 
     async def set_monitoring_active(self, active: bool) -> None:
         await self._set_bool_setting_confirmed("active", active)
+        logger.info("monitoring_active updated to %s", active)
         if not active:
             await self._cancel_reinforce_tasks()
             self.block_retry_at.clear()
             self.up_next_candidates.clear()
+            self.intervention_cooldown_until.clear()
         await self.db.set_setting("last_error", "")
         await self.sync_workers()
         await self.publish_mqtt_snapshot()
 
     async def set_sponsorblock_active(self, active: bool) -> None:
         await self._set_bool_setting_confirmed("sponsorblock_active", active)
+        logger.info("sponsorblock_active updated to %s", active)
         await self.sync_workers()
         await self.publish_mqtt_snapshot()
 
@@ -547,6 +553,14 @@ class RuntimeState:
                 if candidate_id != last_choice:
                     randomized[0], randomized[idx] = randomized[idx], randomized[0]
                     break
+        last_safe = self.last_safe_play.get(device_id)
+        if last_safe and len(randomized) > 1:
+            last_safe_id, _last_safe_ts = last_safe
+            if randomized[0] == last_safe_id:
+                for idx, candidate_id in enumerate(randomized):
+                    if candidate_id != last_safe_id:
+                        randomized[0], randomized[idx] = randomized[idx], randomized[0]
+                        break
         return randomized
 
     async def _play_safe_from_history(
@@ -615,6 +629,7 @@ class RuntimeState:
             ok, err = await self.lounge.play_video(device_id, candidate_id)
             if ok:
                 self.last_history_choice[device_id] = candidate_id
+                self.last_safe_play[device_id] = (candidate_id, monotonic())
                 return True, "", candidate_id
             last_error = err or "TV refused to play known-safe history video."
 
@@ -624,7 +639,7 @@ class RuntimeState:
 
     async def _reinforce_safe_play(self, *, device_id: int, safe_video_id: str) -> None:
         # Some TV clients ignore the first override while user-initiated playback is still settling.
-        for delay in (1.0, 3.0):
+        for delay in (2.0,):
             await asyncio.sleep(delay)
             settings_map = await self.db.all_settings()
             if not await self.monitoring_enabled_now(settings_map):
@@ -633,6 +648,7 @@ class RuntimeState:
                 return
             ok, _err = await self.lounge.play_video(device_id, safe_video_id)
             if ok:
+                self.last_safe_play[device_id] = (safe_video_id, monotonic())
                 await self.emit_live(
                     {
                         "event": "intervention_play_safe_reinforce",
@@ -727,182 +743,197 @@ class RuntimeState:
         if et not in {"now_playing", "up_next"}:
             return
 
-        await self.process_sponsorblock_event(event)
-
-        settings_map = await self.db.all_settings()
-        monitoring = await self.monitoring_enabled_now(settings_map)
-        if not monitoring:
-            return
-
         device_id = int(event["device_id"])
         video_id = str(event.get("video_id", "")).strip()
         if not video_id:
             return
-        if et == "up_next":
-            self._remember_up_next_candidate(device_id, video_id)
 
-        inferred_now_playing = False
-        now_mono = monotonic()
-        if et == "now_playing":
-            prev_now = self.last_now_playing_video.get(device_id)
-            if prev_now and prev_now[0] == video_id and (now_mono - prev_now[1]) < 5.0:
+        await self.process_sponsorblock_event(event)
+
+        lock = self.device_event_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            settings_map = await self.db.all_settings()
+            monitoring = await self.monitoring_enabled_now(settings_map)
+            if not monitoring:
                 return
-            self.last_now_playing_video[device_id] = (video_id, now_mono)
-            self.last_now_playing_at[device_id] = now_mono
-            self.up_next_repeat.pop(device_id, None)
-            self._drop_candidate(device_id, video_id)
-        else:
-            prev_video, prev_count = self.up_next_repeat.get(device_id, ("", 0))
-            if prev_video == video_id:
-                prev_count += 1
+
+            if et == "up_next":
+                self._remember_up_next_candidate(device_id, video_id)
+
+            inferred_now_playing = False
+            now_mono = monotonic()
+            if et == "now_playing":
+                prev_now = self.last_now_playing_video.get(device_id)
+                if prev_now and prev_now[0] == video_id and (now_mono - prev_now[1]) < 5.0:
+                    return
+                self.last_now_playing_video[device_id] = (video_id, now_mono)
+                self.last_now_playing_at[device_id] = now_mono
+                self.up_next_repeat.pop(device_id, None)
+                self._drop_candidate(device_id, video_id)
             else:
-                prev_count = 1
-            self.up_next_repeat[device_id] = (video_id, prev_count)
-            recent_now_playing = (now_mono - self.last_now_playing_at.get(device_id, 0.0)) < 4.0
-            inferred_now_playing = (not recent_now_playing) and prev_count >= 2
+                prev_video, prev_count = self.up_next_repeat.get(device_id, ("", 0))
+                if prev_video == video_id:
+                    prev_count += 1
+                else:
+                    prev_count = 1
+                self.up_next_repeat[device_id] = (video_id, prev_count)
+                recent_now_playing = (now_mono - self.last_now_playing_at.get(device_id, 0.0)) < 4.0
+                inferred_now_playing = (not recent_now_playing) and prev_count >= 2
 
-        meta = await fetch_video_metadata(video_id)
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
-        schedule_ctx = await self.current_schedule_context(settings_map=settings_map)
-        enforcement_mode = str(schedule_ctx.get("mode", "blocklist"))
+            meta = await fetch_video_metadata(video_id)
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            schedule_ctx = await self.current_schedule_context(settings_map=settings_map)
+            enforcement_mode = str(schedule_ctx.get("mode", "blocklist"))
 
-        try:
-            decision = await self.judge.evaluate(
-                video_id=video_id,
-                title=meta.get("title", ""),
-                channel_id=meta.get("channel_id", ""),
-                channel_title=meta.get("channel_title", ""),
-                video_url=video_url,
-                enforcement_mode=enforcement_mode,
+            try:
+                decision = await self.judge.evaluate(
+                    video_id=video_id,
+                    title=meta.get("title", ""),
+                    channel_id=meta.get("channel_id", ""),
+                    channel_title=meta.get("channel_title", ""),
+                    video_url=video_url,
+                    enforcement_mode=enforcement_mode,
+                )
+                await self.db.set_setting("judge_ok", "true")
+                await self.db.set_setting("last_error", "")
+            except GeminiFatalError as err:
+                await self.judge.handle_fatal_failure(err)
+                if enforcement_mode == "whitelist":
+                    decision = {
+                        "verdict": "BLOCK",
+                        "reason": "Whitelist mode: Gemini unavailable and no explicit allowlist match.",
+                        "confidence": 100,
+                        "source": "fallback",
+                    }
+                else:
+                    decision = {
+                        "verdict": "ALLOW",
+                        "reason": "Gemini is temporarily unavailable (quota/auth). Allowed by fail-open policy.",
+                        "confidence": 0,
+                        "source": "fallback",
+                    }
+                await self.emit_live(
+                    {
+                        "event": "judge_failure",
+                        "error": str(err),
+                        "active": True,
+                        "timestamp": utc_now_iso(),
+                    }
+                )
+            except Exception as err:
+                if enforcement_mode == "whitelist":
+                    decision = {
+                        "verdict": "BLOCK",
+                        "reason": f"Whitelist mode fallback block due to parser/runtime error: {err}",
+                        "confidence": 100,
+                        "source": "fallback",
+                    }
+                else:
+                    decision = {
+                        "verdict": "ALLOW",
+                        "reason": f"Fallback allow due to parser/runtime error: {err}",
+                        "confidence": 0,
+                        "source": "fallback",
+                    }
+
+            action = "none"
+            should_treat_as_current = (
+                et == "now_playing" or inferred_now_playing or (et == "up_next" and decision["verdict"] == "BLOCK")
             )
-            await self.db.set_setting("judge_ok", "true")
-            await self.db.set_setting("last_error", "")
-        except GeminiFatalError as err:
-            await self.judge.handle_fatal_failure(err)
-            if enforcement_mode == "whitelist":
-                decision = {
-                    "verdict": "BLOCK",
-                    "reason": "Whitelist mode: Gemini unavailable and no explicit allowlist match.",
-                    "confidence": 100,
-                    "source": "fallback",
-                }
-            else:
-                decision = {
-                    "verdict": "ALLOW",
-                    "reason": "Gemini is temporarily unavailable (quota/auth). Allowed by fail-open policy.",
-                    "confidence": 0,
-                    "source": "fallback",
-                }
+            release_active = self._is_remote_release_active(settings_map)
+            if should_treat_as_current and decision["verdict"] == "BLOCK":
+                if release_active:
+                    action = "none"
+                else:
+                    retry_key = f"{device_id}:{video_id}"
+                    now_mono = monotonic()
+                    cooldown_until = self.intervention_cooldown_until.get(device_id, 0.0)
+                    if now_mono < cooldown_until:
+                        action = "none"
+                    else:
+                        last_try = self.block_retry_at.get(retry_key, 0.0)
+                        if now_mono - last_try < 1.5:
+                            action = "none"
+                        else:
+                            self.block_retry_at[retry_key] = now_mono
+                            ok, skip_error, safe_video_id = await self._play_safe_from_queue(
+                                device_id=device_id,
+                                blocked_video_id=video_id,
+                                enforcement_mode=enforcement_mode,
+                            )
+                            action = "play_safe" if ok else "none"
+                            if ok:
+                                self.last_safe_play[device_id] = (safe_video_id, monotonic())
+                                self.intervention_cooldown_until[device_id] = monotonic() + 10.0
+                                logger.info(
+                                    "intervention_play_safe device=%s blocked=%s safe=%s",
+                                    device_id,
+                                    video_id,
+                                    safe_video_id,
+                                )
+                                old_task = self.reinforce_tasks.get(device_id)
+                                if old_task and not old_task.done():
+                                    old_task.cancel()
+                                self.reinforce_tasks[device_id] = asyncio.create_task(
+                                    self._reinforce_safe_play(device_id=device_id, safe_video_id=safe_video_id),
+                                    name=f"reinforce-safe-{device_id}",
+                                )
+                                # Clear stale retry markers for this device once skip succeeded.
+                                prefix = f"{device_id}:"
+                                for key in [k for k in self.block_retry_at.keys() if k.startswith(prefix)]:
+                                    self.block_retry_at.pop(key, None)
+                                await self.emit_live(
+                                    {
+                                        "event": "intervention_play_safe",
+                                        "device_id": device_id,
+                                        "blocked_video_id": video_id,
+                                        "safe_video_id": safe_video_id,
+                                        "timestamp": utc_now_iso(),
+                                    }
+                                )
+                            elif skip_error:
+                                await self.emit_live(
+                                    {
+                                        "event": "intervention_error",
+                                        "device_id": device_id,
+                                        "video_id": video_id,
+                                        "message": skip_error,
+                                        "timestamp": utc_now_iso(),
+                                    }
+                                )
+            elif should_treat_as_current:
+                action = "allow"
+
+            await self.db.add_video_decision(
+                device_id=device_id,
+                video_id=video_id,
+                channel_id=meta.get("channel_id", ""),
+                title=meta.get("title", ""),
+                thumbnail_url=meta.get("thumbnail_url", ""),
+                verdict=decision["verdict"],
+                reason=decision["reason"],
+                confidence=int(decision["confidence"]),
+                source=decision["source"],
+                action_taken=action,
+            )
+
             await self.emit_live(
                 {
-                    "event": "judge_failure",
-                    "error": str(err),
-                    "active": True,
+                    "event": et,
+                    "device_id": device_id,
+                    "video_id": video_id,
+                    "title": meta.get("title", ""),
+                    "channel_title": meta.get("channel_title", ""),
+                    "thumbnail_url": meta.get("thumbnail_url", ""),
+                    "verdict": decision["verdict"],
+                    "reason": decision["reason"],
+                    "confidence": decision["confidence"],
+                    "source": decision["source"],
+                    "action_taken": action,
+                    "inferred_now_playing": inferred_now_playing,
                     "timestamp": utc_now_iso(),
                 }
             )
-        except Exception as err:
-            if enforcement_mode == "whitelist":
-                decision = {
-                    "verdict": "BLOCK",
-                    "reason": f"Whitelist mode fallback block due to parser/runtime error: {err}",
-                    "confidence": 100,
-                    "source": "fallback",
-                }
-            else:
-                decision = {
-                    "verdict": "ALLOW",
-                    "reason": f"Fallback allow due to parser/runtime error: {err}",
-                    "confidence": 0,
-                    "source": "fallback",
-                }
-
-        action = "none"
-        should_treat_as_current = (
-            et == "now_playing" or inferred_now_playing or (et == "up_next" and decision["verdict"] == "BLOCK")
-        )
-        release_active = self._is_remote_release_active(settings_map)
-        if should_treat_as_current and decision["verdict"] == "BLOCK":
-            if release_active:
-                action = "none"
-            else:
-                retry_key = f"{device_id}:{video_id}"
-                now_mono = monotonic()
-                last_try = self.block_retry_at.get(retry_key, 0.0)
-                if now_mono - last_try < 1.5:
-                    action = "none"
-                else:
-                    self.block_retry_at[retry_key] = now_mono
-                    ok, skip_error, safe_video_id = await self._play_safe_from_queue(
-                        device_id=device_id,
-                        blocked_video_id=video_id,
-                        enforcement_mode=enforcement_mode,
-                    )
-                    action = "play_safe" if ok else "none"
-                    if ok:
-                        old_task = self.reinforce_tasks.get(device_id)
-                        if old_task and not old_task.done():
-                            old_task.cancel()
-                        self.reinforce_tasks[device_id] = asyncio.create_task(
-                            self._reinforce_safe_play(device_id=device_id, safe_video_id=safe_video_id),
-                            name=f"reinforce-safe-{device_id}",
-                        )
-                        # Clear stale retry markers for this device once skip succeeded.
-                        prefix = f"{device_id}:"
-                        for key in [k for k in self.block_retry_at.keys() if k.startswith(prefix)]:
-                            self.block_retry_at.pop(key, None)
-                        await self.emit_live(
-                            {
-                                "event": "intervention_play_safe",
-                                "device_id": device_id,
-                                "blocked_video_id": video_id,
-                                "safe_video_id": safe_video_id,
-                                "timestamp": utc_now_iso(),
-                            }
-                        )
-                    elif skip_error:
-                        await self.emit_live(
-                            {
-                                "event": "intervention_error",
-                                "device_id": device_id,
-                                "video_id": video_id,
-                                "message": skip_error,
-                                "timestamp": utc_now_iso(),
-                            }
-                        )
-        elif should_treat_as_current:
-            action = "allow"
-
-        await self.db.add_video_decision(
-            device_id=device_id,
-            video_id=video_id,
-            channel_id=meta.get("channel_id", ""),
-            title=meta.get("title", ""),
-            thumbnail_url=meta.get("thumbnail_url", ""),
-            verdict=decision["verdict"],
-            reason=decision["reason"],
-            confidence=int(decision["confidence"]),
-            source=decision["source"],
-            action_taken=action,
-        )
-
-        await self.emit_live(
-            {
-                "event": et,
-                "device_id": device_id,
-                "video_id": video_id,
-                "title": meta.get("title", ""),
-                "channel_title": meta.get("channel_title", ""),
-                "thumbnail_url": meta.get("thumbnail_url", ""),
-                "verdict": decision["verdict"],
-                "reason": decision["reason"],
-                "confidence": decision["confidence"],
-                "source": decision["source"],
-                "action_taken": action,
-                "inferred_now_playing": inferred_now_playing,
-                "timestamp": utc_now_iso(),
-            }
-        )
 
     async def supervisor(self) -> None:
         while True:
