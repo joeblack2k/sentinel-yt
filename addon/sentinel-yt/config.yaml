@@ -1,0 +1,28 @@
+name: Sentinel YT
+version: "0.1.0"
+slug: sentinel_yt
+description: YouTube AI Guardian for Apple TV (Lounge monitor + rules + optional Gemini + SponsorBlock)
+url: https://github.com/joeblack2k/sentinel-yt
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: services
+boot: auto
+init: false
+host_network: true
+ingress: false
+panel_icon: mdi:shield-search
+panel_title: Sentinel YT
+webui: "http://[HOST]:[PORT:8090]"
+options:
+  timezone: Europe/Amsterdam
+  gemini_api_key: ""
+  gemini_model: gemini-2.0-flash
+  build_version: ha-addon
+schema:
+  timezone: str
+  gemini_api_key: password
+  gemini_model: str
+  build_version: str
+

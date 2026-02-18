@@ -238,6 +238,22 @@ BASE_URL=http://127.0.0.1:8090 ./scripts/smoke.sh
 
 ## Synology Deploy Bundle
 See:
+
+## Home Assistant Add-on
+This repository now also includes a Home Assistant add-on package.
+
+Add-on files:
+- `/addon/sentinel-yt/config.yaml`
+- `/addon/sentinel-yt/Dockerfile`
+- `/addon/sentinel-yt/run.sh`
+- `/addon/sentinel-yt/DOCS.md`
+- `/repository.yaml`
+
+Install flow:
+1. Home Assistant -> Settings -> Add-ons -> Add-on Store.
+2. Repositories -> add `https://github.com/joeblack2k/sentinel-yt`.
+3. Install `Sentinel YT`.
+4. Open web UI on `http://<ha-host>:8090`.
 - `ops/synology/compose.yaml`
 - `ops/synology/.env.template`
 - `ops/synology/README_DEPLOY_SYNOLOGY.md`
