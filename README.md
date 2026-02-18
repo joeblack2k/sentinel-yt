@@ -1,5 +1,9 @@
 # Sentinel v1 (YouTube AI Guardian)
 
+<p align="center">
+  <img src="app/static/images/sentinel-hero-v5.png" alt="Sentinel Guardian" width="340" />
+</p>
+
 Sentinel is a Docker-first parental-control gateway for YouTube on Apple TV (YouTube Lounge).  
 It discovers TVs on LAN, pairs by TV code, monitors current/up-next videos, applies block/allow rules, optionally uses Gemini for AI decisions, and can actively force playback to a safe video.
 
@@ -236,9 +240,6 @@ docker compose --env-file .env up -d --build
 BASE_URL=http://127.0.0.1:8090 ./scripts/smoke.sh
 ```
 
-## Synology Deploy Bundle
-See:
-
 ## Home Assistant Add-on
 This repository now also includes a Home Assistant add-on package.
 
@@ -254,6 +255,9 @@ Install flow:
 2. Repositories -> add `https://github.com/joeblack2k/sentinel-yt`.
 3. Install `Sentinel YT`.
 4. Open web UI on `http://<ha-host>:8090`.
+
+## Synology Deploy Bundle
+See:
 - `ops/synology/compose.yaml`
 - `ops/synology/.env.template`
 - `ops/synology/README_DEPLOY_SYNOLOGY.md`
