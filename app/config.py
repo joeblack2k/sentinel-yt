@@ -43,6 +43,26 @@ class Settings:
     kids_ingest_freshness_seconds: int = field(
         default_factory=lambda: int(os.getenv("KIDS_INGEST_FRESHNESS_SECONDS", "1800"))
     )
+    kids_resolver_backend_url: str = field(
+        default_factory=lambda: os.getenv("KIDS_RESOLVER_BACKEND_URL", "http://127.0.0.1:8081").rstrip("/")
+    )
+    kids_resolver_batch_size: int = field(default_factory=lambda: int(os.getenv("KIDS_RESOLVER_BATCH_SIZE", "2")))
+    kids_resolve_refresh_margin_seconds: int = field(
+        default_factory=lambda: int(os.getenv("KIDS_RESOLVE_REFRESH_MARGIN_SECONDS", "1800"))
+    )
+    kids_playback_min_remaining_seconds: int = field(
+        default_factory=lambda: int(os.getenv("KIDS_PLAYBACK_MIN_REMAINING_SECONDS", "300"))
+    )
+    kids_ready_minimum: int = field(default_factory=lambda: int(os.getenv("KIDS_READY_MINIMUM", "18")))
+    kids_channel_policy_version: str = field(
+        default_factory=lambda: os.getenv("KIDS_CHANNEL_POLICY_VERSION", "sampled-channel-v1").strip()
+    )
+    kids_channel_recheck_seconds: int = field(
+        default_factory=lambda: int(os.getenv("KIDS_CHANNEL_RECHECK_SECONDS", "604800"))
+    )
+    kids_channel_sample_size: int = field(
+        default_factory=lambda: int(os.getenv("KIDS_CHANNEL_SAMPLE_SIZE", "8"))
+    )
 
 
 def get_host_timezone_name() -> str:

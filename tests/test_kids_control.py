@@ -160,6 +160,7 @@ def test_kids_watch_events_are_persisted_and_unknown_videos_are_rejected(
                 "profile": "noah",
                 "position_seconds": 95.5,
                 "session_id": "play-1",
+                "startup_ms": 1450,
                 "correlation_id": "watch-1",
             },
         )
@@ -168,6 +169,7 @@ def test_kids_watch_events_are_persisted_and_unknown_videos_are_rejected(
 
         events = client.get("/api/kids/watch-events").json()["events"]
         assert events[0]["video_id"] == "video-watch"
+        assert events[0]["startup_ms"] == 1450
         assert events[0]["event"] == "completed"
         assert events[0]["profile"] == "noah"
         assert events[0]["position_seconds"] == 95.5

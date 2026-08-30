@@ -110,6 +110,9 @@ class Database:
                     safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN',
                     safety_reason TEXT NOT NULL DEFAULT '',
                     safety_checked_at TEXT,
+                    safety_policy_version TEXT NOT NULL DEFAULT '',
+                    safety_evidence_json TEXT NOT NULL DEFAULT '[]',
+                    safety_sample_count INTEGER NOT NULL DEFAULT 0,
                     state TEXT NOT NULL DEFAULT 'candidate'
                         CHECK(state IN ('candidate', 'approved', 'blocked', 'revoked', 'unknown')),
                     actor TEXT NOT NULL,
@@ -165,11 +168,28 @@ class Database:
                     profile TEXT NOT NULL DEFAULT 'noah',
                     position_seconds REAL,
                     session_id TEXT NOT NULL DEFAULT '',
+                    startup_ms INTEGER,
                     correlation_id TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_kids_watch_created ON kids_watch_events(id DESC);
                 CREATE INDEX IF NOT EXISTS idx_kids_watch_video ON kids_watch_events(video_id, id DESC);
+                CREATE TABLE IF NOT EXISTS kids_resolve_backlog (
+                    item_id INTEGER PRIMARY KEY REFERENCES catalog_items(id),
+                    video_id TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL CHECK(status IN ('pending','running','ready','retry','blocked')),
+                    candidate_json TEXT NOT NULL DEFAULT '',
+                    quality_height INTEGER,
+                    codec TEXT NOT NULL DEFAULT '',
+                    resolved_at TEXT,
+                    expires_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_kids_resolve_due ON kids_resolve_backlog(status, next_attempt_at);
+                CREATE INDEX IF NOT EXISTS idx_kids_resolve_expiry ON kids_resolve_backlog(expires_at);
 
                 CREATE INDEX IF NOT EXISTS idx_rules_scope_value ON rules(scope, value);
                 CREATE INDEX IF NOT EXISTS idx_rules_type_scope ON rules(rule_type, scope);
@@ -213,6 +233,10 @@ class Database:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0")
             if "visual_category" not in item_cols:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN visual_category TEXT NOT NULL DEFAULT 'general'")
+            cur = await db.execute("PRAGMA table_info(kids_watch_events)")
+            watch_cols = {row[1] for row in await cur.fetchall()}
+            if "startup_ms" not in watch_cols:
+                await db.execute("ALTER TABLE kids_watch_events ADD COLUMN startup_ms INTEGER")
             cur = await db.execute("PRAGMA table_info(catalog_sources)")
             source_cols = {row[1] for row in await cur.fetchall()}
             if "safety_verdict" not in source_cols:
@@ -225,6 +249,18 @@ class Database:
                 )
             if "safety_checked_at" not in source_cols:
                 await db.execute("ALTER TABLE catalog_sources ADD COLUMN safety_checked_at TEXT")
+            if "safety_policy_version" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN safety_policy_version TEXT NOT NULL DEFAULT ''"
+                )
+            if "safety_evidence_json" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN safety_evidence_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "safety_sample_count" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN safety_sample_count INTEGER NOT NULL DEFAULT 0"
+                )
             await db.commit()
 
     async def _catalog_revision(self, db: aiosqlite.Connection) -> int:
@@ -266,6 +302,7 @@ class Database:
                 ("candidate_created", entity, entity_id, "system", "candidate created", revision, values["correlation_id"], now),
             )
             await db.commit()
+        await self.kids_resolve_sync_backlog()
         return await self.catalog_get(entity, entity_id)
 
     async def catalog_get(self, entity: str, entity_id: int) -> dict[str, Any] | None:
@@ -303,6 +340,7 @@ class Database:
                 ("state_changed", entity, entity_id, values["actor"], values["reason"], revision, values["correlation_id"], now),
             )
             await db.commit()
+        await self.kids_resolve_sync_backlog()
         return await self.catalog_get(entity, entity_id)
 
     async def catalog_source_safety_update(
@@ -313,6 +351,8 @@ class Database:
         reason: str,
         actor: str,
         correlation_id: str,
+        policy_version: str = "",
+        evidence: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         verdict = verdict.strip().upper()
         if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
@@ -329,6 +369,7 @@ class Database:
                 """
                 UPDATE catalog_sources
                 SET safety_verdict=?, safety_reason=?, safety_checked_at=?,
+                    safety_policy_version=?, safety_evidence_json=?, safety_sample_count=?,
                     actor=?, changed_at=?, reason=?, revision=?, correlation_id=?
                 WHERE id=?
                 """,
@@ -336,6 +377,9 @@ class Database:
                     verdict,
                     reason[:1000],
                     now,
+                    policy_version[:128],
+                    json.dumps((evidence or [])[:20], separators=(",", ":"), ensure_ascii=True),
+                    min(len(evidence or []), 20),
                     actor,
                     now,
                     reason[:1000],
@@ -363,9 +407,68 @@ class Database:
                 ),
             )
             await db.commit()
+        await self.kids_resolve_sync_backlog()
         return await self.catalog_get("source", source_id)
 
-    async def catalog_items_list(self) -> list[dict[str, Any]]:
+    async def catalog_item_refresh(
+        self,
+        item_id: int,
+        *,
+        title: str,
+        source_id: int,
+        thumbnail_url: str,
+        duration_seconds: int,
+        visual_category: str,
+        correlation_id: str,
+    ) -> dict[str, Any] | None:
+        values = (
+            title.strip()[:500],
+            source_id,
+            thumbnail_url.strip()[:2000],
+            max(0, int(duration_seconds)),
+            visual_category.strip()[:64] or "general",
+        )
+        changed = False
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute(
+                    """
+                    SELECT title,source_id,thumbnail_url,duration_seconds,visual_category
+                    FROM catalog_items WHERE id=?
+                    """,
+                    (item_id,),
+                )
+            ).fetchone()
+            if not row:
+                return None
+            changed = tuple(row) != values
+            if changed:
+                now = utc_now_iso()
+                revision = await self._catalog_revision(db)
+                await db.execute(
+                    """
+                    UPDATE catalog_items
+                    SET title=?,source_id=?,thumbnail_url=?,duration_seconds=?,visual_category=?,
+                        actor='kids-ingest',changed_at=?,reason='metadata refreshed',
+                        revision=?,correlation_id=?
+                    WHERE id=?
+                    """,
+                    (*values, now, revision, correlation_id, item_id),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO kids_audit_events(
+                        event,entity_type,entity_id,actor,reason,revision,correlation_id,created_at
+                    ) VALUES('item_metadata_refreshed','item',?,'kids-ingest','metadata refreshed',?,?,?)
+                    """,
+                    (item_id, revision, correlation_id, now),
+                )
+                await db.commit()
+        if changed:
+            await self.kids_resolve_sync_backlog()
+        return await self.catalog_get("item", item_id)
+
+    async def catalog_items_list(self, minimum_remaining_seconds: int = 300) -> list[dict[str, Any]]:
         # Feed consumers must only ever see items from an approved source.
         query = (
             "SELECT i.* FROM catalog_items i "
@@ -373,10 +476,209 @@ class Database:
             "WHERE i.state='approved' AND s.state='approved'"
         )
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute(query + " ORDER BY id ASC")
+            cur = await db.execute(query + " ORDER BY i.id ASC")
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in rows]
+
+    async def kids_eligible_feed_list(self, minimum_remaining_seconds: int) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT i.* FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
+                JOIN kids_resolve_backlog b ON b.item_id=i.id
+                WHERE i.state='approved' AND s.state='approved' AND s.safety_verdict='SAFE'
+                  AND b.status='ready' AND b.expires_at>?
+                ORDER BY i.id ASC
+                """,
+                ((datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat(),),
+            )
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def kids_resolve_sync_backlog(self) -> None:
+        """Make eligibility changes immediately remove technical playback authority."""
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO kids_resolve_backlog(item_id,video_id,status,updated_at)
+                SELECT i.id,i.video_id,'pending',?
+                FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
+                WHERE i.state='approved' AND s.state='approved' AND s.safety_verdict='SAFE'
+                ON CONFLICT(item_id) DO UPDATE SET
+                    video_id=excluded.video_id,
+                    status=CASE WHEN kids_resolve_backlog.status='blocked' THEN 'pending' ELSE kids_resolve_backlog.status END,
+                    updated_at=excluded.updated_at
+                """,
+                (now,),
+            )
+            await db.execute(
+                """
+                UPDATE kids_resolve_backlog
+                SET status='blocked', candidate_json='', quality_height=NULL, codec='', resolved_at=NULL,
+                    expires_at=NULL, next_attempt_at=NULL, last_error_code='ineligible', updated_at=?
+                WHERE item_id IN (
+                    SELECT b.item_id FROM kids_resolve_backlog b
+                    LEFT JOIN catalog_items i ON i.id=b.item_id
+                    LEFT JOIN catalog_sources s ON s.id=i.source_id
+                    WHERE i.id IS NULL OR i.state!='approved' OR s.state!='approved' OR s.safety_verdict!='SAFE'
+                )
+                """,
+                (now,),
+            )
+            await db.execute(
+                """
+                UPDATE kids_resolve_backlog
+                SET status='retry', next_attempt_at=?, last_error_code='stale_running', updated_at=?
+                WHERE status='running' AND updated_at < ?
+                """,
+                (now, now, (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()),
+            )
+            await db.commit()
+
+    async def kids_resolve_claim_due(self, *, limit: int, refresh_margin_seconds: int) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 20))
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        refresh_at = (now + timedelta(seconds=max(0, refresh_margin_seconds))).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """
+                SELECT item_id,video_id FROM (
+                    SELECT item_id,video_id,1 AS priority,COALESCE(next_attempt_at,'') AS due
+                    FROM kids_resolve_backlog
+                    WHERE status IN ('pending','retry')
+                      AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                    UNION ALL
+                    SELECT item_id,video_id,0 AS priority,expires_at AS due
+                    FROM kids_resolve_backlog
+                    WHERE status='ready' AND expires_at<=?
+                )
+                ORDER BY priority ASC,due ASC,item_id ASC LIMIT ?
+                """,
+                (now_iso, refresh_at, bounded),
+            )
+            rows = await cur.fetchall()
+            for item_id, _video_id in rows:
+                await db.execute(
+                    "UPDATE kids_resolve_backlog SET status='running', updated_at=? WHERE item_id=?",
+                    (now_iso, item_id),
+                )
+            await db.commit()
+        return [{"item_id": int(item_id), "video_id": str(video_id)} for item_id, video_id in rows]
+
+    async def kids_resolve_success(
+        self,
+        *,
+        item_id: int,
+        candidate: dict[str, Any],
+        quality_height: int,
+        codec: str,
+        resolved_at: str,
+        expires_at: str,
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE kids_resolve_backlog
+                SET status='ready', candidate_json=?, quality_height=?, codec=?, resolved_at=?, expires_at=?,
+                    next_attempt_at=NULL, last_error_code='', updated_at=?
+                WHERE item_id=?
+                """,
+                (
+                    json.dumps(candidate, separators=(",", ":"), ensure_ascii=True),
+                    quality_height,
+                    codec,
+                    resolved_at,
+                    expires_at,
+                    utc_now_iso(),
+                    item_id,
+                ),
+            )
+            await db.commit()
+
+    async def kids_resolve_failure(self, *, item_id: int, reason_code: str) -> None:
+        safe_code = reason_code if reason_code in {
+            "backend_unavailable", "no_compatible_stream", "invalid_candidate", "resolver_error", "stale_running"
+        } else "resolver_error"
+        now = datetime.now(timezone.utc)
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute("SELECT attempt_count FROM kids_resolve_backlog WHERE item_id=?", (item_id,))
+            ).fetchone()
+            attempts = min(10, int(row[0] if row else 0) + 1)
+            delay = min(3600, 30 * (2 ** min(attempts - 1, 6)))
+            await db.execute(
+                """
+                UPDATE kids_resolve_backlog
+                SET status='retry', candidate_json='', quality_height=NULL, codec='', resolved_at=NULL, expires_at=NULL,
+                    attempt_count=?, next_attempt_at=?, last_error_code=?, updated_at=?
+                WHERE item_id=?
+                """,
+                (attempts, (now + timedelta(seconds=delay)).isoformat(), safe_code, now.isoformat(), item_id),
+            )
+            await db.commit()
+
+    async def kids_resolve_summary(self, *, minimum_remaining_seconds: int = 300) -> dict[str, Any]:
+        now = (datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                "SELECT status,COUNT(*) FROM kids_resolve_backlog GROUP BY status"
+            )
+            counts = {str(status): int(count) for status, count in await cur.fetchall()}
+            row = await (
+                await db.execute(
+                    "SELECT COUNT(*) FROM kids_resolve_backlog WHERE status='ready' AND expires_at>?",
+                    (now,),
+                )
+            ).fetchone()
+        return {"counts": counts, "fresh_ready": int(row[0] if row else 0)}
+
+    async def kids_resolve_recent_rows(self, limit: int = 20) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 100))
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT b.item_id,b.video_id,i.title,b.status,b.quality_height,b.codec,b.expires_at,
+                       b.attempt_count,b.last_error_code,b.updated_at
+                FROM kids_resolve_backlog b JOIN catalog_items i ON i.id=b.item_id
+                ORDER BY b.updated_at DESC LIMIT ?
+                """,
+                (bounded,),
+            )
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def kids_playback_authorization(
+        self, video_id: str, *, minimum_remaining_seconds: int
+    ) -> dict[str, Any] | None:
+        expires_after = (datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT i.id AS item_id,i.video_id,b.candidate_json,b.expires_at,b.quality_height,b.codec
+                FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
+                JOIN kids_resolve_backlog b ON b.item_id=i.id
+                WHERE i.video_id=? AND i.state='approved' AND s.state='approved'
+                  AND s.safety_verdict='SAFE' AND b.status='ready' AND b.expires_at>?
+                """,
+                (video_id, expires_after),
+            )
+            row = await cur.fetchone()
+            cols = [d[0] for d in cur.description] if row else []
+        if not row:
+            return None
+        result = dict(zip(cols, row))
+        try:
+            candidate = json.loads(str(result.pop("candidate_json")))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        result["candidate"] = candidate
+        return result
 
     async def catalog_item_list_all(self) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
@@ -472,6 +774,7 @@ class Database:
         profile: str,
         position_seconds: float | None,
         session_id: str,
+        startup_ms: int | None,
         correlation_id: str,
     ) -> dict[str, Any] | None:
         if event not in {"selected", "started", "completed", "stopped"}:
@@ -489,9 +792,9 @@ class Database:
             cursor = await db.execute(
                 """
                 INSERT INTO kids_watch_events(
-                    video_id, event, profile, position_seconds, session_id,
+                    video_id, event, profile, position_seconds, session_id, startup_ms,
                     correlation_id, created_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     video_id,
@@ -499,6 +802,7 @@ class Database:
                     profile,
                     position_seconds,
                     session_id,
+                    startup_ms,
                     correlation_id,
                     now,
                 ),
@@ -512,6 +816,7 @@ class Database:
             "profile": profile,
             "position_seconds": position_seconds,
             "session_id": session_id,
+            "startup_ms": startup_ms,
             "correlation_id": correlation_id,
             "created_at": now,
         }
@@ -573,6 +878,7 @@ class Database:
             "allow_policy_flags_json": "{}",
             "schedule_mode": "blocklist",
             "kids_kill_switch": "false",
+            "kids_resolver_last_success_at": "",
         }
         for key, value in defaults.items():
             existing = await self.get_setting(key)

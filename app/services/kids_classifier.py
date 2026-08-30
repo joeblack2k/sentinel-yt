@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -22,24 +23,44 @@ class OpenCodexKidsClassifier:
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.client = client or httpx.AsyncClient(base_url=self.base_url, timeout=20.0)
+        self.client = client or httpx.AsyncClient(base_url=self.base_url, timeout=45.0)
         self._owns_client = client is None
+        self._model_checked = False
 
     async def close(self) -> None:
         if self._owns_client:
             await self.client.aclose()
 
     async def check_model(self) -> str:
+        if self._model_checked:
+            return self.model
         response = await self.client.get(f"{self.base_url}/models")
         response.raise_for_status()
         model_ids = {str(entry.get("id", "")) for entry in response.json().get("data", [])}
         if self.model not in model_ids:
             raise KidsClassificationError("configured OpenCodex model is unavailable")
+        self._model_checked = True
         return self.model
 
     async def classify(self, metadata: dict[str, Any]) -> dict[str, Any]:
         try:
             await self.check_model()
+            thumbnail_urls: list[str] = []
+            for sample in metadata.get("sample_videos", []):
+                value = str(sample.get("thumbnail_url", "")) if isinstance(sample, dict) else ""
+                parsed = urlsplit(value)
+                if parsed.scheme == "https" and parsed.hostname == "i.ytimg.com" and value not in thumbnail_urls:
+                    thumbnail_urls.append(value)
+            user_content: str | list[dict[str, Any]] = json.dumps(metadata, ensure_ascii=True)
+            if thumbnail_urls:
+                user_content = [{"type": "text", "text": user_content}]
+                user_content.extend(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": url, "detail": "low"},
+                    }
+                    for url in thumbnail_urls[:4]
+                )
             response = await self.client.post(
                 f"{self.base_url}/chat/completions",
                 json={
@@ -51,14 +72,17 @@ class OpenCodexKidsClassifier:
                             "role": "system",
                             "content": (
                                 "Classify this Kids source or video for a calm 6-year-old Kids catalog. "
-                                "When kind is channel, judge the channel as a source and do not infer "
-                                "approval from a single video. "
+                                "When kind is channel, judge the channel from all supplied samples, including thumbnails. "
+                                "Mark brainrot, shouting, rapid-cut stimulation, manipulative engagement, dangerous challenges, "
+                                "horror, violence, weapons, pranks, Elsagate patterns, purchase pressure, and repetitive "
+                                "low-value content UNSAFE. Calm animals, nature, building, LEGO-style creativity, stories, "
+                                "and age-appropriate learning may be SAFE. "
                                 "Return only JSON with verdict SAFE, UNSAFE, or UNCERTAIN, "
                                 "a short reason, and confidence 0-100. "
                                 "Choose UNCERTAIN whenever evidence is incomplete."
                             ),
                         },
-                        {"role": "user", "content": json.dumps(metadata, ensure_ascii=True)},
+                        {"role": "user", "content": user_content},
                     ],
                 },
             )

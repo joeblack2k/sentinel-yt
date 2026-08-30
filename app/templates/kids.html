@@ -4,6 +4,21 @@
 <p class="muted">Only approved channels and playlists can publish items to the Kids gateway.</p>
 
 <section class="panel">
+  <h2>Resolve backlog</h2>
+  <p class="muted">Fresh ready {{ kids_status.resolve.fresh_ready }}. Last worker success {{ kids_status.resolver_last_success_at or '-' }}.</p>
+  <table>
+    <thead><tr><th>Video</th><th>Title</th><th>Status</th><th>Quality</th><th>Expiry</th><th>Attempts</th><th>Reason</th></tr></thead>
+    <tbody>
+      {% for row in resolve_rows %}
+      <tr><td><code>{{ row.video_id }}</code></td><td>{{ row.title or '-' }}</td><td>{{ row.status }}</td><td>{{ row.quality_height or '-' }}</td><td>{{ row.expires_at or '-' }}</td><td>{{ row.attempt_count }}</td><td>{{ row.last_error_code or '-' }}</td></tr>
+      {% else %}
+      <tr><td colspan="7" class="muted">No resolve records yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
   <h2>Kids sources</h2>
   <form id="kids-source-form">
     <label>Type
@@ -22,7 +37,7 @@
   </form>
   <p id="kids-source-status" class="muted"></p>
   <table>
-    <thead><tr><th>Type</th><th>Name</th><th>Reference</th><th>Guardian check</th><th>State</th><th>Action</th></tr></thead>
+    <thead><tr><th>Type</th><th>Name</th><th>Reference</th><th>Guardian check</th><th>Samples</th><th>State</th><th>Action</th></tr></thead>
     <tbody id="kids-sources">
       {% for source in sources %}
       <tr data-id="{{ source.id }}">
@@ -35,6 +50,7 @@
           <br><span class="muted">{{ source.safety_reason }}</span>
           {% endif %}
         </td>
+        <td>{{ source.safety_sample_count or 0 }}<br><span class="muted">{{ source.safety_policy_version or '-' }}</span></td>
         <td class="state">{{ source.state }}</td>
         <td>
           {% if source.state != 'approved' %}
@@ -46,7 +62,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="muted">No Kids sources configured.</td></tr>
+      <tr><td colspan="7" class="muted">No Kids sources configured.</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -83,7 +99,7 @@
   <h2>Watch log</h2>
   <p class="muted">Events from the Kids app are stored here for parent review and preference tuning.</p>
   <table>
-    <thead><tr><th>Time</th><th>Event</th><th>Video</th><th>Title</th><th>Profile</th><th>Position</th></tr></thead>
+    <thead><tr><th>Time</th><th>Event</th><th>Video</th><th>Title</th><th>Profile</th><th>Position</th><th>Startup</th></tr></thead>
     <tbody>
       {% for event in watch_events %}
       <tr>
@@ -93,9 +109,10 @@
         <td>{{ event.title or '-' }}</td>
         <td>{{ event.profile }}</td>
         <td>{{ event.position_seconds if event.position_seconds is not none else '-' }}</td>
+        <td>{{ event.startup_ms if event.startup_ms is not none else '-' }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="muted">No Kids watch events yet.</td></tr>
+      <tr><td colspan="7" class="muted">No Kids watch events yet.</td></tr>
       {% endfor %}
     </tbody>
   </table>

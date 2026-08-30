@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 
 import pytest
 
@@ -160,7 +161,14 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
     assert report.approved == 1
     assert len(classifier.calls) == 1
     assert classifier.calls[0]["channel_id"] == "UC123"
-    assert {item["video_id"] for item in await db.catalog_items_list()} == {"abcdefghijk"}
+    assert classifier.calls[0]["sample_videos"][0]["video_id"] == "abcdefghijk"
+    items = await db.catalog_items_list()
+    assert {item["video_id"] for item in items} == {"abcdefghijk"}
+    assert items[0]["source_id"] == source["id"]
+    checked_source = await db.catalog_get("source", source["id"])
+    assert checked_source["safety_policy_version"] == "sampled-channel-v1"
+    assert checked_source["safety_sample_count"] == 1
+    assert json.loads(checked_source["safety_evidence_json"])[0]["video_id"] == "abcdefghijk"
 
     await db.catalog_transition(
         "item",
@@ -212,9 +220,12 @@ async def test_safe_channel_stays_hidden_until_parent_approval(tmp_path):
             "correlation_id": "approve-source",
         },
     )
-    second = await ingest_once(db, ChannelHomeBrowser(), FakeClassifier("SAFE"))
+    cached_classifier = FakeClassifier("SAFE")
+    second = await ingest_once(db, ChannelHomeBrowser(), cached_classifier)
     assert second.approved == 2
+    assert cached_classifier.calls == []
     assert [item["video_id"] for item in await db.catalog_items_list()] == [
         "abcdefghijk",
         "zyxwvutsrqp",
     ]
+    assert {item["source_id"] for item in await db.catalog_items_list()} == {source["id"]}

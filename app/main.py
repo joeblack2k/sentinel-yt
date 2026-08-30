@@ -1241,10 +1241,15 @@ async def page_kids(request: Request) -> HTMLResponse:
             "kids_status": {
                 "kill_switch": await runtime.db.kids_kill_switch_enabled(),
                 "catalog_revision": await runtime.db.catalog_revision(),
+                "resolve": await runtime.db.kids_resolve_summary(
+                    minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
+                ),
+                "resolver_last_success_at": await runtime.db.get_setting("kids_resolver_last_success_at"),
             },
             "sources": await runtime.db.catalog_sources_list(),
             "items": await runtime.db.catalog_item_list_all(),
             "watch_events": await runtime.db.kids_watch_events_list(),
+            "resolve_rows": await runtime.db.kids_resolve_recent_rows(),
             "page": "kids",
         },
     )
@@ -1323,9 +1328,15 @@ async def api_catalog_revision(request: Request) -> dict[str, Any]:
 
 @app.get("/api/kids/catalog/items")
 async def api_catalog_items(request: Request) -> dict[str, Any]:
-    if await request.app.state.runtime.db.kids_kill_switch_enabled():
+    runtime: RuntimeState = request.app.state.runtime
+    if await runtime.db.kids_kill_switch_enabled():
         return {"state": "kill_switch", "items": []}
-    return {"state": "ready", "items": await request.app.state.runtime.db.catalog_items_list()}
+    if not await runtime.monitoring_enabled_now():
+        return {"state": "schedule_closed", "items": []}
+    return {
+        "state": "ready",
+        "items": await runtime.db.kids_eligible_feed_list(runtime.settings.kids_playback_min_remaining_seconds),
+    }
 
 
 @app.get("/api/kids/catalog/items/{item_id}")
@@ -1395,9 +1406,17 @@ async def api_catalog_item_state(item_id: int, payload: CatalogTransitionRequest
 
 @app.get("/api/kids/status")
 async def api_kids_status(request: Request) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
     return {
-        "kill_switch": await request.app.state.runtime.db.kids_kill_switch_enabled(),
-        "catalog_revision": await request.app.state.runtime.db.catalog_revision(),
+        "kill_switch": await runtime.db.kids_kill_switch_enabled(),
+        "catalog_revision": await runtime.db.catalog_revision(),
+        "available": not await runtime.db.kids_kill_switch_enabled() and await runtime.monitoring_enabled_now(),
+        "schedule_active": bool((await runtime.current_schedule_context()).get("active", False)),
+        "monitoring_effective": await runtime.monitoring_enabled_now(),
+        "resolve": await runtime.db.kids_resolve_summary(
+            minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
+        ),
+        "resolver_last_success_at": await runtime.db.get_setting("kids_resolver_last_success_at"),
     }
 
 
@@ -1441,7 +1460,16 @@ async def api_kids_readyz(request: Request) -> dict[str, Any]:
         "ingest_last_success_at": last_success,
         "ingest_age_seconds": ingest_age_seconds,
         "catalog_revision": await runtime.db.catalog_revision(),
+        "resolver_last_success_at": await runtime.db.get_setting("kids_resolver_last_success_at"),
     }
+    resolve_summary = await runtime.db.kids_resolve_summary(
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
+    )
+    payload["backlog_counts"] = resolve_summary["counts"]
+    payload["fresh_ready_count"] = resolve_summary["fresh_ready"]
+    payload["ready_minimum"] = runtime.settings.kids_ready_minimum
+    if resolve_summary["fresh_ready"] < runtime.settings.kids_ready_minimum:
+        payload["status"] = "unready"
     if payload["status"] != "ready":
         raise HTTPException(status_code=503, detail=payload)
     return payload
@@ -1481,6 +1509,7 @@ async def api_kids_watch_event(
         profile=payload.profile,
         position_seconds=payload.position_seconds,
         session_id=payload.session_id,
+        startup_ms=payload.startup_ms,
         correlation_id=payload.correlation_id,
     )
     if event is None:
@@ -1491,6 +1520,29 @@ async def api_kids_watch_event(
 @app.get("/api/kids/watch-events")
 async def api_kids_watch_events(request: Request, limit: int = 100) -> dict[str, Any]:
     return {"events": await request.app.state.runtime.db.kids_watch_events_list(limit)}
+
+
+@app.get("/api/kids/playback-authorizations/{video_id}")
+async def api_kids_playback_authorization(video_id: str, request: Request) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    if await runtime.db.kids_kill_switch_enabled() or not await runtime.monitoring_enabled_now():
+        raise HTTPException(status_code=403, detail="Kids playback is unavailable")
+    row = await runtime.db.kids_playback_authorization(
+        video_id,
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+    )
+    if row is None:
+        raise HTTPException(status_code=403, detail="Kids playback is not authorized")
+    return {
+        "status": "approved",
+        "catalog_revision": await runtime.db.catalog_revision(),
+        "item_id": row["item_id"],
+        "video_id": row["video_id"],
+        "expires_at": row["expires_at"],
+        "quality_height": row["quality_height"],
+        "codec": row["codec"],
+        "candidate": row["candidate"],
+    }
 
 
 @app.post("/api/webhook/control")

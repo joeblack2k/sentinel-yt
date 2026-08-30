@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Sentinel Kids adaptive resolve backlog every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=sentinel-yt-kids-resolver.service
+
+[Install]
+WantedBy=timers.target
