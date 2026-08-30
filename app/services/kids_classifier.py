@@ -50,7 +50,9 @@ class OpenCodexKidsClassifier:
                         {
                             "role": "system",
                             "content": (
-                                "Classify this video for a calm 6-year-old Kids catalog. "
+                                "Classify this Kids source or video for a calm 6-year-old Kids catalog. "
+                                "When kind is channel, judge the channel as a source and do not infer "
+                                "approval from a single video. "
                                 "Return only JSON with verdict SAFE, UNSAFE, or UNCERTAIN, "
                                 "a short reason, and confidence 0-100. "
                                 "Choose UNCERTAIN whenever evidence is incomplete."

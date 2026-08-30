@@ -78,6 +78,16 @@ def source_url(kind: str, reference: str) -> str:
     raise ValueError("unsupported Kids source kind")
 
 
+def channel_id_from_reference(reference: str) -> str:
+    raw = reference.strip()
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) == 2 and parts[0] == "channel":
+            return parts[1]
+    return raw
+
+
 def parse_cards(
     cards: list[dict[str, Any]],
     *,
@@ -175,6 +185,7 @@ class YouTubeKidsCDP:
                         href: x.querySelector('a[href*="/watch?v="]')?.getAttribute("href") || "",
                         title: x.querySelector(".primary-text span")?.textContent?.trim() || "",
                         label: x.querySelector(".primary-text span")?.getAttribute("aria-label") || "",
+                        channel_title: data.shortBylineText?.runs?.map(r => r.text).join("") || "",
                         duration: x.querySelector(".overlay")?.textContent?.trim() || "",
                         thumbnail_url: x.querySelector("img")?.src || "",
                         channel_id: data.kidsVideoOwnerExtension?.externalChannelId
@@ -208,18 +219,8 @@ async def ingest_once(
     max_cards_per_source: int = 48,
 ) -> IngestReport:
     report = IngestReport()
-    sources = [
-        source
-        for source in await db.catalog_sources_list()
-        if source.get("kind") == "channel"
-        and source.get("reference") != HOME_SOURCE_REFERENCE
-        and source.get("state") == "approved"
-    ]
-    home_source = next(
-        (source for source in await db.catalog_sources_list()
-         if source.get("reference") == HOME_SOURCE_REFERENCE),
-        None,
-    )
+    all_sources = await db.catalog_sources_list()
+    home_source = next((source for source in all_sources if source.get("reference") == HOME_SOURCE_REFERENCE), None)
     if home_source is None:
         home_source = await db.catalog_create(
             "source",
@@ -240,15 +241,56 @@ async def ingest_once(
                 "correlation_id": "kids-home-approved",
             },
         )
+    raw_cards: list[dict[str, Any]] = []
+    if home_source.get("state") == "approved":
+        try:
+            raw_cards = await browser.cards_for_source("channel", HOME_SOURCE_REFERENCE)
+            report.cards_seen = len(raw_cards)
+        except Exception:
+            report.errors += 1
+            logger.exception("Kids home ingest failed")
+
+    # Discover channel identities from Home, but leave them candidate-only until a parent approves them.
+    known_references = {
+        str(source.get("reference", "")).strip()
+        for source in await db.catalog_sources_list()
+    }
+    for card in raw_cards[:max_cards_per_source]:
+        channel_id = str(card.get("channel_id", "")).strip()
+        if not channel_id or channel_id in known_references:
+            continue
+        source = await db.catalog_create(
+            "source",
+            {
+                "kind": "channel",
+                "reference": channel_id,
+                "title": (
+                    str(card.get("channel_title", "")).strip()
+                    or str(card.get("label", "")).strip()
+                )[:500],
+                "correlation_id": f"kids-discovered-channel-{channel_id}",
+            },
+        )
+        known_references.add(channel_id)
+        all_sources.append(source)
+
+    sources = [
+        source
+        for source in await db.catalog_sources_list()
+        if source.get("kind") == "channel"
+        and source.get("reference") != HOME_SOURCE_REFERENCE
+        and source.get("state") in {"approved", "candidate"}
+    ]
     report.sources_seen = len(sources) + (1 if home_source.get("state") == "approved" else 0)
     safe_channel_ids: set[str] = set()
     for source in sources:
         if source.get("safety_verdict") == "SAFE":
-            safe_channel_ids.add(str(source["reference"]).strip())
+            if source.get("state") == "approved":
+                safe_channel_ids.add(channel_id_from_reference(str(source["reference"])))
             continue
         metadata = {
             "kind": "channel",
-            "channel_id": str(source["reference"]).strip(),
+            "channel_id": channel_id_from_reference(str(source["reference"])),
             "channel_title": str(source.get("title", "")).strip(),
             "source_reference": str(source["reference"]).strip(),
         }
@@ -268,7 +310,8 @@ async def ingest_once(
             correlation_id=f"kids-channel-classify-{source['id']}",
         )
         if verdict == "SAFE":
-            safe_channel_ids.add(str(source["reference"]).strip())
+            if source.get("state") == "approved":
+                safe_channel_ids.add(channel_id_from_reference(str(source["reference"])))
         elif verdict == "UNSAFE":
             report.blocked += 1
             await db.catalog_transition(
