@@ -107,6 +107,9 @@ class Database:
                     kind TEXT NOT NULL CHECK(kind IN ('channel', 'playlist')),
                     reference TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL DEFAULT '',
+                    safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN',
+                    safety_reason TEXT NOT NULL DEFAULT '',
+                    safety_checked_at TEXT,
                     state TEXT NOT NULL DEFAULT 'candidate'
                         CHECK(state IN ('candidate', 'approved', 'blocked', 'revoked', 'unknown')),
                     actor TEXT NOT NULL,
@@ -198,6 +201,18 @@ class Database:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0")
             if "visual_category" not in item_cols:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN visual_category TEXT NOT NULL DEFAULT 'general'")
+            cur = await db.execute("PRAGMA table_info(catalog_sources)")
+            source_cols = {row[1] for row in await cur.fetchall()}
+            if "safety_verdict" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN'"
+                )
+            if "safety_reason" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN safety_reason TEXT NOT NULL DEFAULT ''"
+                )
+            if "safety_checked_at" not in source_cols:
+                await db.execute("ALTER TABLE catalog_sources ADD COLUMN safety_checked_at TEXT")
             await db.commit()
 
     async def _catalog_revision(self, db: aiosqlite.Connection) -> int:
@@ -277,6 +292,66 @@ class Database:
             )
             await db.commit()
         return await self.catalog_get(entity, entity_id)
+
+    async def catalog_source_safety_update(
+        self,
+        source_id: int,
+        *,
+        verdict: str,
+        reason: str,
+        actor: str,
+        correlation_id: str,
+    ) -> dict[str, Any] | None:
+        verdict = verdict.strip().upper()
+        if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
+            raise ValueError("invalid source safety verdict")
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute("SELECT id FROM catalog_sources WHERE id=?", (source_id,))
+            ).fetchone()
+            if not row:
+                return None
+            revision = await self._catalog_revision(db)
+            await db.execute(
+                """
+                UPDATE catalog_sources
+                SET safety_verdict=?, safety_reason=?, safety_checked_at=?,
+                    actor=?, changed_at=?, reason=?, revision=?, correlation_id=?
+                WHERE id=?
+                """,
+                (
+                    verdict,
+                    reason[:1000],
+                    now,
+                    actor,
+                    now,
+                    reason[:1000],
+                    revision,
+                    correlation_id,
+                    source_id,
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(
+                    event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "source_safety_changed",
+                    "source",
+                    source_id,
+                    actor,
+                    f"{verdict}: {reason[:1000]}",
+                    revision,
+                    correlation_id,
+                    now,
+                ),
+            )
+            await db.commit()
+        return await self.catalog_get("source", source_id)
 
     async def catalog_items_list(self) -> list[dict[str, Any]]:
         # Feed consumers must only ever see items from an approved source.

@@ -29,6 +29,7 @@ class KidsVideoCandidate:
     video_id: str
     title: str
     channel_title: str
+    channel_id: str
     thumbnail_url: str
     duration_seconds: int
     source_id: int
@@ -82,6 +83,7 @@ def parse_cards(
     *,
     source_id: int,
     source_reference: str,
+    allowed_channel_ids: set[str] | None = None,
 ) -> list[KidsVideoCandidate]:
     result: list[KidsVideoCandidate] = []
     seen: set[str] = set()
@@ -91,6 +93,7 @@ def parse_cards(
         query = urllib.parse.parse_qs(parsed.query)
         video_id = str(query.get("v", [""])[0])
         title = str(card.get("title", "")).strip()
+        channel_id = str(card.get("channel_id", "")).strip()
         thumbnail_url = str(card.get("thumbnail_url", "")).strip()
         duration = _duration_seconds(str(card.get("duration", "")))
         if (
@@ -101,6 +104,7 @@ def parse_cards(
             or duration <= 0
             or urllib.parse.urlparse(thumbnail_url).scheme != "https"
             or urllib.parse.urlparse(thumbnail_url).netloc.lower() != "i.ytimg.com"
+            or (allowed_channel_ids is not None and channel_id not in allowed_channel_ids)
         ):
             continue
         seen.add(video_id)
@@ -111,6 +115,7 @@ def parse_cards(
                 video_id=video_id,
                 title=title[:500],
                 channel_title=(channel_match.group(1).strip() if channel_match else "")[:500],
+                channel_id=channel_id[:128],
                 thumbnail_url=thumbnail_url.split("?", 1)[0][:2000],
                 duration_seconds=duration,
                 source_id=source_id,
@@ -164,13 +169,19 @@ class YouTubeKidsCDP:
                 await self._command(page, 2, "Runtime.enable")
                 expression = """JSON.stringify({
                     ready: document.readyState,
-                    cards: Array.from(document.querySelectorAll("ytk-compact-video-renderer")).map(x => ({
+                    cards: Array.from(document.querySelectorAll("ytk-compact-video-renderer")).map(x => {
+                        const data = x.get("data") || {};
+                        return {
                         href: x.querySelector('a[href*="/watch?v="]')?.getAttribute("href") || "",
                         title: x.querySelector(".primary-text span")?.textContent?.trim() || "",
                         label: x.querySelector(".primary-text span")?.getAttribute("aria-label") || "",
                         duration: x.querySelector(".overlay")?.textContent?.trim() || "",
-                        thumbnail_url: x.querySelector("img")?.src || ""
-                    }))
+                        thumbnail_url: x.querySelector("img")?.src || "",
+                        channel_id: data.kidsVideoOwnerExtension?.externalChannelId
+                            || data.shortBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId
+                            || ""
+                        };
+                    })
                 })"""
                 for _ in range(int(self.wait_seconds / 0.5)):
                     result = await self._command(
@@ -200,7 +211,9 @@ async def ingest_once(
     sources = [
         source
         for source in await db.catalog_sources_list()
-        if source.get("state") == "approved"
+        if source.get("kind") == "channel"
+        and source.get("reference") != HOME_SOURCE_REFERENCE
+        and source.get("state") == "approved"
     ]
     home_source = next(
         (source for source in await db.catalog_sources_list()
@@ -227,76 +240,98 @@ async def ingest_once(
                 "correlation_id": "kids-home-approved",
             },
         )
-    if home_source.get("state") == "approved" and home_source not in sources:
-        sources.insert(0, home_source)
-    report.sources_seen = len(sources)
+    report.sources_seen = len(sources) + (1 if home_source.get("state") == "approved" else 0)
+    safe_channel_ids: set[str] = set()
     for source in sources:
-        try:
-            raw_cards = await browser.cards_for_source(source["kind"], source["reference"])
-            report.cards_seen += len(raw_cards)
-            candidates = parse_cards(
-                raw_cards[:max_cards_per_source],
-                source_id=int(source["id"]),
-                source_reference=str(source["reference"]),
-            )
-        except Exception:
-            report.errors += 1
-            logger.exception("Kids source ingest failed source_id=%s", source.get("id"))
+        if source.get("safety_verdict") == "SAFE":
+            safe_channel_ids.add(str(source["reference"]).strip())
             continue
-
-        for candidate in candidates:
-            existing = await db.catalog_item_by_video(candidate.video_id)
-            if existing and existing.get("state") == "revoked":
-                report.skipped += 1
-                continue
-            if existing and existing.get("state") == "approved":
-                report.skipped += 1
-                continue
-            if existing:
-                item = existing
-            else:
-                item = await db.catalog_create(
-                    "item",
-                    {
-                        "video_id": candidate.video_id,
-                        "title": candidate.title,
-                        "source_id": candidate.source_id,
-                        "thumbnail_url": candidate.thumbnail_url,
-                        "duration_seconds": candidate.duration_seconds,
-                        "visual_category": "general",
-                        "correlation_id": f"kids-ingest-{candidate.video_id}",
-                    },
-                )
-                report.candidates_created += 1
-
-            metadata = asdict(candidate)
-            try:
-                decision = await classifier.classify(metadata)
-            except KidsClassificationError:
-                decision = {"verdict": "UNCERTAIN", "reason": "OpenCodex unavailable"}
-            except Exception:
-                decision = {"verdict": "UNCERTAIN", "reason": "classifier failure"}
-
-            verdict = decision["verdict"]
-            if verdict == "SAFE":
-                target_state = "approved"
-                report.approved += 1
-            elif verdict == "UNSAFE":
-                target_state = "blocked"
-                report.blocked += 1
-            else:
-                target_state = "unknown"
-                report.uncertain += 1
+        metadata = {
+            "kind": "channel",
+            "channel_id": str(source["reference"]).strip(),
+            "channel_title": str(source.get("title", "")).strip(),
+            "source_reference": str(source["reference"]).strip(),
+        }
+        try:
+            decision = await classifier.classify(metadata)
+        except KidsClassificationError:
+            decision = {"verdict": "UNCERTAIN", "reason": "OpenCodex unavailable"}
+        except Exception:
+            decision = {"verdict": "UNCERTAIN", "reason": "classifier failure"}
+        verdict = str(decision.get("verdict", "UNCERTAIN")).upper()
+        reason = str(decision.get("reason", ""))[:1000] or "Channel safety classification"
+        await db.catalog_source_safety_update(
+            int(source["id"]),
+            verdict=verdict,
+            reason=reason,
+            actor="kids-channel-guardian",
+            correlation_id=f"kids-channel-classify-{source['id']}",
+        )
+        if verdict == "SAFE":
+            safe_channel_ids.add(str(source["reference"]).strip())
+        elif verdict == "UNSAFE":
+            report.blocked += 1
             await db.catalog_transition(
-                "item",
-                int(item["id"]),
+                "source",
+                int(source["id"]),
                 {
-                    "state": target_state,
-                    "actor": "kids-ingest",
-                    "reason": str(decision.get("reason", ""))[:1000] or "Kids classification",
-                    "correlation_id": f"kids-classify-{candidate.video_id}",
+                    "state": "blocked",
+                    "actor": "kids-channel-guardian",
+                    "reason": reason,
+                    "correlation_id": f"kids-channel-block-{source['id']}",
                 },
             )
+        else:
+            report.uncertain += 1
+
+    if home_source.get("state") != "approved" or not safe_channel_ids:
+        return report
+    try:
+        raw_cards = await browser.cards_for_source("channel", HOME_SOURCE_REFERENCE)
+        report.cards_seen += len(raw_cards)
+        candidates = parse_cards(
+            raw_cards[:max_cards_per_source],
+            source_id=int(home_source["id"]),
+            source_reference=HOME_SOURCE_REFERENCE,
+            allowed_channel_ids=safe_channel_ids,
+        )
+    except Exception:
+        report.errors += 1
+        logger.exception("Kids home ingest failed")
+        return report
+
+    for candidate in candidates:
+        existing = await db.catalog_item_by_video(candidate.video_id)
+        if existing and existing.get("state") in {"revoked", "approved"}:
+            report.skipped += 1
+            continue
+        if existing:
+            item = existing
+        else:
+            item = await db.catalog_create(
+                "item",
+                {
+                    "video_id": candidate.video_id,
+                    "title": candidate.title,
+                    "source_id": candidate.source_id,
+                    "thumbnail_url": candidate.thumbnail_url,
+                    "duration_seconds": candidate.duration_seconds,
+                    "visual_category": "general",
+                    "correlation_id": f"kids-ingest-{candidate.video_id}",
+                },
+            )
+            report.candidates_created += 1
+        await db.catalog_transition(
+            "item",
+            int(item["id"]),
+            {
+                "state": "approved",
+                "actor": "kids-channel-policy",
+                "reason": "Inherited from Guardian-screened approved channel",
+                "correlation_id": f"kids-channel-approval-{candidate.video_id}",
+            },
+        )
+        report.approved += 1
     return report
 
 
@@ -313,6 +348,7 @@ async def _main() -> None:
             db,
             YouTubeKidsCDP(os.getenv("KIDS_BROWSER_CDP_URL", "http://127.0.0.1:9223")),
             classifier,
+            max_cards_per_source=max(1, int(os.getenv("KIDS_INGEST_MAX_CARDS", "12"))),
         )
         print(json.dumps(asdict(report), sort_keys=True))
     finally:

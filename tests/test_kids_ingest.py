@@ -25,6 +25,7 @@ def test_parse_cards_rejects_shorts_bad_host_and_missing_duration():
             "label": "Safe by Channel 10 views",
             "duration": "12:34",
             "thumbnail_url": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg?x=1",
+            "channel_id": "UC123",
         },
         {
             "href": "/shorts/abcdefghijk",
@@ -54,6 +55,12 @@ def test_parse_cards_rejects_shorts_bad_host_and_missing_duration():
     assert [(item.video_id, item.duration_seconds, item.channel_title) for item in parsed] == [
         ("abcdefghijk", 754, "Channel")
     ]
+    assert parse_cards(
+        cards,
+        source_id=1,
+        source_reference=HOME_SOURCE_REFERENCE,
+        allowed_channel_ids={"OTHER"},
+    ) == []
 
 
 @dataclass
@@ -67,24 +74,22 @@ class FakeBrowser:
                     "label": "Safe home animals by Kids Channel 10 views",
                     "duration": "5:00",
                     "thumbnail_url": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg",
+                    "channel_id": "UC123",
                 }
             ]
-        return [
-            {
-                "href": "/watch?v=lmnopqrstuv",
-                "title": "Safe channel animals",
-                "label": "Safe animals by Approved Channel 10 views",
-                "duration": "5:00",
-                "thumbnail_url": "https://i.ytimg.com/vi/lmnopqrstuv/hqdefault.jpg",
-            }
-        ]
+        return []
 
 
 @dataclass
 class FakeClassifier:
     verdict: str
+    calls: list[dict] = None
+
+    def __post_init__(self):
+        self.calls = []
 
     async def classify(self, metadata):
+        self.calls.append(metadata)
         return {"verdict": self.verdict, "reason": "test"}
 
 
@@ -111,12 +116,12 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
             "correlation_id": "approve-source",
         },
     )
-    report = await ingest_once(db, FakeBrowser(), FakeClassifier("SAFE"))
-    assert report.approved == 2
-    assert {item["video_id"] for item in await db.catalog_items_list()} == {
-        "abcdefghijk",
-        "lmnopqrstuv",
-    }
+    classifier = FakeClassifier("SAFE")
+    report = await ingest_once(db, FakeBrowser(), classifier)
+    assert report.approved == 1
+    assert len(classifier.calls) == 1
+    assert classifier.calls[0]["channel_id"] == "UC123"
+    assert {item["video_id"] for item in await db.catalog_items_list()} == {"abcdefghijk"}
 
     await db.catalog_transition(
         "item",
@@ -129,5 +134,5 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
         },
     )
     report = await ingest_once(db, FakeBrowser(), FakeClassifier("SAFE"))
-    assert report.skipped == 2
-    assert [item["video_id"] for item in await db.catalog_items_list()] == ["lmnopqrstuv"]
+    assert report.skipped == 1
+    assert await db.catalog_items_list() == []
