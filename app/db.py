@@ -98,6 +98,79 @@ class Database:
                     created_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS catalog_meta (
+                    key TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS catalog_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK(kind IN ('channel', 'playlist')),
+                    reference TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL DEFAULT '',
+                    safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN',
+                    safety_reason TEXT NOT NULL DEFAULT '',
+                    safety_checked_at TEXT,
+                    state TEXT NOT NULL DEFAULT 'candidate'
+                        CHECK(state IN ('candidate', 'approved', 'blocked', 'revoked', 'unknown')),
+                    actor TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    correlation_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS catalog_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL DEFAULT '',
+                    source_id INTEGER REFERENCES catalog_sources(id),
+                    thumbnail_url TEXT NOT NULL DEFAULT '',
+                    duration_seconds INTEGER NOT NULL DEFAULT 0,
+                    visual_category TEXT NOT NULL DEFAULT 'general',
+                    state TEXT NOT NULL DEFAULT 'candidate'
+                        CHECK(state IN ('candidate', 'approved', 'blocked', 'revoked', 'unknown')),
+                    actor TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    correlation_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS catalog_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_type TEXT NOT NULL,
+                    entity_id INTEGER NOT NULL,
+                    from_state TEXT NOT NULL,
+                    to_state TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    correlation_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS kids_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event TEXT NOT NULL,
+                    entity_type TEXT NOT NULL DEFAULT '',
+                    entity_id INTEGER,
+                    actor TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    correlation_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_kids_audit_created ON kids_audit_events(id DESC);
+                CREATE TABLE IF NOT EXISTS kids_watch_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id TEXT NOT NULL,
+                    event TEXT NOT NULL CHECK(event IN ('selected', 'started', 'completed', 'stopped')),
+                    profile TEXT NOT NULL DEFAULT 'noah',
+                    position_seconds REAL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    correlation_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_kids_watch_created ON kids_watch_events(id DESC);
+                CREATE INDEX IF NOT EXISTS idx_kids_watch_video ON kids_watch_events(video_id, id DESC);
+
                 CREATE INDEX IF NOT EXISTS idx_rules_scope_value ON rules(scope, value);
                 CREATE INDEX IF NOT EXISTS idx_rules_type_scope ON rules(rule_type, scope);
                 CREATE INDEX IF NOT EXISTS idx_schedules_enabled_id ON schedules(enabled, id);
@@ -132,7 +205,334 @@ class Database:
                     await db.execute("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT 'blocklist'")
                 if "updated_at" not in sched_cols:
                     await db.execute("ALTER TABLE schedules ADD COLUMN updated_at TEXT")
+            cur = await db.execute("PRAGMA table_info(catalog_items)")
+            item_cols = {row[1] for row in await cur.fetchall()}
+            if "thumbnail_url" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN thumbnail_url TEXT NOT NULL DEFAULT ''")
+            if "duration_seconds" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0")
+            if "visual_category" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN visual_category TEXT NOT NULL DEFAULT 'general'")
+            cur = await db.execute("PRAGMA table_info(catalog_sources)")
+            source_cols = {row[1] for row in await cur.fetchall()}
+            if "safety_verdict" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN'"
+                )
+            if "safety_reason" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN safety_reason TEXT NOT NULL DEFAULT ''"
+                )
+            if "safety_checked_at" not in source_cols:
+                await db.execute("ALTER TABLE catalog_sources ADD COLUMN safety_checked_at TEXT")
             await db.commit()
+
+    async def _catalog_revision(self, db: aiosqlite.Connection) -> int:
+        await db.execute("INSERT OR IGNORE INTO catalog_meta(key, value) VALUES ('revision', 0)")
+        row = await (await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")).fetchone()
+        revision = int(row[0]) + 1
+        await db.execute("UPDATE catalog_meta SET value=? WHERE key='revision'", (revision,))
+        return revision
+
+    async def catalog_revision(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")).fetchone()
+        return int(row[0]) if row else 0
+
+    async def catalog_create(self, entity: str, values: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            revision = await self._catalog_revision(db)
+            if entity == "source":
+                cur = await db.execute(
+                    "INSERT INTO catalog_sources(kind,reference,title,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?)",
+                    (values["kind"], values["reference"].strip(), values.get("title", "").strip(), "system",
+                     now, "candidate created", revision, values["correlation_id"]),
+                )
+            else:
+                cur = await db.execute(
+                    "INSERT INTO catalog_items(video_id,title,source_id,thumbnail_url,duration_seconds,visual_category,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (values["video_id"].strip(), values.get("title", "").strip(), values.get("source_id"),
+                     values.get("thumbnail_url", "").strip(), int(values.get("duration_seconds", 0) or 0),
+                     values.get("visual_category", "general").strip() or "general",
+                     "system", now, "candidate created", revision, values["correlation_id"]),
+                )
+            entity_id = cur.lastrowid
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("candidate_created", entity, entity_id, "system", "candidate created", revision, values["correlation_id"], now),
+            )
+            await db.commit()
+        return await self.catalog_get(entity, entity_id)
+
+    async def catalog_get(self, entity: str, entity_id: int) -> dict[str, Any] | None:
+        table = "catalog_sources" if entity == "source" else "catalog_items"
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(f"SELECT * FROM {table} WHERE id=?", (entity_id,))
+            row = await cur.fetchone()
+            cols = [d[0] for d in cur.description] if row else []
+        return dict(zip(cols, row)) if row else None
+
+    async def catalog_transition(self, entity: str, entity_id: int, values: dict[str, Any]) -> dict[str, Any]:
+        table = "catalog_sources" if entity == "source" else "catalog_items"
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute(f"SELECT state FROM {table} WHERE id=?", (entity_id,))).fetchone()
+            if not row:
+                return None
+            old = row[0]
+            if old == "revoked" and values["state"] == "approved":
+                raise ValueError("revoked entries cannot be approved")
+            revision = await self._catalog_revision(db)
+            await db.execute(
+                f"UPDATE {table} SET state=?, actor=?, changed_at=?, reason=?, revision=?, correlation_id=? WHERE id=?",
+                (values["state"], values["actor"], now, values["reason"], revision, values["correlation_id"], entity_id),
+            )
+            await db.execute(
+                "INSERT INTO catalog_transitions(entity_type,entity_id,from_state,to_state,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (entity, entity_id, old, values["state"], values["actor"], now, values["reason"], revision, values["correlation_id"]),
+            )
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("state_changed", entity, entity_id, values["actor"], values["reason"], revision, values["correlation_id"], now),
+            )
+            await db.commit()
+        return await self.catalog_get(entity, entity_id)
+
+    async def catalog_source_safety_update(
+        self,
+        source_id: int,
+        *,
+        verdict: str,
+        reason: str,
+        actor: str,
+        correlation_id: str,
+    ) -> dict[str, Any] | None:
+        verdict = verdict.strip().upper()
+        if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
+            raise ValueError("invalid source safety verdict")
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute("SELECT id FROM catalog_sources WHERE id=?", (source_id,))
+            ).fetchone()
+            if not row:
+                return None
+            revision = await self._catalog_revision(db)
+            await db.execute(
+                """
+                UPDATE catalog_sources
+                SET safety_verdict=?, safety_reason=?, safety_checked_at=?,
+                    actor=?, changed_at=?, reason=?, revision=?, correlation_id=?
+                WHERE id=?
+                """,
+                (
+                    verdict,
+                    reason[:1000],
+                    now,
+                    actor,
+                    now,
+                    reason[:1000],
+                    revision,
+                    correlation_id,
+                    source_id,
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(
+                    event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "source_safety_changed",
+                    "source",
+                    source_id,
+                    actor,
+                    f"{verdict}: {reason[:1000]}",
+                    revision,
+                    correlation_id,
+                    now,
+                ),
+            )
+            await db.commit()
+        return await self.catalog_get("source", source_id)
+
+    async def catalog_items_list(self) -> list[dict[str, Any]]:
+        # Feed consumers must only ever see items from an approved source.
+        query = (
+            "SELECT i.* FROM catalog_items i "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE i.state='approved' AND s.state='approved'"
+        )
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(query + " ORDER BY id ASC")
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def catalog_item_list_all(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT * FROM catalog_items ORDER BY id ASC")
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def catalog_item_by_video(self, video_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT * FROM catalog_items WHERE video_id=?", (video_id,))
+            row = await cur.fetchone()
+            cols = [d[0] for d in cur.description] if row else []
+        return dict(zip(cols, row)) if row else None
+
+    async def catalog_sources_list(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT * FROM catalog_sources ORDER BY id ASC")
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def kids_kill_switch_enabled(self) -> bool:
+        value = await self.get_setting("kids_kill_switch")
+        return (value or "false").strip().lower() == "true"
+
+    async def set_kids_kill_switch(
+        self,
+        *,
+        enabled: bool,
+        actor: str,
+        reason: str,
+        correlation_id: str,
+    ) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO settings(key, value) VALUES('kids_kill_switch', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("true" if enabled else "false",),
+            )
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(
+                    event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("kill_switch_changed", "control", None, actor, reason, 0, correlation_id, utc_now_iso()),
+            )
+            await db.commit()
+        return await self.kids_kill_switch_enabled() == enabled
+
+    async def audit_kids_event(
+        self,
+        *,
+        event: str,
+        actor: str = "",
+        reason: str = "",
+        entity_type: str = "",
+        entity_id: int | None = None,
+        revision: int = 0,
+        correlation_id: str = "",
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(
+                    event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (event, entity_type, entity_id, actor, reason, revision, correlation_id, utc_now_iso()),
+            )
+            await db.commit()
+
+    async def kids_audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 500))
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT id, event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+                FROM kids_audit_events ORDER BY id DESC LIMIT ?
+                """,
+                (bounded,),
+            )
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def kids_watch_event_record(
+        self,
+        *,
+        video_id: str,
+        event: str,
+        profile: str,
+        position_seconds: float | None,
+        session_id: str,
+        correlation_id: str,
+    ) -> dict[str, Any] | None:
+        if event not in {"selected", "started", "completed", "stopped"}:
+            raise ValueError("invalid Kids watch event")
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            item = await (
+                await db.execute(
+                    "SELECT id FROM catalog_items WHERE video_id=?",
+                    (video_id,),
+                )
+            ).fetchone()
+            if not item:
+                return None
+            cursor = await db.execute(
+                """
+                INSERT INTO kids_watch_events(
+                    video_id, event, profile, position_seconds, session_id,
+                    correlation_id, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    video_id,
+                    event,
+                    profile,
+                    position_seconds,
+                    session_id,
+                    correlation_id,
+                    now,
+                ),
+            )
+            event_id = cursor.lastrowid
+            await db.commit()
+        return {
+            "id": event_id,
+            "video_id": video_id,
+            "event": event,
+            "profile": profile,
+            "position_seconds": position_seconds,
+            "session_id": session_id,
+            "correlation_id": correlation_id,
+            "created_at": now,
+        }
+
+    async def kids_watch_events_list(self, limit: int = 100) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 500))
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT w.*, i.title, i.source_id, s.title AS source_title
+                FROM kids_watch_events w
+                LEFT JOIN catalog_items i ON i.video_id = w.video_id
+                LEFT JOIN catalog_sources s ON s.id = i.source_id
+                ORDER BY w.id DESC
+                LIMIT ?
+                """,
+                (bounded,),
+            )
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
 
     async def _ensure_defaults(self) -> None:
         defaults = {
@@ -172,6 +572,7 @@ class Database:
             "allowlist_source_urls": "",
             "allow_policy_flags_json": "{}",
             "schedule_mode": "blocklist",
+            "kids_kill_switch": "false",
         }
         for key, value in defaults.items():
             existing = await self.get_setting(key)

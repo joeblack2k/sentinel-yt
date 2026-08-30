@@ -1,0 +1,21 @@
+[Unit]
+Description=Sentinel Kids YouTube Kids ingest
+After=network-online.target youtube-sub-browser-auth-browser.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=homelab
+Group=homelab
+WorkingDirectory=/opt/sentinel-yt
+EnvironmentFile=-/opt/sentinel-yt/.env
+Environment=PATH=/opt/sentinel-yt/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=KIDS_BROWSER_CDP_URL=http://127.0.0.1:9223
+ExecStart=/opt/sentinel-yt/.venv/bin/python -m app.services.kids_ingest
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/sentinel-yt /opt/sentinel-yt/data
+StandardOutput=journal
+StandardError=journal

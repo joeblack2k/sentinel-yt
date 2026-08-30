@@ -9,6 +9,46 @@ class ControlStateRequest(BaseModel):
     active: bool
 
 
+CatalogState = Literal["candidate", "approved", "blocked", "revoked", "unknown"]
+
+
+class CatalogSourceRequest(BaseModel):
+    kind: Literal["channel", "playlist"]
+    reference: str = Field(min_length=1, max_length=256)
+    title: str = Field(default="", max_length=500)
+
+
+class CatalogItemRequest(BaseModel):
+    video_id: str = Field(min_length=1, max_length=64)
+    title: str = Field(default="", max_length=500)
+    source_id: int | None = Field(default=None, ge=1)
+    thumbnail_url: str = Field(default="", max_length=2000)
+    duration_seconds: int = Field(default=0, ge=0, le=86400)
+    visual_category: str = Field(default="general", max_length=64)
+
+
+class CatalogTransitionRequest(BaseModel):
+    state: CatalogState
+    actor: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=1000)
+    correlation_id: str = Field(min_length=1, max_length=128)
+
+class KidsKillSwitchRequest(BaseModel):
+    enabled: bool
+    actor: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=1000)
+    correlation_id: str = Field(min_length=1, max_length=128)
+
+
+class KidsWatchEventRequest(BaseModel):
+    video_id: str = Field(min_length=1, max_length=64)
+    event: Literal["selected", "started", "completed", "stopped"]
+    profile: str = Field(default="noah", min_length=1, max_length=64)
+    position_seconds: float | None = Field(default=None, ge=0, le=86400)
+    session_id: str = Field(default="", max_length=128)
+    correlation_id: str = Field(min_length=1, max_length=128)
+
+
 class WebhookControlRequest(BaseModel):
     active: bool
     source: str = "home_assistant"

@@ -30,9 +30,14 @@ from .config import (
 from .db import Database, utc_now_iso
 from .models import (
     AllowPolicyFlagsRequest,
+    CatalogItemRequest,
+    CatalogSourceRequest,
+    CatalogTransitionRequest,
     ControlStateRequest,
     GeminiSettingsRequest,
+    KidsWatchEventRequest,
     LocalBlocklistContentRequest,
+    KidsKillSwitchRequest,
     MqttConfigRequest,
     MqttStateRequest,
     PairCodeOnlyRequest,
@@ -54,6 +59,7 @@ from .models import (
 from .services.blocklists import BlocklistService
 from .services.discovery import DiscoveryService
 from .services.judge import GeminiFatalError, JudgeService, normalize_allow_policy_flags, normalize_policy_flags
+from .services.kids_classifier import OpenCodexKidsClassifier
 from .services.lounge_manager import LoungeManager, PairingError
 from .services.mqtt_bridge import MQTTBridge
 from .services.scheduler import ScheduleService
@@ -1224,6 +1230,26 @@ async def page_settings(request: Request) -> HTMLResponse:
     )
 
 
+@app.get("/kids", response_class=HTMLResponse)
+async def page_kids(request: Request) -> HTMLResponse:
+    runtime: RuntimeState = request.app.state.runtime
+    return templates.TemplateResponse(
+        request,
+        "kids.html",
+        {
+            "status": await runtime.get_status(),
+            "kids_status": {
+                "kill_switch": await runtime.db.kids_kill_switch_enabled(),
+                "catalog_revision": await runtime.db.catalog_revision(),
+            },
+            "sources": await runtime.db.catalog_sources_list(),
+            "items": await runtime.db.catalog_item_list_all(),
+            "watch_events": await runtime.db.kids_watch_events_list(),
+            "page": "kids",
+        },
+    )
+
+
 @app.get("/automation", response_class=HTMLResponse)
 async def page_automation(request: Request) -> HTMLResponse:
     status = await request.app.state.runtime.get_status()
@@ -1285,7 +1311,186 @@ async def api_control_state(payload: ControlStateRequest, request: Request) -> d
 
 @app.get("/api/status")
 async def api_status(request: Request) -> dict[str, Any]:
-    return await request.app.state.runtime.get_status()
+    status = await request.app.state.runtime.get_status()
+    status["kids_kill_switch"] = await request.app.state.runtime.db.kids_kill_switch_enabled()
+    return status
+
+
+@app.get("/api/kids/catalog/revision")
+async def api_catalog_revision(request: Request) -> dict[str, Any]:
+    return {"revision": await request.app.state.runtime.db.catalog_revision()}
+
+
+@app.get("/api/kids/catalog/items")
+async def api_catalog_items(request: Request) -> dict[str, Any]:
+    if await request.app.state.runtime.db.kids_kill_switch_enabled():
+        return {"state": "kill_switch", "items": []}
+    return {"state": "ready", "items": await request.app.state.runtime.db.catalog_items_list()}
+
+
+@app.get("/api/kids/catalog/items/{item_id}")
+async def api_catalog_item(item_id: int, request: Request) -> dict[str, Any]:
+    if await request.app.state.runtime.db.kids_kill_switch_enabled():
+        raise HTTPException(status_code=403, detail="Kids kill switch is active")
+    item = await request.app.state.runtime.db.catalog_get("item", item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return item
+
+
+@app.get("/api/kids/catalog/items/by-video/{video_id}")
+async def api_catalog_item_by_video(video_id: str, request: Request) -> dict[str, Any]:
+    if await request.app.state.runtime.db.kids_kill_switch_enabled():
+        raise HTTPException(status_code=403, detail="Kids kill switch is active")
+    item = await request.app.state.runtime.db.catalog_item_by_video(video_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return item
+
+
+@app.get("/api/kids/sources")
+async def api_catalog_sources(request: Request) -> dict[str, Any]:
+    return {"sources": await request.app.state.runtime.db.catalog_sources_list()}
+
+
+@app.post("/api/kids/sources")
+async def api_catalog_source(payload: CatalogSourceRequest, request: Request) -> dict[str, Any]:
+    correlation_id = request.headers.get("X-Correlation-ID", f"catalog-source-{payload.reference}")
+    try:
+        return await request.app.state.runtime.db.catalog_create("source", {**payload.model_dump(), "correlation_id": correlation_id})
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/kids/catalog/items")
+async def api_catalog_item_create(payload: CatalogItemRequest, request: Request) -> dict[str, Any]:
+    correlation_id = request.headers.get("X-Correlation-ID", f"catalog-item-{payload.video_id}")
+    try:
+        return await request.app.state.runtime.db.catalog_create("item", {**payload.model_dump(), "correlation_id": correlation_id})
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.patch("/api/kids/sources/{source_id}/state")
+async def api_catalog_source_state(source_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
+    try:
+        result = await request.app.state.runtime.db.catalog_transition("source", source_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="catalog source not found")
+    return result
+
+
+@app.patch("/api/kids/catalog/items/{item_id}/state")
+async def api_catalog_item_state(item_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
+    try:
+        result = await request.app.state.runtime.db.catalog_transition("item", item_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return result
+
+
+@app.get("/api/kids/status")
+async def api_kids_status(request: Request) -> dict[str, Any]:
+    return {
+        "kill_switch": await request.app.state.runtime.db.kids_kill_switch_enabled(),
+        "catalog_revision": await request.app.state.runtime.db.catalog_revision(),
+    }
+
+
+@app.get("/api/kids/readyz")
+async def api_kids_readyz(request: Request) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    last_success = await runtime.db.get_setting("kids_ingest_last_success_at")
+    ingest_age_seconds: int | None = None
+    ingest_fresh = False
+    if last_success:
+        try:
+            finished_at = datetime.fromisoformat(last_success)
+            if finished_at.tzinfo is None:
+                finished_at = finished_at.replace(tzinfo=timezone.utc)
+            ingest_age_seconds = max(
+                0,
+                int((datetime.now(timezone.utc) - finished_at).total_seconds()),
+            )
+            ingest_fresh = ingest_age_seconds <= runtime.settings.kids_ingest_freshness_seconds
+        except ValueError:
+            ingest_age_seconds = None
+
+    opencodex_ready = False
+    classifier = OpenCodexKidsClassifier(
+        base_url=runtime.settings.opencodex_base_url,
+        model=runtime.settings.opencodex_model,
+    )
+    try:
+        await classifier.check_model()
+        opencodex_ready = True
+    except Exception:
+        opencodex_ready = False
+    finally:
+        await classifier.close()
+
+    payload = {
+        "status": "ready" if opencodex_ready and ingest_fresh else "unready",
+        "opencodex": "ready" if opencodex_ready else "unavailable",
+        "opencodex_model": runtime.settings.opencodex_model,
+        "ingest": "fresh" if ingest_fresh else "stale",
+        "ingest_last_success_at": last_success,
+        "ingest_age_seconds": ingest_age_seconds,
+        "catalog_revision": await runtime.db.catalog_revision(),
+    }
+    if payload["status"] != "ready":
+        raise HTTPException(status_code=503, detail=payload)
+    return payload
+
+
+@app.get("/api/kids/control/kill-switch")
+async def api_kids_kill_switch(request: Request) -> dict[str, Any]:
+    return {"enabled": await request.app.state.runtime.db.kids_kill_switch_enabled()}
+
+
+@app.post("/api/kids/control/kill-switch")
+async def api_kids_set_kill_switch(payload: KidsKillSwitchRequest, request: Request) -> dict[str, Any]:
+    ok = await request.app.state.runtime.db.set_kids_kill_switch(
+        enabled=payload.enabled,
+        actor=payload.actor,
+        reason=payload.reason,
+        correlation_id=payload.correlation_id,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="Kids kill switch state was not persisted")
+    return {"enabled": payload.enabled}
+
+
+@app.get("/api/kids/audit")
+async def api_kids_audit(request: Request, limit: int = 100) -> dict[str, Any]:
+    return {"events": await request.app.state.runtime.db.kids_audit_events(limit)}
+
+
+@app.post("/api/kids/watch-events", status_code=202)
+async def api_kids_watch_event(
+    payload: KidsWatchEventRequest,
+    request: Request,
+) -> dict[str, Any]:
+    event = await request.app.state.runtime.db.kids_watch_event_record(
+        video_id=payload.video_id,
+        event=payload.event,
+        profile=payload.profile,
+        position_seconds=payload.position_seconds,
+        session_id=payload.session_id,
+        correlation_id=payload.correlation_id,
+    )
+    if event is None:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return {"status": "accepted", "event_id": event["id"]}
+
+
+@app.get("/api/kids/watch-events")
+async def api_kids_watch_events(request: Request, limit: int = 100) -> dict[str, Any]:
+    return {"events": await request.app.state.runtime.db.kids_watch_events_list(limit)}
 
 
 @app.post("/api/webhook/control")
