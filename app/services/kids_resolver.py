@@ -136,6 +136,8 @@ async def run_once(
 
 async def _main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     settings = Settings()
     await run_once(db=Database(settings.db_path), settings=settings)
 
