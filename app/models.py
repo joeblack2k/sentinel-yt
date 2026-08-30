@@ -39,6 +39,16 @@ class KidsKillSwitchRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
     correlation_id: str = Field(min_length=1, max_length=128)
 
+
+class KidsWatchEventRequest(BaseModel):
+    video_id: str = Field(min_length=1, max_length=64)
+    event: Literal["selected", "started", "completed", "stopped"]
+    profile: str = Field(default="noah", min_length=1, max_length=64)
+    position_seconds: float | None = Field(default=None, ge=0, le=86400)
+    session_id: str = Field(default="", max_length=128)
+    correlation_id: str = Field(min_length=1, max_length=128)
+
+
 class WebhookControlRequest(BaseModel):
     active: bool
     source: str = "home_assistant"

@@ -158,6 +158,18 @@ class Database:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_kids_audit_created ON kids_audit_events(id DESC);
+                CREATE TABLE IF NOT EXISTS kids_watch_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id TEXT NOT NULL,
+                    event TEXT NOT NULL CHECK(event IN ('selected', 'started', 'completed', 'stopped')),
+                    profile TEXT NOT NULL DEFAULT 'noah',
+                    position_seconds REAL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    correlation_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_kids_watch_created ON kids_watch_events(id DESC);
+                CREATE INDEX IF NOT EXISTS idx_kids_watch_video ON kids_watch_events(video_id, id DESC);
 
                 CREATE INDEX IF NOT EXISTS idx_rules_scope_value ON rules(scope, value);
                 CREATE INDEX IF NOT EXISTS idx_rules_type_scope ON rules(rule_type, scope);
@@ -445,6 +457,76 @@ class Database:
                 """
                 SELECT id, event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
                 FROM kids_audit_events ORDER BY id DESC LIMIT ?
+                """,
+                (bounded,),
+            )
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def kids_watch_event_record(
+        self,
+        *,
+        video_id: str,
+        event: str,
+        profile: str,
+        position_seconds: float | None,
+        session_id: str,
+        correlation_id: str,
+    ) -> dict[str, Any] | None:
+        if event not in {"selected", "started", "completed", "stopped"}:
+            raise ValueError("invalid Kids watch event")
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            item = await (
+                await db.execute(
+                    "SELECT id FROM catalog_items WHERE video_id=?",
+                    (video_id,),
+                )
+            ).fetchone()
+            if not item:
+                return None
+            cursor = await db.execute(
+                """
+                INSERT INTO kids_watch_events(
+                    video_id, event, profile, position_seconds, session_id,
+                    correlation_id, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    video_id,
+                    event,
+                    profile,
+                    position_seconds,
+                    session_id,
+                    correlation_id,
+                    now,
+                ),
+            )
+            event_id = cursor.lastrowid
+            await db.commit()
+        return {
+            "id": event_id,
+            "video_id": video_id,
+            "event": event,
+            "profile": profile,
+            "position_seconds": position_seconds,
+            "session_id": session_id,
+            "correlation_id": correlation_id,
+            "created_at": now,
+        }
+
+    async def kids_watch_events_list(self, limit: int = 100) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 500))
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT w.*, i.title, i.source_id, s.title AS source_title
+                FROM kids_watch_events w
+                LEFT JOIN catalog_items i ON i.video_id = w.video_id
+                LEFT JOIN catalog_sources s ON s.id = i.source_id
+                ORDER BY w.id DESC
+                LIMIT ?
                 """,
                 (bounded,),
             )

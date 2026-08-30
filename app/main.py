@@ -35,6 +35,7 @@ from .models import (
     CatalogTransitionRequest,
     ControlStateRequest,
     GeminiSettingsRequest,
+    KidsWatchEventRequest,
     LocalBlocklistContentRequest,
     KidsKillSwitchRequest,
     MqttConfigRequest,
@@ -1243,6 +1244,7 @@ async def page_kids(request: Request) -> HTMLResponse:
             },
             "sources": await runtime.db.catalog_sources_list(),
             "items": await runtime.db.catalog_item_list_all(),
+            "watch_events": await runtime.db.kids_watch_events_list(),
             "page": "kids",
         },
     )
@@ -1466,6 +1468,29 @@ async def api_kids_set_kill_switch(payload: KidsKillSwitchRequest, request: Requ
 @app.get("/api/kids/audit")
 async def api_kids_audit(request: Request, limit: int = 100) -> dict[str, Any]:
     return {"events": await request.app.state.runtime.db.kids_audit_events(limit)}
+
+
+@app.post("/api/kids/watch-events", status_code=202)
+async def api_kids_watch_event(
+    payload: KidsWatchEventRequest,
+    request: Request,
+) -> dict[str, Any]:
+    event = await request.app.state.runtime.db.kids_watch_event_record(
+        video_id=payload.video_id,
+        event=payload.event,
+        profile=payload.profile,
+        position_seconds=payload.position_seconds,
+        session_id=payload.session_id,
+        correlation_id=payload.correlation_id,
+    )
+    if event is None:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return {"status": "accepted", "event_id": event["id"]}
+
+
+@app.get("/api/kids/watch-events")
+async def api_kids_watch_events(request: Request, limit: int = 100) -> dict[str, Any]:
+    return {"events": await request.app.state.runtime.db.kids_watch_events_list(limit)}
 
 
 @app.post("/api/webhook/control")

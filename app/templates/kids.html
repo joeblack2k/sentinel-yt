@@ -79,6 +79,28 @@
   </table>
 </section>
 
+<section class="panel">
+  <h2>Watch log</h2>
+  <p class="muted">Events from the Kids app are stored here for parent review and preference tuning.</p>
+  <table>
+    <thead><tr><th>Time</th><th>Event</th><th>Video</th><th>Title</th><th>Profile</th><th>Position</th></tr></thead>
+    <tbody>
+      {% for event in watch_events %}
+      <tr>
+        <td>{{ event.created_at }}</td>
+        <td>{{ event.event }}</td>
+        <td><code>{{ event.video_id }}</code></td>
+        <td>{{ event.title or '-' }}</td>
+        <td>{{ event.profile }}</td>
+        <td>{{ event.position_seconds if event.position_seconds is not none else '-' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">No Kids watch events yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
 <script>
 const statusNode = document.getElementById('kids-source-status');
 const correlation = () => `kids-ui-${Date.now()}`;

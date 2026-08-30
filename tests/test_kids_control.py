@@ -107,3 +107,78 @@ def test_parent_kids_page_is_available(tmp_path, monkeypatch):
         ):
             assert client.patch(path, json=body).status_code == 200
         assert client.get("/api/kids/catalog/items").json()["items"] == []
+
+
+def test_kids_watch_events_are_persisted_and_unknown_videos_are_rejected(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
+    module = importlib.reload(importlib.import_module("app.main"))
+
+    with TestClient(module.app) as client:
+        source = client.post(
+            "/api/kids/sources",
+            json={"kind": "channel", "reference": "UC-watch", "title": "Watch"},
+        ).json()
+        item = client.post(
+            "/api/kids/catalog/items",
+            json={
+                "video_id": "video-watch",
+                "title": "Watch item",
+                "source_id": source["id"],
+                "visual_category": "animals",
+            },
+        ).json()
+        for path, body in (
+            (
+                f"/api/kids/sources/{source['id']}/state",
+                {
+                    "state": "approved",
+                    "actor": "parent",
+                    "reason": "trusted channel",
+                    "correlation_id": "watch-source",
+                },
+            ),
+            (
+                f"/api/kids/catalog/items/{item['id']}/state",
+                {
+                    "state": "approved",
+                    "actor": "parent",
+                    "reason": "trusted item",
+                    "correlation_id": "watch-item",
+                },
+            ),
+        ):
+            assert client.patch(path, json=body).status_code == 200
+
+        accepted = client.post(
+            "/api/kids/watch-events",
+            json={
+                "video_id": "video-watch",
+                "event": "completed",
+                "profile": "noah",
+                "position_seconds": 95.5,
+                "session_id": "play-1",
+                "correlation_id": "watch-1",
+            },
+        )
+        assert accepted.status_code == 202
+        assert accepted.json()["status"] == "accepted"
+
+        events = client.get("/api/kids/watch-events").json()["events"]
+        assert events[0]["video_id"] == "video-watch"
+        assert events[0]["event"] == "completed"
+        assert events[0]["profile"] == "noah"
+        assert events[0]["position_seconds"] == 95.5
+        assert events[0]["source_title"] == "Watch"
+
+        unknown = client.post(
+            "/api/kids/watch-events",
+            json={
+                "video_id": "not-in-catalog",
+                "event": "selected",
+                "correlation_id": "watch-unknown",
+            },
+        )
+        assert unknown.status_code == 404
