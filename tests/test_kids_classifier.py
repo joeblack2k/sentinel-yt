@@ -1,3 +1,4 @@
+import json
 import httpx
 import pytest
 
@@ -36,6 +37,15 @@ async def test_classifier_checks_exact_model_and_returns_strict_safe_result():
         "confidence": 96,
     }
     await classifier.close()
+
+
+def test_classifier_accepts_observed_markdown_fence_but_not_extra_prose():
+    fenced = OpenCodexKidsClassifier._parse_json(
+        '```json\n{"verdict":"SAFE","reason":"ok","confidence":99}\n```'
+    )
+    assert fenced["verdict"] == "SAFE"
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        OpenCodexKidsClassifier._parse_json("Here is the JSON: {}")
 
 
 @pytest.mark.asyncio

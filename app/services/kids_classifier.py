@@ -62,7 +62,7 @@ class OpenCodexKidsClassifier:
             )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
-            result = json.loads(content)
+            result = self._parse_json(content)
             verdict = result.get("verdict")
             if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
                 raise ValueError("invalid verdict")
@@ -76,3 +76,19 @@ class OpenCodexKidsClassifier:
             }
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise KidsClassificationError("OpenCodex classification failed") from exc
+
+    @staticmethod
+    def _parse_json(content: Any) -> dict[str, Any]:
+        if not isinstance(content, str):
+            raise ValueError("classifier content is not text")
+        text = content.strip()
+        # OpenCodex may wrap an otherwise valid JSON object in a markdown fence.
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) < 3:
+                raise ValueError("empty fenced classifier response")
+            text = "\n".join(lines[1:-1]).strip()
+        result = json.loads(text)
+        if not isinstance(result, dict):
+            raise ValueError("classifier response is not an object")
+        return result
