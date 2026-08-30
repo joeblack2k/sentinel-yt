@@ -3,13 +3,14 @@ from dataclasses import dataclass
 import pytest
 
 from app.db import Database
-from app.services.kids_ingest import ingest_once, parse_cards, source_url
+from app.services.kids_ingest import HOME_SOURCE_REFERENCE, ingest_once, parse_cards, source_url
 
 
 def test_source_url_stays_inside_youtube_kids():
     assert source_url("channel", "UC123") == "https://www.youtubekids.com/channel/UC123"
     assert source_url("playlist", "PL123") == "https://www.youtubekids.com/playlist?list=PL123"
     assert source_url("channel", "https://www.youtubekids.com/channel/UC123").endswith("/UC123")
+    assert source_url("channel", HOME_SOURCE_REFERENCE) == "https://www.youtubekids.com/"
     with pytest.raises(ValueError):
         source_url("channel", "https://www.youtubekids.com/watch?v=abcdefghijk")
     with pytest.raises(ValueError):
@@ -58,13 +59,23 @@ def test_parse_cards_rejects_shorts_bad_host_and_missing_duration():
 @dataclass
 class FakeBrowser:
     async def cards_for_source(self, kind, reference):
+        if reference == HOME_SOURCE_REFERENCE:
+            return [
+                {
+                    "href": "/watch?v=abcdefghijk",
+                    "title": "Safe home animals",
+                    "label": "Safe home animals by Kids Channel 10 views",
+                    "duration": "5:00",
+                    "thumbnail_url": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg",
+                }
+            ]
         return [
             {
-                "href": "/watch?v=abcdefghijk",
-                "title": "Safe animals",
+                "href": "/watch?v=lmnopqrstuv",
+                "title": "Safe channel animals",
                 "label": "Safe animals by Approved Channel 10 views",
                 "duration": "5:00",
-                "thumbnail_url": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg",
+                "thumbnail_url": "https://i.ytimg.com/vi/lmnopqrstuv/hqdefault.jpg",
             }
         ]
 
@@ -101,8 +112,11 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
         },
     )
     report = await ingest_once(db, FakeBrowser(), FakeClassifier("SAFE"))
-    assert report.approved == 1
-    assert (await db.catalog_items_list())[0]["video_id"] == "abcdefghijk"
+    assert report.approved == 2
+    assert {item["video_id"] for item in await db.catalog_items_list()} == {
+        "abcdefghijk",
+        "lmnopqrstuv",
+    }
 
     await db.catalog_transition(
         "item",
@@ -115,5 +129,5 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
         },
     )
     report = await ingest_once(db, FakeBrowser(), FakeClassifier("SAFE"))
-    assert report.skipped == 1
-    assert await db.catalog_items_list() == []
+    assert report.skipped == 2
+    assert [item["video_id"] for item in await db.catalog_items_list()] == ["lmnopqrstuv"]

@@ -18,6 +18,7 @@ from .kids_classifier import KidsClassificationError, OpenCodexKidsClassifier
 
 logger = logging.getLogger("sentinel.kids_ingest")
 
+HOME_SOURCE_REFERENCE = "__youtube_kids_home__"
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _DURATION = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})$")
 _CHANNEL_FROM_LABEL = re.compile(r"\sby\s(.+?)(?:\s[\d,]+ views|\s\d+ views|\s*$)", re.IGNORECASE)
@@ -56,6 +57,8 @@ def _duration_seconds(value: str) -> int:
 
 def source_url(kind: str, reference: str) -> str:
     raw = reference.strip()
+    if kind == "channel" and raw == HOME_SOURCE_REFERENCE:
+        return "https://www.youtubekids.com/"
     parsed = urllib.parse.urlparse(raw)
     if parsed.scheme or parsed.netloc:
         if parsed.scheme != "https" or parsed.netloc.lower() != "www.youtubekids.com":
@@ -199,6 +202,33 @@ async def ingest_once(
         for source in await db.catalog_sources_list()
         if source.get("state") == "approved"
     ]
+    home_source = next(
+        (source for source in await db.catalog_sources_list()
+         if source.get("reference") == HOME_SOURCE_REFERENCE),
+        None,
+    )
+    if home_source is None:
+        home_source = await db.catalog_create(
+            "source",
+            {
+                "kind": "channel",
+                "reference": HOME_SOURCE_REFERENCE,
+                "title": "YouTube Kids Home",
+                "correlation_id": "kids-home-source",
+            },
+        )
+        home_source = await db.catalog_transition(
+            "source",
+            int(home_source["id"]),
+            {
+                "state": "approved",
+                "actor": "kids-home-policy",
+                "reason": "Use the logged-in YouTube Kids home as the ingest source",
+                "correlation_id": "kids-home-approved",
+            },
+        )
+    if home_source.get("state") == "approved" and home_source not in sources:
+        sources.insert(0, home_source)
     report.sources_seen = len(sources)
     for source in sources:
         try:
