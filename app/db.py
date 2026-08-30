@@ -120,6 +120,9 @@ class Database:
                     video_id TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL DEFAULT '',
                     source_id INTEGER REFERENCES catalog_sources(id),
+                    thumbnail_url TEXT NOT NULL DEFAULT '',
+                    duration_seconds INTEGER NOT NULL DEFAULT 0,
+                    visual_category TEXT NOT NULL DEFAULT 'general',
                     state TEXT NOT NULL DEFAULT 'candidate'
                         CHECK(state IN ('candidate', 'approved', 'blocked', 'revoked', 'unknown')),
                     actor TEXT NOT NULL,
@@ -187,6 +190,14 @@ class Database:
                     await db.execute("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT 'blocklist'")
                 if "updated_at" not in sched_cols:
                     await db.execute("ALTER TABLE schedules ADD COLUMN updated_at TEXT")
+            cur = await db.execute("PRAGMA table_info(catalog_items)")
+            item_cols = {row[1] for row in await cur.fetchall()}
+            if "thumbnail_url" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN thumbnail_url TEXT NOT NULL DEFAULT ''")
+            if "duration_seconds" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0")
+            if "visual_category" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN visual_category TEXT NOT NULL DEFAULT 'general'")
             await db.commit()
 
     async def _catalog_revision(self, db: aiosqlite.Connection) -> int:
@@ -213,8 +224,10 @@ class Database:
                 )
             else:
                 cur = await db.execute(
-                    "INSERT INTO catalog_items(video_id,title,source_id,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?)",
+                    "INSERT INTO catalog_items(video_id,title,source_id,thumbnail_url,duration_seconds,visual_category,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (values["video_id"].strip(), values.get("title", "").strip(), values.get("source_id"),
+                     values.get("thumbnail_url", "").strip(), int(values.get("duration_seconds", 0) or 0),
+                     values.get("visual_category", "general").strip() or "general",
                      "system", now, "candidate created", revision, values["correlation_id"]),
                 )
             entity_id = cur.lastrowid

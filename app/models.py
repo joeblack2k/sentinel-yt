@@ -22,6 +22,9 @@ class CatalogItemRequest(BaseModel):
     video_id: str = Field(min_length=1, max_length=64)
     title: str = Field(default="", max_length=500)
     source_id: int | None = Field(default=None, ge=1)
+    thumbnail_url: str = Field(default="", max_length=2000)
+    duration_seconds: int = Field(default=0, ge=0, le=86400)
+    visual_category: str = Field(default="general", max_length=64)
 
 
 class CatalogTransitionRequest(BaseModel):
