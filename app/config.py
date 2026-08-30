@@ -48,7 +48,7 @@ class Settings:
     )
     kids_resolver_batch_size: int = field(default_factory=lambda: int(os.getenv("KIDS_RESOLVER_BATCH_SIZE", "2")))
     kids_resolve_refresh_margin_seconds: int = field(
-        default_factory=lambda: int(os.getenv("KIDS_RESOLVE_REFRESH_MARGIN_SECONDS", "1800"))
+        default_factory=lambda: int(os.getenv("KIDS_RESOLVE_REFRESH_MARGIN_SECONDS", "300"))
     )
     kids_playback_min_remaining_seconds: int = field(
         default_factory=lambda: int(os.getenv("KIDS_PLAYBACK_MIN_REMAINING_SECONDS", "300"))

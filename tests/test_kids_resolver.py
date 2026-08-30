@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.db import Database
-from app.services.kids_resolver import run_once
+from app.services.kids_resolver import PRACTICAL_CANDIDATE_TTL, normalize_candidate, run_once
 
 
 def signed_url(kind: str, expires_at: datetime) -> str:
@@ -15,6 +15,30 @@ def signed_url(kind: str, expires_at: datetime) -> str:
         f"https://rr1---sn.example.googlevideo.com/videoplayback/{kind}"
         f"?expire={int(expires_at.timestamp())}&sig=opaque"
     )
+
+
+def test_resolved_candidate_is_capped_before_po_token_goes_stale():
+    resolved_at = datetime.now(timezone.utc)
+    signed_expiry = resolved_at + timedelta(hours=6)
+    normalized = normalize_candidate(
+        {
+            "status": "ready",
+            "resolved_at": resolved_at.isoformat(),
+            "expires_at": signed_expiry.isoformat(),
+            "candidate": {
+                "media_url": signed_url("video", signed_expiry),
+                "audio_url": signed_url("audio", signed_expiry),
+                "quality_height": 1080,
+                "codec": "avc1.640028",
+                "video_headers": {},
+                "audio_headers": {},
+            },
+        }
+    )
+
+    assert normalized is not None
+    practical_expiry = datetime.fromisoformat(normalized[4])
+    assert practical_expiry == resolved_at + PRACTICAL_CANDIDATE_TTL
 
 
 async def eligible_item(db: Database, video_id: str = "video-ready") -> dict:

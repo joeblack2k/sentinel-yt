@@ -14,6 +14,8 @@ from ..db import Database
 
 logger = logging.getLogger(__name__)
 
+PRACTICAL_CANDIDATE_TTL = timedelta(minutes=25)
+
 
 def _utc_timestamp(value: Any) -> str | None:
     if not isinstance(value, str):
@@ -67,7 +69,12 @@ def normalize_candidate(payload: Any) -> tuple[dict[str, Any], int, str, str, st
     audio_expiry = _signed_expiry(candidate.get("audio_url"))
     if media_expiry is None or audio_expiry is None:
         return None
-    earliest_expiry = min(media_expiry, audio_expiry)
+    resolved_datetime = datetime.fromisoformat(resolved_at)
+    earliest_expiry = min(
+        media_expiry,
+        audio_expiry,
+        resolved_datetime + PRACTICAL_CANDIDATE_TTL,
+    )
     if earliest_expiry <= datetime.now(timezone.utc) + timedelta(seconds=120):
         return None
     required = {"media_url", "audio_url", "quality_height", "codec", "video_headers", "audio_headers"}
