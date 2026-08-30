@@ -20,6 +20,7 @@ logger = logging.getLogger("sentinel.kids_ingest")
 
 HOME_SOURCE_REFERENCE = "__youtube_kids_home__"
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_CHANNEL_ID = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 _DURATION = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})$")
 _CHANNEL_FROM_LABEL = re.compile(r"\sby\s(.+?)(?:\s[\d,]+ views|\s\d+ views|\s*$)", re.IGNORECASE)
 
@@ -252,12 +253,13 @@ async def ingest_once(
 
     # Discover channel identities from Home, but leave them candidate-only until a parent approves them.
     known_references = {
-        str(source.get("reference", "")).strip()
+        channel_id_from_reference(str(source.get("reference", "")))
         for source in await db.catalog_sources_list()
+        if source.get("kind") == "channel"
     }
     for card in raw_cards[:max_cards_per_source]:
         channel_id = str(card.get("channel_id", "")).strip()
-        if not channel_id or channel_id in known_references:
+        if not _CHANNEL_ID.fullmatch(channel_id) or channel_id in known_references:
             continue
         source = await db.catalog_create(
             "source",

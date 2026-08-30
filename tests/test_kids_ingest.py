@@ -17,6 +17,17 @@ def test_source_url_stays_inside_youtube_kids():
         source_url("playlist", "https://www.youtubekids.com/search?query=lego")
 
 
+def test_channel_reference_normalization_and_discovery_id_validation():
+    from app.services.kids_ingest import _CHANNEL_ID, channel_id_from_reference
+
+    channel_id = "UCefhjBQbDVq0oqpoFBLuJrg"
+    assert _CHANNEL_ID.fullmatch(channel_id)
+    assert channel_id_from_reference(
+        f"https://www.youtubekids.com/channel/{channel_id}"
+    ) == channel_id
+    assert not _CHANNEL_ID.fullmatch("UC123")
+
+
 def test_parse_cards_rejects_shorts_bad_host_and_missing_duration():
     cards = [
         {
