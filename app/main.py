@@ -58,6 +58,7 @@ from .models import (
 from .services.blocklists import BlocklistService
 from .services.discovery import DiscoveryService
 from .services.judge import GeminiFatalError, JudgeService, normalize_allow_policy_flags, normalize_policy_flags
+from .services.kids_classifier import KidsClassificationError, OpenCodexKidsClassifier
 from .services.lounge_manager import LoungeManager, PairingError
 from .services.mqtt_bridge import MQTTBridge
 from .services.scheduler import ScheduleService
@@ -1396,6 +1397,52 @@ async def api_kids_status(request: Request) -> dict[str, Any]:
         "kill_switch": await request.app.state.runtime.db.kids_kill_switch_enabled(),
         "catalog_revision": await request.app.state.runtime.db.catalog_revision(),
     }
+
+
+@app.get("/api/kids/readyz")
+async def api_kids_readyz(request: Request) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    last_success = await runtime.db.get_setting("kids_ingest_last_success_at")
+    ingest_age_seconds: int | None = None
+    ingest_fresh = False
+    if last_success:
+        try:
+            finished_at = datetime.fromisoformat(last_success)
+            if finished_at.tzinfo is None:
+                finished_at = finished_at.replace(tzinfo=timezone.utc)
+            ingest_age_seconds = max(
+                0,
+                int((datetime.now(timezone.utc) - finished_at).total_seconds()),
+            )
+            ingest_fresh = ingest_age_seconds <= runtime.settings.kids_ingest_freshness_seconds
+        except ValueError:
+            ingest_age_seconds = None
+
+    opencodex_ready = False
+    classifier = OpenCodexKidsClassifier(
+        base_url=runtime.settings.opencodex_base_url,
+        model=runtime.settings.opencodex_model,
+    )
+    try:
+        await classifier.check_model()
+        opencodex_ready = True
+    except Exception:
+        opencodex_ready = False
+    finally:
+        await classifier.close()
+
+    payload = {
+        "status": "ready" if opencodex_ready and ingest_fresh else "unready",
+        "opencodex": "ready" if opencodex_ready else "unavailable",
+        "opencodex_model": runtime.settings.opencodex_model,
+        "ingest": "fresh" if ingest_fresh else "stale",
+        "ingest_last_success_at": last_success,
+        "ingest_age_seconds": ingest_age_seconds,
+        "catalog_revision": await runtime.db.catalog_revision(),
+    }
+    if payload["status"] != "ready":
+        raise HTTPException(status_code=503, detail=payload)
+    return payload
 
 
 @app.get("/api/kids/control/kill-switch")

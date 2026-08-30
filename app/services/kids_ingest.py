@@ -13,7 +13,7 @@ from typing import Any
 import websockets
 
 from ..config import Settings
-from ..db import Database
+from ..db import Database, utc_now_iso
 from .kids_classifier import KidsClassificationError, OpenCodexKidsClassifier
 
 logger = logging.getLogger("sentinel.kids_ingest")
@@ -395,6 +395,8 @@ async def _main() -> None:
             classifier,
             max_cards_per_source=max(1, int(os.getenv("KIDS_INGEST_MAX_CARDS", "12"))),
         )
+        if report.errors == 0:
+            await db.set_setting("kids_ingest_last_success_at", utc_now_iso())
         print(json.dumps(asdict(report), sort_keys=True))
     finally:
         await classifier.close()
