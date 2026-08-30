@@ -58,7 +58,7 @@ from .models import (
 from .services.blocklists import BlocklistService
 from .services.discovery import DiscoveryService
 from .services.judge import GeminiFatalError, JudgeService, normalize_allow_policy_flags, normalize_policy_flags
-from .services.kids_classifier import KidsClassificationError, OpenCodexKidsClassifier
+from .services.kids_classifier import OpenCodexKidsClassifier
 from .services.lounge_manager import LoungeManager, PairingError
 from .services.mqtt_bridge import MQTTBridge
 from .services.scheduler import ScheduleService
