@@ -92,6 +92,23 @@ class FakeBrowser:
 
 
 @dataclass
+class ChannelHomeBrowser:
+    async def cards_for_source(self, kind, reference):
+        if reference == HOME_SOURCE_REFERENCE:
+            return [
+                {
+                    "href": "/watch?v=abcdefghijk",
+                    "title": "Safe home animals",
+                    "label": "Safe home animals by Approved Channel 10 views",
+                    "duration": "5:00",
+                    "thumbnail_url": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg",
+                    "channel_id": "UC123",
+                }
+            ]
+        return []
+
+
+@dataclass
 class FakeClassifier:
     verdict: str
     calls: list[dict] = None
@@ -147,3 +164,43 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
     report = await ingest_once(db, FakeBrowser(), FakeClassifier("SAFE"))
     assert report.skipped == 1
     assert await db.catalog_items_list() == []
+
+
+@pytest.mark.asyncio
+async def test_safe_channel_stays_hidden_until_parent_approval(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": "UC123",
+            "title": "Discovered channel",
+            "correlation_id": "source",
+        },
+    )
+    await db.catalog_source_safety_update(
+        source["id"],
+        verdict="SAFE",
+        reason="test",
+        actor="kids-channel-guardian",
+        correlation_id="classify-source",
+    )
+
+    first = await ingest_once(db, ChannelHomeBrowser(), FakeClassifier("SAFE"))
+    assert first.approved == 0
+    assert await db.catalog_items_list() == []
+
+    await db.catalog_transition(
+        "source",
+        source["id"],
+        {
+            "state": "approved",
+            "actor": "parent",
+            "reason": "approved for Noah",
+            "correlation_id": "approve-source",
+        },
+    )
+    second = await ingest_once(db, ChannelHomeBrowser(), FakeClassifier("SAFE"))
+    assert second.approved == 1
+    assert [item["video_id"] for item in await db.catalog_items_list()] == ["abcdefghijk"]
