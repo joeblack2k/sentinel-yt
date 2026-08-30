@@ -16,6 +16,6 @@ ExecStart=/opt/sentinel-yt/.venv/bin/python -m app.services.kids_ingest
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/data
+ReadWritePaths=/opt/sentinel-yt /opt/sentinel-yt/data
 StandardOutput=journal
 StandardError=journal
