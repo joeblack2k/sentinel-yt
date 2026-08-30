@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>SubTube Kids</h1>
+<p class="muted">Only approved channels and playlists can publish items to the Kids gateway.</p>
+
+<section class="panel">
+  <h2>Approved sources</h2>
+  <form id="kids-source-form">
+    <label>Type
+      <select name="kind">
+        <option value="channel">Channel</option>
+        <option value="playlist">Playlist</option>
+      </select>
+    </label>
+    <label>Channel ID or Kids URL
+      <input name="reference" required maxlength="256" placeholder="UC... or https://www.youtubekids.com/channel/...">
+    </label>
+    <label>Parent label
+      <input name="title" maxlength="500" placeholder="Optional">
+    </label>
+    <button type="submit">Add candidate</button>
+  </form>
+  <p id="kids-source-status" class="muted"></p>
+  <table>
+    <thead><tr><th>Type</th><th>Reference</th><th>State</th><th>Action</th></tr></thead>
+    <tbody id="kids-sources">
+      {% for source in sources %}
+      <tr data-id="{{ source.id }}">
+        <td>{{ source.kind }}</td>
+        <td><code>{{ source.reference }}</code></td>
+        <td class="state">{{ source.state }}</td>
+        <td>
+          {% if source.state != 'approved' %}
+          <button data-state="approved">Approve</button>
+          {% endif %}
+          {% if source.state != 'revoked' %}
+          <button data-state="revoked">Revoke</button>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" class="muted">No Kids sources configured.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>Catalog</h2>
+  <p class="muted">Feed revision {{ kids_status.catalog_revision }}. Only approved items from approved sources are visible to the Kids app.</p>
+  <table>
+    <thead><tr><th>Video</th><th>Source</th><th>State</th><th>Action</th></tr></thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td><code>{{ item.video_id }}</code></td>
+        <td>{{ item.source_id or '-' }}</td>
+        <td>{{ item.state }}</td>
+        <td>
+          {% if item.state != 'approved' %}
+          <button data-item-id="{{ item.id }}" data-state="approved">Approve</button>
+          {% endif %}
+          {% if item.state != 'revoked' %}
+          <button data-item-id="{{ item.id }}" data-state="revoked">Revoke</button>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" class="muted">No catalog items yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<script>
+const statusNode = document.getElementById('kids-source-status');
+const correlation = () => `kids-ui-${Date.now()}`;
+
+async function changeState(url, state) {
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
+    body: JSON.stringify({state, actor: 'parent-ui', reason: `Kids UI ${state}`, correlation_id: correlation()})
+  });
+  if (!response.ok) throw new Error(await response.text());
+  location.reload();
+}
+
+document.getElementById('kids-source-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  try {
+    const response = await fetch('/api/kids/sources', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
+      body: JSON.stringify(Object.fromEntries(form.entries()))
+    });
+    if (!response.ok) throw new Error(await response.text());
+    statusNode.textContent = 'Candidate added. Approve it only after parent review.';
+    event.currentTarget.reset();
+    setTimeout(() => location.reload(), 500);
+  } catch (error) {
+    statusNode.textContent = `Could not add source: ${error}`;
+  }
+});
+
+document.querySelectorAll('[data-state]').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const row = button.closest('tr');
+    const sourceId = row?.dataset.id;
+    const itemId = button.dataset.itemId;
+    const url = sourceId
+      ? `/api/kids/sources/${sourceId}/state`
+      : `/api/kids/catalog/items/${itemId}/state`;
+    try {
+      await changeState(url, button.dataset.state);
+    } catch (error) {
+      statusNode.textContent = `Could not change state: ${error}`;
+    }
+  });
+});
+</script>
+{% endblock %}

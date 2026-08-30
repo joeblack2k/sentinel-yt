@@ -291,6 +291,13 @@ class Database:
             cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in rows]
 
+    async def catalog_item_list_all(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT * FROM catalog_items ORDER BY id ASC")
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
     async def catalog_item_by_video(self, video_id: str) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute("SELECT * FROM catalog_items WHERE video_id=?", (video_id,))

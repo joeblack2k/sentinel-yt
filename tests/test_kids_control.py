@@ -68,7 +68,19 @@ def test_approved_item_requires_approved_source(tmp_path, monkeypatch):
                 "correlation_id": "orphan-approve",
             },
         ).status_code == 200
-        assert client.get("/api/kids/catalog/items").json()["items"] == []
+    assert client.get("/api/kids/catalog/items").json()["items"] == []
+
+
+def test_parent_kids_page_is_available(tmp_path, monkeypatch):
+    monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
+    module = importlib.reload(importlib.import_module("app.main"))
+
+    with TestClient(module.app) as client:
+        response = client.get("/kids")
+        assert response.status_code == 200
+        assert "SubTube Kids" in response.text
+        assert "Approved sources" in response.text
 
         source = client.post(
             "/api/kids/sources",

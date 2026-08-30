@@ -1228,6 +1228,25 @@ async def page_settings(request: Request) -> HTMLResponse:
     )
 
 
+@app.get("/kids", response_class=HTMLResponse)
+async def page_kids(request: Request) -> HTMLResponse:
+    runtime: RuntimeState = request.app.state.runtime
+    return templates.TemplateResponse(
+        request,
+        "kids.html",
+        {
+            "status": await runtime.get_status(),
+            "kids_status": {
+                "kill_switch": await runtime.db.kids_kill_switch_enabled(),
+                "catalog_revision": await runtime.db.catalog_revision(),
+            },
+            "sources": await runtime.db.catalog_sources_list(),
+            "items": await runtime.db.catalog_item_list_all(),
+            "page": "kids",
+        },
+    )
+
+
 @app.get("/automation", response_class=HTMLResponse)
 async def page_automation(request: Request) -> HTMLResponse:
     status = await request.app.state.runtime.get_status()
