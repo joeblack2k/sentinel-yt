@@ -34,6 +34,9 @@ class Settings:
     remote_blocklists_cache_ttl_seconds: int = field(
         default_factory=lambda: int(os.getenv("SENTINEL_REMOTE_BLOCKLISTS_CACHE_TTL_SECONDS", "900"))
     )
+    kids_parent_token: str = field(default_factory=lambda: os.getenv("SENTINEL_KIDS_PARENT_TOKEN", ""))
+    kids_ingest_token: str = field(default_factory=lambda: os.getenv("SENTINEL_KIDS_INGEST_TOKEN", ""))
+    kids_gateway_token: str = field(default_factory=lambda: os.getenv("SENTINEL_KIDS_GATEWAY_TOKEN", ""))
 
 
 def get_host_timezone_name() -> str:

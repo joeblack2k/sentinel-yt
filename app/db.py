@@ -140,6 +140,18 @@ class Database:
                     revision INTEGER NOT NULL,
                     correlation_id TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS kids_audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event TEXT NOT NULL,
+                    entity_type TEXT NOT NULL DEFAULT '',
+                    entity_id INTEGER,
+                    actor TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    correlation_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_kids_audit_created ON kids_audit_events(id DESC);
 
                 CREATE INDEX IF NOT EXISTS idx_rules_scope_value ON rules(scope, value);
                 CREATE INDEX IF NOT EXISTS idx_rules_type_scope ON rules(rule_type, scope);
@@ -206,6 +218,13 @@ class Database:
                      "system", now, "candidate created", revision, values["correlation_id"]),
                 )
             entity_id = cur.lastrowid
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("candidate_created", entity, entity_id, "system", "candidate created", revision, values["correlation_id"], now),
+            )
             await db.commit()
         return await self.catalog_get(entity, entity_id)
 
@@ -236,6 +255,13 @@ class Database:
                 "INSERT INTO catalog_transitions(entity_type,entity_id,from_state,to_state,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?,?)",
                 (entity, entity_id, old, values["state"], values["actor"], now, values["reason"], revision, values["correlation_id"]),
             )
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("state_changed", entity, entity_id, values["actor"], values["reason"], revision, values["correlation_id"], now),
+            )
             await db.commit()
         return await self.catalog_get(entity, entity_id)
 
@@ -257,6 +283,63 @@ class Database:
     async def catalog_sources_list(self) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute("SELECT * FROM catalog_sources ORDER BY id ASC")
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def kids_kill_switch_enabled(self) -> bool:
+        value = await self.get_setting("kids_kill_switch")
+        return (value or "false").strip().lower() == "true"
+
+    async def set_kids_kill_switch(
+        self,
+        *,
+        enabled: bool,
+        actor: str,
+        reason: str,
+        correlation_id: str,
+    ) -> bool:
+        await self.set_setting("kids_kill_switch", "true" if enabled else "false")
+        await self.audit_kids_event(
+            event="kill_switch_changed",
+            actor=actor,
+            reason=reason,
+            correlation_id=correlation_id,
+        )
+        return await self.kids_kill_switch_enabled() == enabled
+
+    async def audit_kids_event(
+        self,
+        *,
+        event: str,
+        actor: str = "",
+        reason: str = "",
+        entity_type: str = "",
+        entity_id: int | None = None,
+        revision: int = 0,
+        correlation_id: str = "",
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(
+                    event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (event, entity_type, entity_id, actor, reason, revision, correlation_id, utc_now_iso()),
+            )
+            await db.commit()
+
+    async def kids_audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 500))
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT id, event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+                FROM kids_audit_events ORDER BY id DESC LIMIT ?
+                """,
+                (bounded,),
+            )
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in rows]
@@ -299,6 +382,7 @@ class Database:
             "allowlist_source_urls": "",
             "allow_policy_flags_json": "{}",
             "schedule_mode": "blocklist",
+            "kids_kill_switch": "false",
         }
         for key, value in defaults.items():
             existing = await self.get_setting(key)
