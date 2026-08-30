@@ -9,6 +9,28 @@ class ControlStateRequest(BaseModel):
     active: bool
 
 
+CatalogState = Literal["candidate", "approved", "blocked", "revoked", "unknown"]
+
+
+class CatalogSourceRequest(BaseModel):
+    kind: Literal["channel", "playlist"]
+    reference: str = Field(min_length=1, max_length=256)
+    title: str = Field(default="", max_length=500)
+
+
+class CatalogItemRequest(BaseModel):
+    video_id: str = Field(min_length=1, max_length=64)
+    title: str = Field(default="", max_length=500)
+    source_id: int | None = Field(default=None, ge=1)
+
+
+class CatalogTransitionRequest(BaseModel):
+    state: CatalogState
+    actor: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=1000)
+    correlation_id: str = Field(min_length=1, max_length=128)
+
+
 class WebhookControlRequest(BaseModel):
     active: bool
     source: str = "home_assistant"

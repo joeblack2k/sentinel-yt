@@ -98,6 +98,49 @@ class Database:
                     created_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS catalog_meta (
+                    key TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS catalog_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK(kind IN ('channel', 'playlist')),
+                    reference TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'candidate'
+                        CHECK(state IN ('candidate', 'approved', 'blocked', 'revoked', 'unknown')),
+                    actor TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    correlation_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS catalog_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL DEFAULT '',
+                    source_id INTEGER REFERENCES catalog_sources(id),
+                    state TEXT NOT NULL DEFAULT 'candidate'
+                        CHECK(state IN ('candidate', 'approved', 'blocked', 'revoked', 'unknown')),
+                    actor TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    correlation_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS catalog_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_type TEXT NOT NULL,
+                    entity_id INTEGER NOT NULL,
+                    from_state TEXT NOT NULL,
+                    to_state TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    correlation_id TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_rules_scope_value ON rules(scope, value);
                 CREATE INDEX IF NOT EXISTS idx_rules_type_scope ON rules(rule_type, scope);
                 CREATE INDEX IF NOT EXISTS idx_schedules_enabled_id ON schedules(enabled, id);
@@ -133,6 +176,90 @@ class Database:
                 if "updated_at" not in sched_cols:
                     await db.execute("ALTER TABLE schedules ADD COLUMN updated_at TEXT")
             await db.commit()
+
+    async def _catalog_revision(self, db: aiosqlite.Connection) -> int:
+        await db.execute("INSERT OR IGNORE INTO catalog_meta(key, value) VALUES ('revision', 0)")
+        row = await (await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")).fetchone()
+        revision = int(row[0]) + 1
+        await db.execute("UPDATE catalog_meta SET value=? WHERE key='revision'", (revision,))
+        return revision
+
+    async def catalog_revision(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")).fetchone()
+        return int(row[0]) if row else 0
+
+    async def catalog_create(self, entity: str, values: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            revision = await self._catalog_revision(db)
+            if entity == "source":
+                cur = await db.execute(
+                    "INSERT INTO catalog_sources(kind,reference,title,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?)",
+                    (values["kind"], values["reference"].strip(), values.get("title", "").strip(), "system",
+                     now, "candidate created", revision, values["correlation_id"]),
+                )
+            else:
+                cur = await db.execute(
+                    "INSERT INTO catalog_items(video_id,title,source_id,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?)",
+                    (values["video_id"].strip(), values.get("title", "").strip(), values.get("source_id"),
+                     "system", now, "candidate created", revision, values["correlation_id"]),
+                )
+            entity_id = cur.lastrowid
+            await db.commit()
+        return await self.catalog_get(entity, entity_id)
+
+    async def catalog_get(self, entity: str, entity_id: int) -> dict[str, Any] | None:
+        table = "catalog_sources" if entity == "source" else "catalog_items"
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(f"SELECT * FROM {table} WHERE id=?", (entity_id,))
+            row = await cur.fetchone()
+            cols = [d[0] for d in cur.description] if row else []
+        return dict(zip(cols, row)) if row else None
+
+    async def catalog_transition(self, entity: str, entity_id: int, values: dict[str, Any]) -> dict[str, Any]:
+        table = "catalog_sources" if entity == "source" else "catalog_items"
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute(f"SELECT state FROM {table} WHERE id=?", (entity_id,))).fetchone()
+            if not row:
+                return None
+            old = row[0]
+            if old == "revoked" and values["state"] == "approved":
+                raise ValueError("revoked entries cannot be approved")
+            revision = await self._catalog_revision(db)
+            await db.execute(
+                f"UPDATE {table} SET state=?, actor=?, changed_at=?, reason=?, revision=?, correlation_id=? WHERE id=?",
+                (values["state"], values["actor"], now, values["reason"], revision, values["correlation_id"], entity_id),
+            )
+            await db.execute(
+                "INSERT INTO catalog_transitions(entity_type,entity_id,from_state,to_state,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (entity, entity_id, old, values["state"], values["actor"], now, values["reason"], revision, values["correlation_id"]),
+            )
+            await db.commit()
+        return await self.catalog_get(entity, entity_id)
+
+    async def catalog_items_list(self, approved_only: bool = True) -> list[dict[str, Any]]:
+        query = "SELECT * FROM catalog_items WHERE state='approved'" if approved_only else "SELECT * FROM catalog_items"
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(query + " ORDER BY id ASC")
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def catalog_item_by_video(self, video_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT * FROM catalog_items WHERE video_id=?", (video_id,))
+            row = await cur.fetchone()
+            cols = [d[0] for d in cur.description] if row else []
+        return dict(zip(cols, row)) if row else None
+
+    async def catalog_sources_list(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("SELECT * FROM catalog_sources ORDER BY id ASC")
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
 
     async def _ensure_defaults(self) -> None:
         defaults = {

@@ -30,6 +30,9 @@ from .config import (
 from .db import Database, utc_now_iso
 from .models import (
     AllowPolicyFlagsRequest,
+    CatalogItemRequest,
+    CatalogSourceRequest,
+    CatalogTransitionRequest,
     ControlStateRequest,
     GeminiSettingsRequest,
     LocalBlocklistContentRequest,
@@ -1286,6 +1289,77 @@ async def api_control_state(payload: ControlStateRequest, request: Request) -> d
 @app.get("/api/status")
 async def api_status(request: Request) -> dict[str, Any]:
     return await request.app.state.runtime.get_status()
+
+
+@app.get("/api/kids/catalog/revision")
+async def api_catalog_revision(request: Request) -> dict[str, Any]:
+    return {"revision": await request.app.state.runtime.db.catalog_revision()}
+
+
+@app.get("/api/kids/catalog/items")
+async def api_catalog_items(request: Request, approved_only: bool = True) -> dict[str, Any]:
+    return {"items": await request.app.state.runtime.db.catalog_items_list(approved_only)}
+
+
+@app.get("/api/kids/catalog/items/{item_id}")
+async def api_catalog_item(item_id: int, request: Request) -> dict[str, Any]:
+    item = await request.app.state.runtime.db.catalog_get("item", item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return item
+
+
+@app.get("/api/kids/catalog/items/by-video/{video_id}")
+async def api_catalog_item_by_video(video_id: str, request: Request) -> dict[str, Any]:
+    item = await request.app.state.runtime.db.catalog_item_by_video(video_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return item
+
+
+@app.get("/api/kids/sources")
+async def api_catalog_sources(request: Request) -> dict[str, Any]:
+    return {"sources": await request.app.state.runtime.db.catalog_sources_list()}
+
+
+@app.post("/api/kids/sources")
+async def api_catalog_source(payload: CatalogSourceRequest, request: Request) -> dict[str, Any]:
+    correlation_id = request.headers.get("X-Correlation-ID", f"catalog-source-{payload.reference}")
+    try:
+        return await request.app.state.runtime.db.catalog_create("source", {**payload.model_dump(), "correlation_id": correlation_id})
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/kids/catalog/items")
+async def api_catalog_item_create(payload: CatalogItemRequest, request: Request) -> dict[str, Any]:
+    correlation_id = request.headers.get("X-Correlation-ID", f"catalog-item-{payload.video_id}")
+    try:
+        return await request.app.state.runtime.db.catalog_create("item", {**payload.model_dump(), "correlation_id": correlation_id})
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.patch("/api/kids/sources/{source_id}/state")
+async def api_catalog_source_state(source_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
+    try:
+        result = await request.app.state.runtime.db.catalog_transition("source", source_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="catalog source not found")
+    return result
+
+
+@app.patch("/api/kids/catalog/items/{item_id}/state")
+async def api_catalog_item_state(item_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
+    try:
+        result = await request.app.state.runtime.db.catalog_transition("item", item_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return result
 
 
 @app.post("/api/webhook/control")
