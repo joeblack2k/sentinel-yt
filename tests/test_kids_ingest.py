@@ -10,6 +10,10 @@ def test_source_url_stays_inside_youtube_kids():
     assert source_url("channel", "UC123") == "https://www.youtubekids.com/channel/UC123"
     assert source_url("playlist", "PL123") == "https://www.youtubekids.com/playlist?list=PL123"
     assert source_url("channel", "https://www.youtubekids.com/channel/UC123").endswith("/UC123")
+    with pytest.raises(ValueError):
+        source_url("channel", "https://www.youtubekids.com/watch?v=abcdefghijk")
+    with pytest.raises(ValueError):
+        source_url("playlist", "https://www.youtubekids.com/search?query=lego")
 
 
 def test_parse_cards_rejects_shorts_bad_host_and_missing_duration():

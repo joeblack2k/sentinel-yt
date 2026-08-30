@@ -60,6 +60,11 @@ def source_url(kind: str, reference: str) -> str:
     if parsed.scheme or parsed.netloc:
         if parsed.scheme != "https" or parsed.netloc.lower() != "www.youtubekids.com":
             raise ValueError("Kids source URLs must stay on www.youtubekids.com")
+        path = parsed.path.rstrip("/")
+        if kind == "channel" and not path.startswith("/channel/"):
+            raise ValueError("channel source URLs must use the Kids channel route")
+        if kind == "playlist" and path != "/playlist":
+            raise ValueError("playlist source URLs must use the Kids playlist route")
         return raw
     encoded = urllib.parse.quote(raw, safe="")
     if kind == "channel":
