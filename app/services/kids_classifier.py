@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import httpx
+
+
+class KidsClassificationError(RuntimeError):
+    """The safety model could not return a usable decision."""
+
+
+class OpenCodexKidsClassifier:
+    """OpenAI-compatible, local OpenCodex classifier with deny-on-error semantics."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        client: httpx.AsyncClient | None = None,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.client = client or httpx.AsyncClient(base_url=self.base_url, timeout=20.0)
+        self._owns_client = client is None
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self.client.aclose()
+
+    async def check_model(self) -> str:
+        response = await self.client.get(f"{self.base_url}/models")
+        response.raise_for_status()
+        model_ids = {str(entry.get("id", "")) for entry in response.json().get("data", [])}
+        if self.model not in model_ids:
+            raise KidsClassificationError("configured OpenCodex model is unavailable")
+        return self.model
+
+    async def classify(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        try:
+            await self.check_model()
+            response = await self.client.post(
+                f"{self.base_url}/chat/completions",
+                json={
+                    "model": self.model,
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Classify this video for a calm 6-year-old Kids catalog. "
+                                "Return only JSON with verdict SAFE, UNSAFE, or UNCERTAIN, "
+                                "a short reason, and confidence 0-100. "
+                                "Choose UNCERTAIN whenever evidence is incomplete."
+                            ),
+                        },
+                        {"role": "user", "content": json.dumps(metadata, ensure_ascii=True)},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            result = json.loads(content)
+            verdict = result.get("verdict")
+            if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
+                raise ValueError("invalid verdict")
+            confidence = int(result.get("confidence", 0))
+            if not 0 <= confidence <= 100:
+                raise ValueError("invalid confidence")
+            return {
+                "verdict": verdict,
+                "reason": str(result.get("reason", ""))[:1000],
+                "confidence": confidence,
+            }
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise KidsClassificationError("OpenCodex classification failed") from exc

@@ -34,6 +34,12 @@ class Settings:
     remote_blocklists_cache_ttl_seconds: int = field(
         default_factory=lambda: int(os.getenv("SENTINEL_REMOTE_BLOCKLISTS_CACHE_TTL_SECONDS", "900"))
     )
+    opencodex_base_url: str = field(
+        default_factory=lambda: os.getenv("OPENCODEX_BASE_URL", "http://192.168.2.93:10100/v1").rstrip("/")
+    )
+    opencodex_model: str = field(
+        default_factory=lambda: os.getenv("OPENCODEX_MODEL", "google-antigravity/gemini-3.7-flash")
+    )
 
 
 def get_host_timezone_name() -> str:
