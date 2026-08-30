@@ -105,6 +105,17 @@ class ChannelHomeBrowser:
                     "channel_id": "UC123",
                 }
             ]
+        if reference == "UC123":
+            return [
+                {
+                    "href": "/watch?v=zyxwvutsrqp",
+                    "title": "Safe channel animals",
+                    "label": "Safe channel animals by Approved Channel 10 views",
+                    "duration": "4:00",
+                    "thumbnail_url": "https://i.ytimg.com/vi/zyxwvutsrqp/hqdefault.jpg",
+                    "channel_id": "UC123",
+                }
+            ]
         return []
 
 
@@ -202,5 +213,8 @@ async def test_safe_channel_stays_hidden_until_parent_approval(tmp_path):
         },
     )
     second = await ingest_once(db, ChannelHomeBrowser(), FakeClassifier("SAFE"))
-    assert second.approved == 1
-    assert [item["video_id"] for item in await db.catalog_items_list()] == ["abcdefghijk"]
+    assert second.approved == 2
+    assert [item["video_id"] for item in await db.catalog_items_list()] == [
+        "abcdefghijk",
+        "zyxwvutsrqp",
+    ]

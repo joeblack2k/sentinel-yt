@@ -331,21 +331,47 @@ async def ingest_once(
 
     if home_source.get("state") != "approved" or not safe_channel_ids:
         return report
+    candidates: list[KidsVideoCandidate] = []
     try:
         raw_cards = await browser.cards_for_source("channel", HOME_SOURCE_REFERENCE)
         report.cards_seen += len(raw_cards)
-        candidates = parse_cards(
-            raw_cards[:max_cards_per_source],
-            source_id=int(home_source["id"]),
-            source_reference=HOME_SOURCE_REFERENCE,
-            allowed_channel_ids=safe_channel_ids,
+        candidates.extend(
+            parse_cards(
+                raw_cards[:max_cards_per_source],
+                source_id=int(home_source["id"]),
+                source_reference=HOME_SOURCE_REFERENCE,
+                allowed_channel_ids=safe_channel_ids,
+            )
         )
     except Exception:
         report.errors += 1
         logger.exception("Kids home ingest failed")
         return report
 
+    for source in sources:
+        channel_id = channel_id_from_reference(str(source["reference"]))
+        if source.get("state") != "approved" or channel_id not in safe_channel_ids:
+            continue
+        try:
+            channel_cards = await browser.cards_for_source("channel", channel_id)
+            report.cards_seen += len(channel_cards)
+            candidates.extend(
+                parse_cards(
+                    channel_cards[:max_cards_per_source],
+                    source_id=int(source["id"]),
+                    source_reference=channel_id,
+                    allowed_channel_ids={channel_id},
+                )
+            )
+        except Exception:
+            report.errors += 1
+            logger.exception("Kids channel ingest failed")
+
+    seen_candidates: set[str] = set()
     for candidate in candidates:
+        if candidate.video_id in seen_candidates:
+            continue
+        seen_candidates.add(candidate.video_id)
         existing = await db.catalog_item_by_video(candidate.video_id)
         if existing and existing.get("state") in {"revoked", "approved"}:
             report.skipped += 1
