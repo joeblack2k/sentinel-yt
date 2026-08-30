@@ -10,14 +10,6 @@ class ControlStateRequest(BaseModel):
 
 
 CatalogState = Literal["candidate", "approved", "blocked", "revoked", "unknown"]
-_CREDENTIAL_WORDS = ("authorization", "bearer", "cookie", "secret", "token")
-
-
-def _reject_credential_text(value: str) -> str:
-    lowered = value.lower()
-    if any(word in lowered for word in _CREDENTIAL_WORDS):
-        raise ValueError("credential-like text is not accepted")
-    return value.strip()
 
 
 class CatalogSourceRequest(BaseModel):
@@ -38,23 +30,11 @@ class CatalogTransitionRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
     correlation_id: str = Field(min_length=1, max_length=128)
 
-    @field_validator("actor", "reason", "correlation_id")
-    @classmethod
-    def reject_credential_text(cls, value: str) -> str:
-        return _reject_credential_text(value)
-
-
 class KidsKillSwitchRequest(BaseModel):
     enabled: bool
     actor: str = Field(min_length=1, max_length=128)
     reason: str = Field(min_length=1, max_length=1000)
     correlation_id: str = Field(min_length=1, max_length=128)
-
-    @field_validator("actor", "reason", "correlation_id")
-    @classmethod
-    def reject_credential_text(cls, value: str) -> str:
-        return _reject_credential_text(value)
-
 
 class WebhookControlRequest(BaseModel):
     active: bool

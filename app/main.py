@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 import random
@@ -1053,23 +1052,6 @@ templates = Jinja2Templates(directory=str(base_dir / "templates"))
 app.mount("/static", StaticFiles(directory=str(base_dir / "static")), name="static")
 
 
-def require_kids_auth(request: Request, scope: str) -> str:
-    token = request.headers.get("Authorization", "")
-    if not token.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Kids service authorization required")
-    presented = token[7:].strip()
-    expected = {
-        "parent": settings.kids_parent_token,
-        "ingest": settings.kids_ingest_token,
-        "gateway": settings.kids_gateway_token,
-    }.get(scope, "")
-    if not expected:
-        raise HTTPException(status_code=503, detail="Kids service authorization is not configured")
-    if not hmac.compare_digest(presented, expected):
-        raise HTTPException(status_code=403, detail="Kids service authorization denied")
-    return scope
-
-
 @app.middleware("http")
 async def cache_control_middleware(request: Request, call_next):
     response = await call_next(request)
@@ -1314,21 +1296,18 @@ async def api_status(request: Request) -> dict[str, Any]:
 
 @app.get("/api/kids/catalog/revision")
 async def api_catalog_revision(request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "gateway")
     return {"revision": await request.app.state.runtime.db.catalog_revision()}
 
 
 @app.get("/api/kids/catalog/items")
-async def api_catalog_items(request: Request, approved_only: bool = True) -> dict[str, Any]:
-    require_kids_auth(request, "gateway")
+async def api_catalog_items(request: Request) -> dict[str, Any]:
     if await request.app.state.runtime.db.kids_kill_switch_enabled():
         return {"state": "kill_switch", "items": []}
-    return {"state": "ready", "items": await request.app.state.runtime.db.catalog_items_list(approved_only)}
+    return {"state": "ready", "items": await request.app.state.runtime.db.catalog_items_list()}
 
 
 @app.get("/api/kids/catalog/items/{item_id}")
 async def api_catalog_item(item_id: int, request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "gateway")
     if await request.app.state.runtime.db.kids_kill_switch_enabled():
         raise HTTPException(status_code=403, detail="Kids kill switch is active")
     item = await request.app.state.runtime.db.catalog_get("item", item_id)
@@ -1339,7 +1318,6 @@ async def api_catalog_item(item_id: int, request: Request) -> dict[str, Any]:
 
 @app.get("/api/kids/catalog/items/by-video/{video_id}")
 async def api_catalog_item_by_video(video_id: str, request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "gateway")
     if await request.app.state.runtime.db.kids_kill_switch_enabled():
         raise HTTPException(status_code=403, detail="Kids kill switch is active")
     item = await request.app.state.runtime.db.catalog_item_by_video(video_id)
@@ -1350,13 +1328,11 @@ async def api_catalog_item_by_video(video_id: str, request: Request) -> dict[str
 
 @app.get("/api/kids/sources")
 async def api_catalog_sources(request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "parent")
     return {"sources": await request.app.state.runtime.db.catalog_sources_list()}
 
 
 @app.post("/api/kids/sources")
 async def api_catalog_source(payload: CatalogSourceRequest, request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "parent")
     correlation_id = request.headers.get("X-Correlation-ID", f"catalog-source-{payload.reference}")
     try:
         return await request.app.state.runtime.db.catalog_create("source", {**payload.model_dump(), "correlation_id": correlation_id})
@@ -1366,7 +1342,6 @@ async def api_catalog_source(payload: CatalogSourceRequest, request: Request) ->
 
 @app.post("/api/kids/catalog/items")
 async def api_catalog_item_create(payload: CatalogItemRequest, request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "ingest")
     correlation_id = request.headers.get("X-Correlation-ID", f"catalog-item-{payload.video_id}")
     try:
         return await request.app.state.runtime.db.catalog_create("item", {**payload.model_dump(), "correlation_id": correlation_id})
@@ -1376,7 +1351,6 @@ async def api_catalog_item_create(payload: CatalogItemRequest, request: Request)
 
 @app.patch("/api/kids/sources/{source_id}/state")
 async def api_catalog_source_state(source_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "parent")
     try:
         result = await request.app.state.runtime.db.catalog_transition("source", source_id, payload.model_dump())
     except ValueError as exc:
@@ -1388,7 +1362,6 @@ async def api_catalog_source_state(source_id: int, payload: CatalogTransitionReq
 
 @app.patch("/api/kids/catalog/items/{item_id}/state")
 async def api_catalog_item_state(item_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "parent")
     try:
         result = await request.app.state.runtime.db.catalog_transition("item", item_id, payload.model_dump())
     except ValueError as exc:
@@ -1400,7 +1373,6 @@ async def api_catalog_item_state(item_id: int, payload: CatalogTransitionRequest
 
 @app.get("/api/kids/status")
 async def api_kids_status(request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "gateway")
     return {
         "kill_switch": await request.app.state.runtime.db.kids_kill_switch_enabled(),
         "catalog_revision": await request.app.state.runtime.db.catalog_revision(),
@@ -1409,13 +1381,11 @@ async def api_kids_status(request: Request) -> dict[str, Any]:
 
 @app.get("/api/kids/control/kill-switch")
 async def api_kids_kill_switch(request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "parent")
     return {"enabled": await request.app.state.runtime.db.kids_kill_switch_enabled()}
 
 
 @app.post("/api/kids/control/kill-switch")
 async def api_kids_set_kill_switch(payload: KidsKillSwitchRequest, request: Request) -> dict[str, Any]:
-    require_kids_auth(request, "parent")
     ok = await request.app.state.runtime.db.set_kids_kill_switch(
         enabled=payload.enabled,
         actor=payload.actor,
@@ -1429,7 +1399,6 @@ async def api_kids_set_kill_switch(payload: KidsKillSwitchRequest, request: Requ
 
 @app.get("/api/kids/audit")
 async def api_kids_audit(request: Request, limit: int = 100) -> dict[str, Any]:
-    require_kids_auth(request, "parent")
     return {"events": await request.app.state.runtime.db.kids_audit_events(limit)}
 
 

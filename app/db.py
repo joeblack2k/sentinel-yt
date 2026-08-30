@@ -265,8 +265,13 @@ class Database:
             await db.commit()
         return await self.catalog_get(entity, entity_id)
 
-    async def catalog_items_list(self, approved_only: bool = True) -> list[dict[str, Any]]:
-        query = "SELECT * FROM catalog_items WHERE state='approved'" if approved_only else "SELECT * FROM catalog_items"
+    async def catalog_items_list(self) -> list[dict[str, Any]]:
+        # Feed consumers must only ever see items from an approved source.
+        query = (
+            "SELECT i.* FROM catalog_items i "
+            "JOIN catalog_sources s ON s.id = i.source_id "
+            "WHERE i.state='approved' AND s.state='approved'"
+        )
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(query + " ORDER BY id ASC")
             rows = await cur.fetchall()
@@ -299,13 +304,21 @@ class Database:
         reason: str,
         correlation_id: str,
     ) -> bool:
-        await self.set_setting("kids_kill_switch", "true" if enabled else "false")
-        await self.audit_kids_event(
-            event="kill_switch_changed",
-            actor=actor,
-            reason=reason,
-            correlation_id=correlation_id,
-        )
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO settings(key, value) VALUES('kids_kill_switch', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("true" if enabled else "false",),
+            )
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(
+                    event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("kill_switch_changed", "control", None, actor, reason, 0, correlation_id, utc_now_iso()),
+            )
+            await db.commit()
         return await self.kids_kill_switch_enabled() == enabled
 
     async def audit_kids_event(
