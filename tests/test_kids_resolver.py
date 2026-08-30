@@ -141,6 +141,43 @@ async def test_resolver_worker_keeps_candidate_scoped_to_authorization_storage(t
     assert await db.kids_playback_authorization("video-ready", minimum_remaining_seconds=300) is None
 
 
+@pytest.mark.asyncio
+async def test_feed_orders_newly_probed_candidates_first(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    older = await eligible_item(db, "video-older")
+    newer = await eligible_item(db, "video-newer")
+    await db.kids_resolve_claim_due(limit=2, refresh_margin_seconds=300)
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=15)
+    candidate = {
+        "media_url": signed_url("video", expiry),
+        "audio_url": signed_url("audio", expiry),
+        "quality_height": 1080,
+        "codec": "avc1.640028",
+        "video_headers": {},
+        "audio_headers": {},
+    }
+    await db.kids_resolve_success(
+        item_id=older["id"],
+        candidate=candidate,
+        quality_height=1080,
+        codec="avc1.640028",
+        resolved_at=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+        expires_at=expiry.isoformat(),
+    )
+    await db.kids_resolve_success(
+        item_id=newer["id"],
+        candidate=candidate,
+        quality_height=1080,
+        codec="avc1.640028",
+        resolved_at=datetime.now(timezone.utc).isoformat(),
+        expires_at=expiry.isoformat(),
+    )
+
+    feed = await db.kids_eligible_feed_list(300)
+    assert [item["video_id"] for item in feed] == ["video-newer", "video-older"]
+
+
 def test_playback_revalidation_can_omit_candidate(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
     monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))

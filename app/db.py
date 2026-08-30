@@ -490,7 +490,7 @@ class Database:
                 JOIN kids_resolve_backlog b ON b.item_id=i.id
                 WHERE i.state='approved' AND s.state='approved' AND s.safety_verdict='SAFE'
                   AND b.status='ready' AND b.expires_at>?
-                ORDER BY i.id ASC
+                ORDER BY b.resolved_at DESC,i.id ASC
                 """,
                 ((datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat(),),
             )

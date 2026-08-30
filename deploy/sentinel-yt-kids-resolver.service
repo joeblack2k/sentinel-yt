@@ -11,7 +11,7 @@ WorkingDirectory=/opt/sentinel-yt
 EnvironmentFile=-/opt/sentinel-yt/.env
 Environment=PATH=/opt/sentinel-yt/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
-Environment=KIDS_RESOLVER_BATCH_SIZE=4
+Environment=KIDS_RESOLVER_BATCH_SIZE=6
 Nice=10
 CPUQuota=50%
 IOSchedulingClass=idle

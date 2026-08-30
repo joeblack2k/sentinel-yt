@@ -14,7 +14,7 @@ from ..db import Database
 
 logger = logging.getLogger(__name__)
 
-PRACTICAL_CANDIDATE_TTL = timedelta(minutes=25)
+PRACTICAL_CANDIDATE_TTL = timedelta(minutes=20)
 
 
 def _utc_timestamp(value: Any) -> str | None:
