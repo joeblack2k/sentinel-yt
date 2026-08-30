@@ -1523,7 +1523,11 @@ async def api_kids_watch_events(request: Request, limit: int = 100) -> dict[str,
 
 
 @app.get("/api/kids/playback-authorizations/{video_id}")
-async def api_kids_playback_authorization(video_id: str, request: Request) -> dict[str, Any]:
+async def api_kids_playback_authorization(
+    video_id: str,
+    request: Request,
+    include_candidate: bool = True,
+) -> dict[str, Any]:
     runtime: RuntimeState = request.app.state.runtime
     if await runtime.db.kids_kill_switch_enabled() or not await runtime.monitoring_enabled_now():
         raise HTTPException(status_code=403, detail="Kids playback is unavailable")
@@ -1533,7 +1537,7 @@ async def api_kids_playback_authorization(video_id: str, request: Request) -> di
     )
     if row is None:
         raise HTTPException(status_code=403, detail="Kids playback is not authorized")
-    return {
+    response = {
         "status": "approved",
         "catalog_revision": await runtime.db.catalog_revision(),
         "item_id": row["item_id"],
@@ -1541,8 +1545,10 @@ async def api_kids_playback_authorization(video_id: str, request: Request) -> di
         "expires_at": row["expires_at"],
         "quality_height": row["quality_height"],
         "codec": row["codec"],
-        "candidate": row["candidate"],
     }
+    if include_candidate:
+        response["candidate"] = row["candidate"]
+    return response
 
 
 @app.post("/api/webhook/control")

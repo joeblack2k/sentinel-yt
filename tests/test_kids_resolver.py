@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.db import Database
@@ -114,3 +115,51 @@ async def test_resolver_worker_keeps_candidate_scoped_to_authorization_storage(t
         1, verdict="UNSAFE", reason="revoked", actor="guardian", correlation_id="unsafe"
     )
     assert await db.kids_playback_authorization("video-ready", minimum_remaining_seconds=300) is None
+
+
+def test_playback_revalidation_can_omit_candidate(tmp_path, monkeypatch):
+    monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
+    import importlib
+
+    module = importlib.reload(importlib.import_module("app.main"))
+    row = {
+        "item_id": 7,
+        "video_id": "video-ready",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+        "quality_height": 1080,
+        "codec": "avc1.640028",
+        "candidate": {"media_url": "https://media.example/video"},
+    }
+
+    async def available() -> bool:
+        return True
+
+    async def disabled() -> bool:
+        return False
+
+    async def authorize(video_id: str, *, minimum_remaining_seconds: int):
+        assert video_id == "video-ready"
+        assert minimum_remaining_seconds > 0
+        return row
+
+    async def revision() -> int:
+        return 12
+
+    with TestClient(module.app) as client:
+        runtime = client.app.state.runtime
+        monkeypatch.setattr(runtime, "monitoring_enabled_now", available)
+        monkeypatch.setattr(runtime.db, "kids_kill_switch_enabled", disabled)
+        monkeypatch.setattr(runtime.db, "kids_playback_authorization", authorize)
+        monkeypatch.setattr(runtime.db, "catalog_revision", revision)
+
+        initial = client.get("/api/kids/playback-authorizations/video-ready")
+        assert initial.status_code == 200
+        assert initial.json()["candidate"] == row["candidate"]
+
+        recheck = client.get(
+            "/api/kids/playback-authorizations/video-ready",
+            params={"include_candidate": "false"},
+        )
+        assert recheck.status_code == 200
+        assert "candidate" not in recheck.json()
