@@ -420,6 +420,7 @@ class Database:
         duration_seconds: int,
         visual_category: str,
         correlation_id: str,
+        sync_backlog: bool = True,
     ) -> dict[str, Any] | None:
         values = (
             title.strip()[:500],
@@ -464,7 +465,7 @@ class Database:
                     (item_id, revision, correlation_id, now),
                 )
                 await db.commit()
-        if changed:
+        if changed and sync_backlog:
             await self.kids_resolve_sync_backlog()
         return await self.catalog_get("item", item_id)
 

@@ -462,6 +462,7 @@ async def ingest_once(
                 duration_seconds=candidate.duration_seconds,
                 visual_category=str(existing.get("visual_category", "general")),
                 correlation_id=f"kids-refresh-{candidate.video_id}",
+                sync_backlog=False,
             )
             if existing.get("state") == "approved":
                 report.skipped += 1
@@ -494,6 +495,7 @@ async def ingest_once(
             },
         )
         report.approved += 1
+    await db.kids_resolve_sync_backlog()
     return report
 
 
