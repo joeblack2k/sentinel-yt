@@ -4,7 +4,7 @@
 <p class="muted">Only approved channels and playlists can publish items to the Kids gateway.</p>
 
 <section class="panel">
-  <h2>Approved sources</h2>
+  <h2>Kids sources</h2>
   <form id="kids-source-form">
     <label>Type
       <select name="kind">
@@ -22,12 +22,19 @@
   </form>
   <p id="kids-source-status" class="muted"></p>
   <table>
-    <thead><tr><th>Type</th><th>Reference</th><th>State</th><th>Action</th></tr></thead>
+    <thead><tr><th>Type</th><th>Name</th><th>Reference</th><th>Guardian check</th><th>State</th><th>Action</th></tr></thead>
     <tbody id="kids-sources">
       {% for source in sources %}
       <tr data-id="{{ source.id }}">
         <td>{{ source.kind }}</td>
+        <td>{{ source.title or '-' }}</td>
         <td><code>{{ source.reference }}</code></td>
+        <td>
+          <strong>{{ source.safety_verdict }}</strong>
+          {% if source.safety_reason %}
+          <br><span class="muted">{{ source.safety_reason }}</span>
+          {% endif %}
+        </td>
         <td class="state">{{ source.state }}</td>
         <td>
           {% if source.state != 'approved' %}
@@ -39,7 +46,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="4" class="muted">No Kids sources configured.</td></tr>
+      <tr><td colspan="6" class="muted">No Kids sources configured.</td></tr>
       {% endfor %}
     </tbody>
   </table>

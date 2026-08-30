@@ -80,7 +80,8 @@ def test_parent_kids_page_is_available(tmp_path, monkeypatch):
         response = client.get("/kids")
         assert response.status_code == 200
         assert "SubTube Kids" in response.text
-        assert "Approved sources" in response.text
+        assert "Kids sources" in response.text
+        assert "Guardian check" in response.text
 
         source = client.post(
             "/api/kids/sources",
