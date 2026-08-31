@@ -30,9 +30,13 @@ def _source_channel_id(kind: Any, reference: Any) -> str | None:
 def _catalog_identity_is_known(item: dict[str, Any], source: dict[str, Any]) -> bool:
     channel_id = str(item.get("channel_id") or "").strip()
     channel_title = str(item.get("channel_title") or "").strip()
-    if not channel_id or not channel_title:
+    if not channel_title:
         return False
     expected_channel_id = _source_channel_id(source.get("kind"), source.get("reference"))
+    if expected_channel_id is None:
+        return True
+    if not channel_id:
+        return False
     return expected_channel_id is None or channel_id == expected_channel_id
 
 
@@ -326,6 +330,39 @@ class Database:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN channel_id TEXT NOT NULL DEFAULT ''")
             if "channel_title" not in item_cols:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN channel_title TEXT NOT NULL DEFAULT ''")
+            # Existing catalog rows predate source identity fields; backfill them
+            # from the already-approved source instead of invalidating the catalog.
+            await db.execute(
+                """
+                UPDATE catalog_items
+                SET channel_id=CASE
+                        WHEN trim(coalesce(channel_id,''))='' THEN coalesce(
+                            (
+                                SELECT CASE
+                                    WHEN kind='channel' AND reference!=? THEN reference
+                                    ELSE ''
+                                END
+                                FROM catalog_sources WHERE id=catalog_items.source_id
+                            ),
+                            ''
+                        )
+                        ELSE channel_id
+                    END,
+                    channel_title=CASE
+                        WHEN trim(coalesce(channel_title,''))='' THEN coalesce(
+                            (SELECT title FROM catalog_sources WHERE id=catalog_items.source_id),
+                            ''
+                        )
+                        ELSE channel_title
+                    END
+                WHERE source_id IS NOT NULL
+                  AND (
+                      trim(coalesce(channel_id,''))=''
+                      OR trim(coalesce(channel_title,''))=''
+                  )
+                """,
+                (KIDS_HOME_SOURCE_REFERENCE,),
+            )
             cur = await db.execute("PRAGMA table_info(kids_watch_events)")
             watch_cols = {row[1] for row in await cur.fetchall()}
             if "startup_ms" not in watch_cols:
