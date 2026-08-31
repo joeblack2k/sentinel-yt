@@ -239,9 +239,9 @@ class YouTubeKidsCDP:
             except Exception:
                 self._target_id = None
             else:
-                if self._is_kids_page(target):
-                    return target
-                self._target_id = None
+                # A navigation can briefly expose the intermediate YouTube URL.
+                # The requested URL is still checked before cards are accepted.
+                return target
 
         targets = await self._json("/json/list")
         target = next(
@@ -294,6 +294,7 @@ class YouTubeKidsCDP:
             collected: dict[str, dict[str, Any]] = {}
             stable_rounds = 0
             ready_seen = False
+            external_url = ""
             deadline = asyncio.get_running_loop().time() + max(0.5, self.wait_seconds)
             while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
                 result = await self._command(
@@ -310,7 +311,7 @@ class YouTubeKidsCDP:
                     or actual_url.netloc.lower() != "www.youtubekids.com"
                 ):
                     if payload.get("url") != "about:blank":
-                        raise RuntimeError("CDP navigation left YouTube Kids")
+                        external_url = str(payload.get("url", ""))
                     await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
                     continue
                 if payload.get("ready") not in {"interactive", "complete"}:
@@ -328,6 +329,8 @@ class YouTubeKidsCDP:
                 await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
             if ready_seen:
                 return list(collected.values())[:_MAX_COLLECTED_CARDS]
+            if external_url:
+                raise RuntimeError("CDP navigation left YouTube Kids")
             raise RuntimeError("CDP navigation did not reach YouTube Kids")
 
     async def restore_home(self) -> None:
