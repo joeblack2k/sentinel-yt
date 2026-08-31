@@ -232,6 +232,16 @@ class YouTubeKidsCDP:
         parsed = urllib.parse.urlparse(str(target.get("url", "")))
         return parsed.scheme == "https" and parsed.hostname == "www.youtubekids.com"
 
+    @staticmethod
+    def _is_requested_kids_url(actual: urllib.parse.ParseResult, requested: str) -> bool:
+        expected = urllib.parse.urlparse(requested)
+        return (
+            actual.scheme == "https"
+            and actual.hostname == "www.youtubekids.com"
+            and actual.path.rstrip("/") == expected.path.rstrip("/")
+            and actual.query == expected.query
+        )
+
     async def _reusable_target(self) -> dict[str, Any]:
         if self._target_id is not None:
             try:
@@ -265,8 +275,22 @@ class YouTubeKidsCDP:
         target_url = source_url(kind, reference)
         target = await self._reusable_target()
         async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
-            await self._command(page, 2, "Runtime.enable")
-            navigation = await self._command(page, 3, "Page.navigate", {"url": target_url})
+            command_timeout = max(5.0, min(15.0, self.wait_seconds))
+            try:
+                await self._command(page, 2, "Runtime.enable", timeout=command_timeout)
+            except asyncio.TimeoutError:
+                await self._command(page, 20, "Runtime.enable", timeout=command_timeout)
+            try:
+                navigation = await self._command(
+                    page,
+                    3,
+                    "Page.navigate",
+                    {"url": target_url},
+                    timeout=command_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Kids page navigation command timed out; waiting for requested route")
+                navigation = {}
             if navigation.get("errorText"):
                 raise RuntimeError("CDP navigation failed")
             expression = """(() => {
@@ -295,6 +319,7 @@ class YouTubeKidsCDP:
             stable_rounds = 0
             ready_seen = False
             external_url = ""
+            wrong_kids_url = ""
             deadline = asyncio.get_running_loop().time() + max(0.5, self.wait_seconds)
             while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
                 result = await self._command(
@@ -306,12 +331,12 @@ class YouTubeKidsCDP:
                 )
                 payload = json.loads(result["result"].get("value", "{}"))
                 actual_url = urllib.parse.urlparse(str(payload.get("url", "")))
-                if (
-                    actual_url.scheme != "https"
-                    or actual_url.netloc.lower() != "www.youtubekids.com"
-                ):
+                if not self._is_requested_kids_url(actual_url, target_url):
                     if payload.get("url") != "about:blank":
-                        external_url = str(payload.get("url", ""))
+                        if actual_url.hostname == "www.youtubekids.com":
+                            wrong_kids_url = str(payload.get("url", ""))
+                        else:
+                            external_url = str(payload.get("url", ""))
                     await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
                     continue
                 if payload.get("ready") not in {"interactive", "complete"}:
@@ -331,6 +356,8 @@ class YouTubeKidsCDP:
                 return list(collected.values())[:_MAX_COLLECTED_CARDS]
             if external_url:
                 raise RuntimeError("CDP navigation left YouTube Kids")
+            if wrong_kids_url:
+                raise RuntimeError("CDP navigation did not reach the requested YouTube Kids page")
             raise RuntimeError("CDP navigation did not reach YouTube Kids")
 
     async def restore_home(self) -> None:

@@ -106,6 +106,11 @@ async def test_cdp_reuses_existing_kids_page_without_creating_or_closing_target(
         async def recv(self):
             command = commands[-1]
             if command["method"] == "Runtime.evaluate":
+                navigation = next(
+                    command
+                    for command in reversed(commands)
+                    if command["method"] == "Page.navigate"
+                )
                 return json.dumps(
                     {
                         "id": command["id"],
@@ -113,7 +118,7 @@ async def test_cdp_reuses_existing_kids_page_without_creating_or_closing_target(
                             "result": {
                                 "value": json.dumps(
                                     {
-                                        "url": "https://www.youtubekids.com/",
+                                        "url": navigation["params"]["url"],
                                         "ready": "complete",
                                         "cards": [{"href": "/watch?v=abcdefghijk"}],
                                     }
