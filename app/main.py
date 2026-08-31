@@ -1531,10 +1531,13 @@ async def api_kids_playback_authorization(
     runtime: RuntimeState = request.app.state.runtime
     if await runtime.db.kids_kill_switch_enabled() or not await runtime.monitoring_enabled_now():
         raise HTTPException(status_code=403, detail="Kids playback is unavailable")
-    row = await runtime.db.kids_playback_authorization(
-        video_id,
-        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
-    )
+    if include_candidate:
+        row = await runtime.db.kids_playback_authorization(
+            video_id,
+            minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        )
+    else:
+        row = await runtime.db.kids_playback_policy_authorization(video_id)
     if row is None:
         raise HTTPException(status_code=403, detail="Kids playback is not authorized")
     response = {
@@ -1542,12 +1545,16 @@ async def api_kids_playback_authorization(
         "catalog_revision": await runtime.db.catalog_revision(),
         "item_id": row["item_id"],
         "video_id": row["video_id"],
-        "expires_at": row["expires_at"],
-        "quality_height": row["quality_height"],
-        "codec": row["codec"],
     }
     if include_candidate:
-        response["candidate"] = row["candidate"]
+        response.update(
+            {
+                "expires_at": row["expires_at"],
+                "quality_height": row["quality_height"],
+                "codec": row["codec"],
+                "candidate": row["candidate"],
+            }
+        )
     return response
 
 

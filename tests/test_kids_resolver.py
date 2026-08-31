@@ -180,6 +180,34 @@ async def test_feed_orders_newly_probed_candidates_first(tmp_path):
     assert [item["video_id"] for item in feed] == ["video-newer", "video-older"]
 
 
+@pytest.mark.asyncio
+async def test_active_policy_authorization_survives_resolver_retry_but_not_revoke(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    item = await eligible_item(db, "video-active")
+    claimed = await db.kids_resolve_claim_due(limit=1, refresh_margin_seconds=300)
+    assert claimed == [{"item_id": item["id"], "video_id": "video-active"}]
+    await db.kids_resolve_failure(item_id=item["id"], reason_code="backend_unavailable")
+
+    assert await db.kids_playback_authorization("video-active", minimum_remaining_seconds=300) is None
+    assert await db.kids_playback_policy_authorization("video-active") == {
+        "item_id": item["id"],
+        "video_id": "video-active",
+    }
+
+    await db.catalog_transition(
+        "item",
+        item["id"],
+        {
+            "state": "revoked",
+            "actor": "parent",
+            "reason": "revoked",
+            "correlation_id": "item-revoked",
+        },
+    )
+    assert await db.kids_playback_policy_authorization("video-active") is None
+
+
 def test_playback_revalidation_can_omit_candidate(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
     monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
@@ -206,6 +234,10 @@ def test_playback_revalidation_can_omit_candidate(tmp_path, monkeypatch):
         assert minimum_remaining_seconds > 0
         return row
 
+    async def policy_authorize(video_id: str):
+        assert video_id == "video-ready"
+        return {"item_id": 7, "video_id": "video-ready"}
+
     async def revision() -> int:
         return 12
 
@@ -214,6 +246,7 @@ def test_playback_revalidation_can_omit_candidate(tmp_path, monkeypatch):
         monkeypatch.setattr(runtime, "monitoring_enabled_now", available)
         monkeypatch.setattr(runtime.db, "kids_kill_switch_enabled", disabled)
         monkeypatch.setattr(runtime.db, "kids_playback_authorization", authorize)
+        monkeypatch.setattr(runtime.db, "kids_playback_policy_authorization", policy_authorize)
         monkeypatch.setattr(runtime.db, "catalog_revision", revision)
 
         initial = client.get("/api/kids/playback-authorizations/video-ready")

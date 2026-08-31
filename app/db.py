@@ -686,6 +686,22 @@ class Database:
         result["candidate"] = candidate
         return result
 
+    async def kids_playback_policy_authorization(self, video_id: str) -> dict[str, Any] | None:
+        """Revalidate an active relay without coupling it to the next resolve candidate."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT i.id AS item_id,i.video_id
+                FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
+                WHERE i.video_id=? AND i.state='approved' AND s.state='approved'
+                  AND s.safety_verdict='SAFE'
+                """,
+                (video_id,),
+            )
+            row = await cur.fetchone()
+            cols = [d[0] for d in cur.description] if row else []
+        return dict(zip(cols, row)) if row else None
+
     async def catalog_item_list_all(self) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute("SELECT * FROM catalog_items ORDER BY id ASC")
