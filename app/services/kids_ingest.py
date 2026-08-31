@@ -188,10 +188,26 @@ class YouTubeKidsCDP:
 
         return await asyncio.to_thread(load)
 
-    async def _command(self, websocket: Any, request_id: int, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        await websocket.send(json.dumps({"id": request_id, "method": method, "params": params or {}}))
+    async def _command(
+        self,
+        websocket: Any,
+        request_id: int,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        command_timeout = timeout if timeout is not None else max(1.0, min(5.0, self.wait_seconds))
+        deadline = asyncio.get_running_loop().time() + command_timeout
+        await asyncio.wait_for(
+            websocket.send(json.dumps({"id": request_id, "method": method, "params": params or {}})),
+            timeout=command_timeout,
+        )
         while True:
-            message = json.loads(await websocket.recv())
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(f"CDP {method} timed out")
+            message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=remaining))
             if message.get("id") == request_id:
                 if "error" in message:
                     raise RuntimeError(f"CDP {method} failed")
@@ -209,15 +225,23 @@ class YouTubeKidsCDP:
     async def cards_for_source(self, kind: str, reference: str) -> list[dict[str, Any]]:
         version = await self._json("/json/version")
         target_url = source_url(kind, reference)
-        async with websockets.connect(version["webSocketDebuggerUrl"]) as browser:
-            created = await self._command(browser, 1, "Target.createTarget", {"url": target_url})
-            target_id = str(created["targetId"])
+        target_id: str | None = None
+        original_error: BaseException | None = None
         try:
+            async with websockets.connect(version["webSocketDebuggerUrl"]) as browser:
+                created = await self._command(browser, 1, "Target.createTarget", {"url": target_url})
+                if not created.get("targetId"):
+                    raise RuntimeError("CDP target creation returned no target")
+                target_id = str(created["targetId"])
             target = await self._target(target_id)
             async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
                 await self._command(page, 2, "Runtime.enable")
+                navigation = await self._command(page, 3, "Page.navigate", {"url": target_url})
+                if navigation.get("errorText"):
+                    raise RuntimeError("CDP navigation failed")
                 expression = """(() => {
                   const payload = {
+                    url: window.location.href,
                     ready: document.readyState,
                     cards: Array.from(document.querySelectorAll("ytk-compact-video-renderer")).map(x => {
                         const data = x.get("data") || {};
@@ -239,14 +263,30 @@ class YouTubeKidsCDP:
                 })()"""
                 collected: dict[str, dict[str, Any]] = {}
                 stable_rounds = 0
-                for _ in range(int(self.wait_seconds / 0.5)):
+                ready_seen = False
+                deadline = asyncio.get_running_loop().time() + max(0.5, self.wait_seconds)
+                while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
                     result = await self._command(
                         page,
-                        3,
+                        4,
                         "Runtime.evaluate",
                         {"expression": expression, "returnByValue": True},
+                        timeout=remaining,
                     )
                     payload = json.loads(result["result"].get("value", "{}"))
+                    actual_url = urllib.parse.urlparse(str(payload.get("url", "")))
+                    if (
+                        actual_url.scheme != "https"
+                        or actual_url.netloc.lower() != "www.youtubekids.com"
+                    ):
+                        if payload.get("url") != "about:blank":
+                            raise RuntimeError("CDP navigation left YouTube Kids")
+                        await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
+                        continue
+                    if payload.get("ready") not in {"interactive", "complete"}:
+                        await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
+                        continue
+                    ready_seen = True
                     before = len(collected)
                     for card in payload.get("cards", []):
                         key = str(card.get("href", ""))
@@ -255,11 +295,22 @@ class YouTubeKidsCDP:
                     stable_rounds = stable_rounds + 1 if len(collected) == before else 0
                     if len(collected) >= _MAX_COLLECTED_CARDS or (collected and stable_rounds >= 3):
                         return list(collected.values())[:_MAX_COLLECTED_CARDS]
-                    await asyncio.sleep(0.5)
-                return list(collected.values())[:_MAX_COLLECTED_CARDS]
+                    await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
+                if ready_seen:
+                    return list(collected.values())[:_MAX_COLLECTED_CARDS]
+                raise RuntimeError("CDP navigation did not reach YouTube Kids")
+        except BaseException as exc:
+            original_error = exc
+            raise
         finally:
-            async with websockets.connect(version["webSocketDebuggerUrl"]) as browser:
-                await self._command(browser, 4, "Target.closeTarget", {"targetId": target_id})
+            if target_id is not None:
+                try:
+                    async with websockets.connect(version["webSocketDebuggerUrl"]) as browser:
+                        await self._command(browser, 5, "Target.closeTarget", {"targetId": target_id})
+                except BaseException:
+                    if original_error is None:
+                        raise
+                    logger.warning("Kids target cleanup failed after ingest error")
 
 
 async def ingest_once(

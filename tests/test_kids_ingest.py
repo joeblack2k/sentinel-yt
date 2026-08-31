@@ -1,10 +1,17 @@
-from dataclasses import dataclass
+import asyncio
 import json
+from dataclasses import dataclass
 
 import pytest
 
 from app.db import Database
-from app.services.kids_ingest import HOME_SOURCE_REFERENCE, ingest_once, parse_cards, source_url
+from app.services.kids_ingest import (
+    HOME_SOURCE_REFERENCE,
+    YouTubeKidsCDP,
+    ingest_once,
+    parse_cards,
+    source_url,
+)
 
 
 def test_source_url_stays_inside_youtube_kids():
@@ -73,6 +80,172 @@ def test_parse_cards_rejects_shorts_bad_host_and_missing_duration():
         source_reference=HOME_SOURCE_REFERENCE,
         allowed_channel_ids={"OTHER"},
     ) == []
+
+
+@pytest.mark.asyncio
+async def test_cdp_explicitly_navigates_created_blank_target(monkeypatch):
+    import app.services.kids_ingest as kids_ingest
+
+    commands: list[dict] = []
+
+    class FakeWebSocket:
+        def __init__(self, url):
+            self.url = url
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def send(self, message):
+            commands.append(json.loads(message))
+
+        async def recv(self):
+            command = commands[-1]
+            method = command["method"]
+            if method == "Target.createTarget":
+                return json.dumps({"id": command["id"], "result": {"targetId": "target-1"}})
+            if method == "Target.closeTarget":
+                return json.dumps({"id": command["id"], "result": {"success": True}})
+            if method == "Runtime.evaluate":
+                return json.dumps(
+                    {
+                        "id": command["id"],
+                        "result": {
+                            "result": {
+                                "value": json.dumps(
+                                    {
+                                        "url": "https://www.youtubekids.com/",
+                                        "ready": "complete",
+                                        "cards": [{"href": "/watch?v=abcdefghijk"}],
+                                    }
+                                )
+                            }
+                        },
+                    }
+                )
+            return json.dumps({"id": command["id"], "result": {}})
+
+    monkeypatch.setattr(
+        kids_ingest.websockets,
+        "connect",
+        lambda url, **kwargs: FakeWebSocket(url),
+    )
+    adapter = YouTubeKidsCDP(wait_seconds=0.5)
+    async def fake_json(path):
+        return {
+            "/json/version": {"webSocketDebuggerUrl": "ws://browser"},
+            "/json/list": [
+                {"id": "target-1", "webSocketDebuggerUrl": "ws://page"},
+            ],
+        }[path]
+
+    adapter._json = fake_json
+
+    assert await adapter.cards_for_source("channel", HOME_SOURCE_REFERENCE) == [
+        {"href": "/watch?v=abcdefghijk"}
+    ]
+    assert [command["method"] for command in commands[:4]] == [
+        "Target.createTarget",
+        "Runtime.enable",
+        "Page.navigate",
+        "Runtime.evaluate",
+    ]
+    assert [command["method"] for command in commands[4:]] == ["Target.closeTarget"]
+    assert commands[2]["params"] == {"url": "https://www.youtubekids.com/"}
+    assert commands[-1]["params"] == {"targetId": "target-1"}
+
+
+@pytest.mark.asyncio
+async def test_cdp_rejects_navigation_away_and_preserves_original_failure(monkeypatch):
+    import app.services.kids_ingest as kids_ingest
+
+    commands: list[dict] = []
+
+    class FakeWebSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def send(self, message):
+            commands.append(json.loads(message))
+
+        async def recv(self):
+            command = commands[-1]
+            method = command["method"]
+            if method == "Target.createTarget":
+                return json.dumps({"id": command["id"], "result": {"targetId": "target-1"}})
+            if method == "Page.navigate":
+                return json.dumps({"id": command["id"], "result": {}})
+            if method == "Runtime.evaluate":
+                return json.dumps(
+                    {
+                        "id": command["id"],
+                        "result": {
+                            "result": {
+                                "value": json.dumps(
+                                    {
+                                        "url": "https://www.youtube.com/",
+                                        "ready": "complete",
+                                        "cards": [],
+                                    }
+                                )
+                            }
+                        },
+                    }
+                )
+            if method == "Target.closeTarget":
+                raise RuntimeError("cleanup failed")
+            return json.dumps({"id": command["id"], "result": {}})
+
+    monkeypatch.setattr(
+        kids_ingest.websockets,
+        "connect",
+        lambda url, **kwargs: FakeWebSocket(),
+    )
+    adapter = YouTubeKidsCDP(wait_seconds=0.5)
+
+    async def fake_json(path):
+        return {
+            "/json/version": {"webSocketDebuggerUrl": "ws://browser"},
+            "/json/list": [
+                {"id": "target-1", "webSocketDebuggerUrl": "ws://page"},
+            ],
+        }[path]
+
+    adapter._json = fake_json
+
+    with pytest.raises(RuntimeError, match="left YouTube Kids"):
+        await adapter.cards_for_source("channel", HOME_SOURCE_REFERENCE)
+    assert [command["method"] for command in commands] == [
+        "Target.createTarget",
+        "Runtime.enable",
+        "Page.navigate",
+        "Runtime.evaluate",
+        "Target.closeTarget",
+    ]
+    assert commands[-1]["params"] == {"targetId": "target-1"}
+
+
+@pytest.mark.asyncio
+async def test_cdp_command_timeout_covers_unsolicited_messages():
+    class FakeWebSocket:
+        async def send(self, message):
+            return None
+
+        async def recv(self):
+            return json.dumps({"method": "Runtime.consoleAPICalled"})
+
+    with pytest.raises(asyncio.TimeoutError):
+        await YouTubeKidsCDP()._command(
+            FakeWebSocket(),
+            1,
+            "Runtime.evaluate",
+            timeout=0.01,
+        )
 
 
 @dataclass
