@@ -88,15 +88,12 @@ def test_parse_cards_rejects_shorts_bad_host_and_missing_duration():
 
 
 @pytest.mark.asyncio
-async def test_cdp_explicitly_navigates_created_blank_target(monkeypatch):
+async def test_cdp_reuses_existing_kids_page_without_creating_or_closing_target(monkeypatch):
     import app.services.kids_ingest as kids_ingest
 
     commands: list[dict] = []
 
     class FakeWebSocket:
-        def __init__(self, url):
-            self.url = url
-
         async def __aenter__(self):
             return self
 
@@ -108,12 +105,7 @@ async def test_cdp_explicitly_navigates_created_blank_target(monkeypatch):
 
         async def recv(self):
             command = commands[-1]
-            method = command["method"]
-            if method == "Target.createTarget":
-                return json.dumps({"id": command["id"], "result": {"targetId": "target-1"}})
-            if method == "Target.closeTarget":
-                return json.dumps({"id": command["id"], "result": {"success": True}})
-            if method == "Runtime.evaluate":
+            if command["method"] == "Runtime.evaluate":
                 return json.dumps(
                     {
                         "id": command["id"],
@@ -135,35 +127,51 @@ async def test_cdp_explicitly_navigates_created_blank_target(monkeypatch):
     monkeypatch.setattr(
         kids_ingest.websockets,
         "connect",
-        lambda url, **kwargs: FakeWebSocket(url),
+        lambda url, **kwargs: FakeWebSocket(),
     )
     adapter = YouTubeKidsCDP(wait_seconds=0.5)
+    json_list_calls = 0
+
     async def fake_json(path):
-        return {
-            "/json/version": {"webSocketDebuggerUrl": "ws://browser"},
-            "/json/list": [
-                {"id": "target-1", "webSocketDebuggerUrl": "ws://page"},
-            ],
-        }[path]
+        nonlocal json_list_calls
+        assert path == "/json/list"
+        json_list_calls += 1
+        return [
+            {
+                "id": "target-1",
+                "type": "page",
+                "url": "https://www.youtubekids.com/",
+                "webSocketDebuggerUrl": "ws://page",
+            },
+        ]
 
     adapter._json = fake_json
 
     assert await adapter.cards_for_source("channel", HOME_SOURCE_REFERENCE) == [
         {"href": "/watch?v=abcdefghijk"}
     ]
-    assert [command["method"] for command in commands[:4]] == [
-        "Target.createTarget",
+    assert await adapter.cards_for_source("channel", "UC123") == [
+        {"href": "/watch?v=abcdefghijk"}
+    ]
+    assert [command["method"] for command in commands] == [
+        "Runtime.enable",
+        "Page.navigate",
+        "Runtime.evaluate",
         "Runtime.enable",
         "Page.navigate",
         "Runtime.evaluate",
     ]
-    assert [command["method"] for command in commands[4:]] == ["Target.closeTarget"]
-    assert commands[2]["params"] == {"url": "https://www.youtubekids.com/"}
-    assert commands[-1]["params"] == {"targetId": "target-1"}
+    assert commands[1]["params"] == {"url": "https://www.youtubekids.com/"}
+    assert commands[4]["params"] == {"url": "https://www.youtubekids.com/channel/UC123"}
+    assert json_list_calls == 2
+    assert all(
+        command["method"] not in {"Target.createTarget", "Target.closeTarget"}
+        for command in commands
+    )
 
 
 @pytest.mark.asyncio
-async def test_cdp_rejects_navigation_away_and_preserves_original_failure(monkeypatch):
+async def test_cdp_rejects_navigation_away_without_closing_existing_target(monkeypatch):
     import app.services.kids_ingest as kids_ingest
 
     commands: list[dict] = []
@@ -180,12 +188,7 @@ async def test_cdp_rejects_navigation_away_and_preserves_original_failure(monkey
 
         async def recv(self):
             command = commands[-1]
-            method = command["method"]
-            if method == "Target.createTarget":
-                return json.dumps({"id": command["id"], "result": {"targetId": "target-1"}})
-            if method == "Page.navigate":
-                return json.dumps({"id": command["id"], "result": {}})
-            if method == "Runtime.evaluate":
+            if command["method"] == "Runtime.evaluate":
                 return json.dumps(
                     {
                         "id": command["id"],
@@ -202,8 +205,6 @@ async def test_cdp_rejects_navigation_away_and_preserves_original_failure(monkey
                         },
                     }
                 )
-            if method == "Target.closeTarget":
-                raise RuntimeError("cleanup failed")
             return json.dumps({"id": command["id"], "result": {}})
 
     monkeypatch.setattr(
@@ -214,25 +215,39 @@ async def test_cdp_rejects_navigation_away_and_preserves_original_failure(monkey
     adapter = YouTubeKidsCDP(wait_seconds=0.5)
 
     async def fake_json(path):
-        return {
-            "/json/version": {"webSocketDebuggerUrl": "ws://browser"},
-            "/json/list": [
-                {"id": "target-1", "webSocketDebuggerUrl": "ws://page"},
-            ],
-        }[path]
+        assert path == "/json/list"
+        return [
+            {
+                "id": "target-1",
+                "type": "page",
+                "url": "https://www.youtubekids.com/",
+                "webSocketDebuggerUrl": "ws://page",
+            },
+        ]
 
     adapter._json = fake_json
 
     with pytest.raises(RuntimeError, match="left YouTube Kids"):
         await adapter.cards_for_source("channel", HOME_SOURCE_REFERENCE)
     assert [command["method"] for command in commands] == [
-        "Target.createTarget",
         "Runtime.enable",
         "Page.navigate",
         "Runtime.evaluate",
-        "Target.closeTarget",
     ]
-    assert commands[-1]["params"] == {"targetId": "target-1"}
+
+
+@pytest.mark.asyncio
+async def test_cdp_does_not_create_a_new_target_when_existing_kids_page_is_missing():
+    adapter = YouTubeKidsCDP(wait_seconds=0.5)
+
+    async def empty_targets(path):
+        assert path == "/json/list"
+        return []
+
+    adapter._json = empty_targets
+
+    with pytest.raises(RuntimeError, match="No existing YouTube Kids CDP target"):
+        await adapter.cards_for_source("channel", HOME_SOURCE_REFERENCE)
 
 
 @pytest.mark.asyncio

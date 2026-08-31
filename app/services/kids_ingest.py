@@ -184,6 +184,7 @@ class YouTubeKidsCDP:
     def __init__(self, cdp_url: str = "http://127.0.0.1:9223", wait_seconds: float = 15.0):
         self.cdp_url = cdp_url.rstrip("/")
         self.wait_seconds = wait_seconds
+        self._target_id: str | None = None
 
     async def _json(self, path: str) -> dict[str, Any] | list[dict[str, Any]]:
         def load() -> dict[str, Any] | list[dict[str, Any]]:
@@ -226,95 +227,124 @@ class YouTubeKidsCDP:
             await asyncio.sleep(0.2)
         raise RuntimeError("CDP target did not become available")
 
+    @staticmethod
+    def _is_kids_page(target: dict[str, Any]) -> bool:
+        parsed = urllib.parse.urlparse(str(target.get("url", "")))
+        return parsed.scheme == "https" and parsed.hostname == "www.youtubekids.com"
+
+    async def _reusable_target(self) -> dict[str, Any]:
+        if self._target_id is not None:
+            try:
+                target = await self._target(self._target_id)
+            except Exception:
+                self._target_id = None
+            else:
+                if self._is_kids_page(target):
+                    return target
+                self._target_id = None
+
+        targets = await self._json("/json/list")
+        target = next(
+            (
+                item
+                for item in targets
+                if item.get("type") == "page"
+                and item.get("id")
+                and item.get("webSocketDebuggerUrl")
+                and self._is_kids_page(item)
+            ),
+            None,
+        )
+        if target is None:
+            raise RuntimeError("No existing YouTube Kids CDP target")
+        self._target_id = str(target["id"])
+        logger.info("Kids ingest reusing existing YouTube Kids browser page")
+        return target
+
     async def cards_for_source(self, kind: str, reference: str) -> list[dict[str, Any]]:
-        version = await self._json("/json/version")
         target_url = source_url(kind, reference)
-        target_id: str | None = None
-        original_error: BaseException | None = None
-        try:
-            async with websockets.connect(version["webSocketDebuggerUrl"]) as browser:
-                created = await self._command(browser, 1, "Target.createTarget", {"url": target_url})
-                if not created.get("targetId"):
-                    raise RuntimeError("CDP target creation returned no target")
-                target_id = str(created["targetId"])
-            target = await self._target(target_id)
-            async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
-                await self._command(page, 2, "Runtime.enable")
-                navigation = await self._command(page, 3, "Page.navigate", {"url": target_url})
-                if navigation.get("errorText"):
-                    raise RuntimeError("CDP navigation failed")
-                expression = """(() => {
-                  const payload = {
-                    url: window.location.href,
-                    ready: document.readyState,
-                    cards: Array.from(document.querySelectorAll("ytk-compact-video-renderer")).map(x => {
-                        const data = x.get("data") || {};
-                        return {
-                        href: x.querySelector('a[href*="/watch?v="]')?.getAttribute("href") || "",
-                        title: x.querySelector(".primary-text span")?.textContent?.trim() || "",
-                        label: x.querySelector(".primary-text span")?.getAttribute("aria-label") || "",
-                        channel_title: data.shortBylineText?.runs?.map(r => r.text).join("") || "",
-                        duration: x.querySelector(".overlay")?.textContent?.trim() || "",
-                        thumbnail_url: x.querySelector("img")?.src || "",
-                        channel_id: data.kidsVideoOwnerExtension?.externalChannelId
-                            || data.shortBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId
-                            || ""
-                        };
-                    })
-                  };
-                  window.scrollTo(0, document.documentElement.scrollHeight);
-                  return JSON.stringify(payload);
-                })()"""
-                collected: dict[str, dict[str, Any]] = {}
-                stable_rounds = 0
-                ready_seen = False
-                deadline = asyncio.get_running_loop().time() + max(0.5, self.wait_seconds)
-                while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
-                    result = await self._command(
-                        page,
-                        4,
-                        "Runtime.evaluate",
-                        {"expression": expression, "returnByValue": True},
-                        timeout=remaining,
-                    )
-                    payload = json.loads(result["result"].get("value", "{}"))
-                    actual_url = urllib.parse.urlparse(str(payload.get("url", "")))
-                    if (
-                        actual_url.scheme != "https"
-                        or actual_url.netloc.lower() != "www.youtubekids.com"
-                    ):
-                        if payload.get("url") != "about:blank":
-                            raise RuntimeError("CDP navigation left YouTube Kids")
-                        await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
-                        continue
-                    if payload.get("ready") not in {"interactive", "complete"}:
-                        await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
-                        continue
-                    ready_seen = True
-                    before = len(collected)
-                    for card in payload.get("cards", []):
-                        key = str(card.get("href", ""))
-                        if key:
-                            collected[key] = card
-                    stable_rounds = stable_rounds + 1 if len(collected) == before else 0
-                    if len(collected) >= _MAX_COLLECTED_CARDS or (collected and stable_rounds >= 3):
-                        return list(collected.values())[:_MAX_COLLECTED_CARDS]
+        target = await self._reusable_target()
+        async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
+            await self._command(page, 2, "Runtime.enable")
+            navigation = await self._command(page, 3, "Page.navigate", {"url": target_url})
+            if navigation.get("errorText"):
+                raise RuntimeError("CDP navigation failed")
+            expression = """(() => {
+              const payload = {
+                url: window.location.href,
+                ready: document.readyState,
+                cards: Array.from(document.querySelectorAll("ytk-compact-video-renderer")).map(x => {
+                    const data = x.get("data") || {};
+                    return {
+                    href: x.querySelector('a[href*="/watch?v="]')?.getAttribute("href") || "",
+                    title: x.querySelector(".primary-text span")?.textContent?.trim() || "",
+                    label: x.querySelector(".primary-text span")?.getAttribute("aria-label") || "",
+                    channel_title: data.shortBylineText?.runs?.map(r => r.text).join("") || "",
+                    duration: x.querySelector(".overlay")?.textContent?.trim() || "",
+                    thumbnail_url: x.querySelector("img")?.src || "",
+                    channel_id: data.kidsVideoOwnerExtension?.externalChannelId
+                        || data.shortBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId
+                        || ""
+                    };
+                })
+              };
+              window.scrollTo(0, document.documentElement.scrollHeight);
+              return JSON.stringify(payload);
+            })()"""
+            collected: dict[str, dict[str, Any]] = {}
+            stable_rounds = 0
+            ready_seen = False
+            deadline = asyncio.get_running_loop().time() + max(0.5, self.wait_seconds)
+            while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
+                result = await self._command(
+                    page,
+                    4,
+                    "Runtime.evaluate",
+                    {"expression": expression, "returnByValue": True},
+                    timeout=remaining,
+                )
+                payload = json.loads(result["result"].get("value", "{}"))
+                actual_url = urllib.parse.urlparse(str(payload.get("url", "")))
+                if (
+                    actual_url.scheme != "https"
+                    or actual_url.netloc.lower() != "www.youtubekids.com"
+                ):
+                    if payload.get("url") != "about:blank":
+                        raise RuntimeError("CDP navigation left YouTube Kids")
                     await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
-                if ready_seen:
+                    continue
+                if payload.get("ready") not in {"interactive", "complete"}:
+                    await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
+                    continue
+                ready_seen = True
+                before = len(collected)
+                for card in payload.get("cards", []):
+                    key = str(card.get("href", ""))
+                    if key:
+                        collected[key] = card
+                stable_rounds = stable_rounds + 1 if len(collected) == before else 0
+                if len(collected) >= _MAX_COLLECTED_CARDS or (collected and stable_rounds >= 3):
                     return list(collected.values())[:_MAX_COLLECTED_CARDS]
-                raise RuntimeError("CDP navigation did not reach YouTube Kids")
-        except BaseException as exc:
-            original_error = exc
-            raise
-        finally:
-            if target_id is not None:
-                try:
-                    async with websockets.connect(version["webSocketDebuggerUrl"]) as browser:
-                        await self._command(browser, 5, "Target.closeTarget", {"targetId": target_id})
-                except BaseException:
-                    if original_error is None:
-                        raise
-                    logger.warning("Kids target cleanup failed after ingest error")
+                await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
+            if ready_seen:
+                return list(collected.values())[:_MAX_COLLECTED_CARDS]
+            raise RuntimeError("CDP navigation did not reach YouTube Kids")
+
+    async def restore_home(self) -> None:
+        """Leave the persistent user page on Kids home without creating a target."""
+        if self._target_id is None:
+            return
+        try:
+            target = await self._target(self._target_id)
+            async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
+                await self._command(
+                    page,
+                    6,
+                    "Page.navigate",
+                    {"url": "https://www.youtubekids.com/"},
+                )
+        except Exception:
+            logger.warning("Could not restore the persistent YouTube Kids page")
 
 
 async def ingest_once(
@@ -643,10 +673,11 @@ async def _main() -> None:
         base_url=settings.opencodex_base_url,
         model=settings.opencodex_model,
     )
+    browser = YouTubeKidsCDP(os.getenv("KIDS_BROWSER_CDP_URL", "http://127.0.0.1:9223"))
     try:
         report = await ingest_once(
             db,
-            YouTubeKidsCDP(os.getenv("KIDS_BROWSER_CDP_URL", "http://127.0.0.1:9223")),
+            browser,
             classifier,
             max_cards_per_source=max(1, int(os.getenv("KIDS_INGEST_MAX_CARDS", "96"))),
             channel_policy_version=settings.kids_channel_policy_version,
@@ -658,6 +689,7 @@ async def _main() -> None:
             await db.set_setting("kids_ingest_last_success_at", utc_now_iso())
         print(json.dumps(asdict(report), sort_keys=True))
     finally:
+        await browser.restore_home()
         await classifier.close()
 
 
