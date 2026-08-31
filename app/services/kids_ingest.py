@@ -345,6 +345,7 @@ class YouTubeKidsCDP:
                     6,
                     "Page.navigate",
                     {"url": "https://www.youtubekids.com/"},
+                    timeout=max(10.0, self.wait_seconds),
                 )
         except Exception:
             logger.warning("Could not restore the persistent YouTube Kids page")
