@@ -1017,6 +1017,9 @@ judge = JudgeService(db, settings, webhook_client, blocklists=blocklists, allowl
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await db.init()
+    await db.kids_resolve_sync_backlog(
+        minimum_quality_height=settings.kids_resolver_min_quality_height,
+    )
     await blocklists.reload(db)
     await allowlists.reload(db)
     mqtt_bridge.set_event_loop(asyncio.get_running_loop())
@@ -1241,10 +1244,15 @@ async def page_kids(request: Request) -> HTMLResponse:
             "kids_status": {
                 "kill_switch": await runtime.db.kids_kill_switch_enabled(),
                 "catalog_revision": await runtime.db.catalog_revision(),
+                "resolve": await runtime.db.kids_resolve_summary(
+                    minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
+                ),
+                "resolver_last_success_at": await runtime.db.get_setting("kids_resolver_last_success_at"),
             },
             "sources": await runtime.db.catalog_sources_list(),
             "items": await runtime.db.catalog_item_list_all(),
             "watch_events": await runtime.db.kids_watch_events_list(),
+            "resolve_rows": await runtime.db.kids_resolve_recent_rows(),
             "page": "kids",
         },
     )
@@ -1323,9 +1331,16 @@ async def api_catalog_revision(request: Request) -> dict[str, Any]:
 
 @app.get("/api/kids/catalog/items")
 async def api_catalog_items(request: Request) -> dict[str, Any]:
-    if await request.app.state.runtime.db.kids_kill_switch_enabled():
+    runtime: RuntimeState = request.app.state.runtime
+    if await runtime.db.kids_kill_switch_enabled():
         return {"state": "kill_switch", "items": []}
-    return {"state": "ready", "items": await request.app.state.runtime.db.catalog_items_list()}
+    if not await runtime.monitoring_enabled_now():
+        return {"state": "schedule_closed", "items": []}
+    await runtime.judge.reconcile_catalog_policy()
+    return {
+        "state": "ready",
+        "items": await runtime.db.kids_eligible_feed_list(runtime.settings.kids_playback_min_remaining_seconds),
+    }
 
 
 @app.get("/api/kids/catalog/items/{item_id}")
@@ -1373,8 +1388,19 @@ async def api_catalog_item_create(payload: CatalogItemRequest, request: Request)
 
 @app.patch("/api/kids/sources/{source_id}/state")
 async def api_catalog_source_state(source_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    if payload.state == "approved":
+        source = await runtime.db.catalog_get("source", source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="catalog source not found")
+        decision = await runtime.judge.match_catalog_source_blocklist(source)
+        if decision:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot approve a source blocked by /blocklist",
+            )
     try:
-        result = await request.app.state.runtime.db.catalog_transition("source", source_id, payload.model_dump())
+        result = await runtime.db.catalog_transition("source", source_id, payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result is None:
@@ -1384,8 +1410,24 @@ async def api_catalog_source_state(source_id: int, payload: CatalogTransitionReq
 
 @app.patch("/api/kids/catalog/items/{item_id}/state")
 async def api_catalog_item_state(item_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    if payload.state == "approved":
+        item = await runtime.db.catalog_get("item", item_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="catalog item not found")
+        source = (
+            await runtime.db.catalog_get("source", int(item["source_id"]))
+            if item.get("source_id") is not None
+            else None
+        )
+        decision = await runtime.judge.match_catalog_item_blocklist(item, source)
+        if decision:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot approve an item blocked by /blocklist",
+            )
     try:
-        result = await request.app.state.runtime.db.catalog_transition("item", item_id, payload.model_dump())
+        result = await runtime.db.catalog_transition("item", item_id, payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result is None:
@@ -1395,9 +1437,17 @@ async def api_catalog_item_state(item_id: int, payload: CatalogTransitionRequest
 
 @app.get("/api/kids/status")
 async def api_kids_status(request: Request) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
     return {
-        "kill_switch": await request.app.state.runtime.db.kids_kill_switch_enabled(),
-        "catalog_revision": await request.app.state.runtime.db.catalog_revision(),
+        "kill_switch": await runtime.db.kids_kill_switch_enabled(),
+        "catalog_revision": await runtime.db.catalog_revision(),
+        "available": not await runtime.db.kids_kill_switch_enabled() and await runtime.monitoring_enabled_now(),
+        "schedule_active": bool((await runtime.current_schedule_context()).get("active", False)),
+        "monitoring_effective": await runtime.monitoring_enabled_now(),
+        "resolve": await runtime.db.kids_resolve_summary(
+            minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
+        ),
+        "resolver_last_success_at": await runtime.db.get_setting("kids_resolver_last_success_at"),
     }
 
 
@@ -1441,7 +1491,16 @@ async def api_kids_readyz(request: Request) -> dict[str, Any]:
         "ingest_last_success_at": last_success,
         "ingest_age_seconds": ingest_age_seconds,
         "catalog_revision": await runtime.db.catalog_revision(),
+        "resolver_last_success_at": await runtime.db.get_setting("kids_resolver_last_success_at"),
     }
+    resolve_summary = await runtime.db.kids_resolve_summary(
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
+    )
+    payload["backlog_counts"] = resolve_summary["counts"]
+    payload["fresh_ready_count"] = resolve_summary["fresh_ready"]
+    payload["ready_minimum"] = runtime.settings.kids_ready_minimum
+    if resolve_summary["fresh_ready"] < runtime.settings.kids_ready_minimum:
+        payload["status"] = "unready"
     if payload["status"] != "ready":
         raise HTTPException(status_code=503, detail=payload)
     return payload
@@ -1481,6 +1540,7 @@ async def api_kids_watch_event(
         profile=payload.profile,
         position_seconds=payload.position_seconds,
         session_id=payload.session_id,
+        startup_ms=payload.startup_ms,
         correlation_id=payload.correlation_id,
     )
     if event is None:
@@ -1491,6 +1551,43 @@ async def api_kids_watch_event(
 @app.get("/api/kids/watch-events")
 async def api_kids_watch_events(request: Request, limit: int = 100) -> dict[str, Any]:
     return {"events": await request.app.state.runtime.db.kids_watch_events_list(limit)}
+
+
+@app.get("/api/kids/playback-authorizations/{video_id}")
+async def api_kids_playback_authorization(
+    video_id: str,
+    request: Request,
+    include_candidate: bool = True,
+) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    if await runtime.db.kids_kill_switch_enabled() or not await runtime.monitoring_enabled_now():
+        raise HTTPException(status_code=403, detail="Kids playback is unavailable")
+    await runtime.judge.reconcile_catalog_policy()
+    if include_candidate:
+        row = await runtime.db.kids_playback_authorization(
+            video_id,
+            minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        )
+    else:
+        row = await runtime.db.kids_playback_policy_authorization(video_id)
+    if row is None:
+        raise HTTPException(status_code=403, detail="Kids playback is not authorized")
+    response = {
+        "status": "approved",
+        "catalog_revision": await runtime.db.catalog_revision(),
+        "item_id": row["item_id"],
+        "video_id": row["video_id"],
+    }
+    if include_candidate:
+        response.update(
+            {
+                "expires_at": row["expires_at"],
+                "quality_height": row["quality_height"],
+                "codec": row["codec"],
+                "candidate": row["candidate"],
+            }
+        )
+    return response
 
 
 @app.post("/api/webhook/control")
@@ -1826,14 +1923,17 @@ async def api_blacklist(payload: RuleRequest, request: Request) -> dict[str, Any
         url=url,
         source_list="manual",
     )
-    return {"ok": True}
+    blocked = await runtime.judge.reconcile_catalog_policy()
+    return {"ok": True, "blocked": blocked}
 
 
 @app.post("/api/blocklist/policies")
 @app.post("/api/rules/policies")
 async def api_rules_policies(payload: PolicyFlagsRequest, request: Request) -> dict[str, Any]:
     flags = normalize_policy_flags(payload.flags)
-    await request.app.state.runtime.db.set_setting("policy_flags_json", json.dumps(flags))
+    runtime: RuntimeState = request.app.state.runtime
+    await runtime.db.set_setting("policy_flags_json", json.dumps(flags))
+    await runtime.judge.reconcile_catalog_policy()
     return {"ok": True, "flags": flags}
 
 
@@ -1850,7 +1950,8 @@ async def api_rules_blocklists_sources(payload: RulesImportSourcesRequest, reque
     runtime: RuntimeState = request.app.state.runtime
     await runtime.blocklists.set_sources(runtime.db, payload.urls)
     summary = await runtime.blocklists.reload(runtime.db)
-    return {"ok": True, "summary": summary, "sources": payload.urls}
+    blocked = await runtime.judge.reconcile_catalog_policy()
+    return {"ok": True, "summary": summary, "blocked": blocked, "sources": payload.urls}
 
 
 @app.post("/api/blocklist/reload")
@@ -1858,7 +1959,8 @@ async def api_rules_blocklists_sources(payload: RulesImportSourcesRequest, reque
 async def api_rules_blocklists_reload(request: Request) -> dict[str, Any]:
     runtime: RuntimeState = request.app.state.runtime
     summary = await runtime.blocklists.reload(runtime.db)
-    return {"ok": True, "summary": summary}
+    blocked = await runtime.judge.reconcile_catalog_policy()
+    return {"ok": True, "summary": summary, "blocked": blocked}
 
 
 @app.post("/api/blocklist/local")
@@ -1867,7 +1969,8 @@ async def api_rules_blocklists_local(payload: LocalBlocklistContentRequest, requ
     runtime: RuntimeState = request.app.state.runtime
     await runtime.blocklists.save_local_content(payload.content)
     summary = await runtime.blocklists.reload(runtime.db)
-    return {"ok": True, "summary": summary}
+    blocked = await runtime.judge.reconcile_catalog_policy()
+    return {"ok": True, "summary": summary, "blocked": blocked}
 
 
 @app.post("/api/allowlist/sources")

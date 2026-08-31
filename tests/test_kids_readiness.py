@@ -27,6 +27,7 @@ def test_kids_readyz_requires_fresh_ingest_and_opencodex(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_DB_PATH", db_path)
     monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("KIDS_INGEST_FRESHNESS_SECONDS", "1800")
+    monkeypatch.setenv("KIDS_READY_MINIMUM", "0")
     module = importlib.reload(importlib.import_module("app.main"))
     monkeypatch.setattr(module, "OpenCodexKidsClassifier", FakeClassifier)
 

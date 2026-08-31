@@ -5,6 +5,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from google import genai
 from google.genai import types
@@ -17,7 +18,7 @@ from ..config import (
     POLICY_PRESETS,
     Settings,
 )
-from ..db import Database, utc_now_iso
+from ..db import KIDS_HOME_SOURCE_REFERENCE, Database, utc_now_iso
 from .blocklists import BlocklistService
 from .webhook import WebhookClient
 
@@ -32,11 +33,6 @@ class GeminiOutputError(RuntimeError):
 
 _POLICY_KEYS = [p["key"] for p in POLICY_PRESETS]
 _POLICY_LABELS = {p["key"]: p["label"] for p in POLICY_PRESETS}
-_POLICY_DEFAULTS = {
-    "block_cocomelon": True,
-    "block_nursery_factory": True,
-    "block_kids_clickbait_animals": True,
-}
 _POLICY_KEYWORDS = {
     "block_cocomelon": [
         "cocomelon",
@@ -107,15 +103,41 @@ _ALLOW_POLICY_KEYWORDS = {
     "allow_storytelling_books": ["story time", "read aloud", "storybook", "bedtime story"],
     "allow_family_game_shows": ["family quiz", "kids game show", "trivia for kids", "family challenge"],
 }
-_STRICT_CLICKBAIT_KEYWORDS = [
-    "monkey baby",
-    "baby monkey",
-    "bon bon",
-    "toilet",
-    "poop",
-    "potty",
-    "animal ht",
-]
+def match_policy_keywords(
+    flags: dict[str, bool],
+    *,
+    title: str = "",
+    channel_title: str = "",
+    video_url: str = "",
+    video_context: str = "",
+) -> str | None:
+    values = (
+        str(value or "").casefold()
+        for value in (title, channel_title, video_url, video_context)
+    )
+    hay = " ".join(values)
+    compact_hay = re.sub(r"[^a-z0-9]+", "", hay)
+    for key in _POLICY_KEYS:
+        if not flags.get(key, False):
+            continue
+        for needle in _POLICY_KEYWORDS.get(key, []):
+            normalized_needle = needle.casefold()
+            if normalized_needle in hay or re.sub(r"[^a-z0-9]+", "", normalized_needle) in compact_hay:
+                return key
+    return None
+
+
+def policy_block_reason(policy_key: str) -> str:
+    return f"guardian_policy_{policy_key}"
+
+
+def _channel_id_from_reference(reference: object) -> str:
+    raw = str(reference or "").strip()
+    parsed = urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        parts = [part for part in parsed.path.split("/") if part]
+        return parts[1] if len(parts) == 2 and parts[0] == "channel" else ""
+    return raw
 
 
 def normalize_policy_flags(raw: dict[str, Any] | str | None) -> dict[str, bool]:
@@ -132,7 +154,7 @@ def normalize_policy_flags(raw: dict[str, Any] | str | None) -> dict[str, bool]:
     elif isinstance(raw, dict):
         data = raw
 
-    return {key: bool(data.get(key, _POLICY_DEFAULTS.get(key, False))) for key in _POLICY_KEYS}
+    return {key: bool(data.get(key, False)) for key in _POLICY_KEYS}
 
 
 def normalize_allow_policy_flags(raw: dict[str, Any] | str | None) -> dict[str, bool]:
@@ -198,7 +220,7 @@ class JudgeService:
             return runtime.strip()
         return (self.settings.gemini_api_key or "").strip()
 
-    async def evaluate(
+    async def match_blocklist(
         self,
         *,
         video_id: str,
@@ -206,13 +228,14 @@ class JudgeService:
         channel_id: str,
         channel_title: str,
         video_url: str,
-        enforcement_mode: str = "blocklist",
-    ) -> dict[str, Any]:
-        mode = "whitelist" if enforcement_mode == "whitelist" else "blocklist"
-        cache_key = f"{mode}:{video_id}"
-
-        # Always honor explicit local blacklist first.
-        blacklist_match = await self.db.find_rule_match(video_id, channel_id, preferred_rule_type="blacklist")
+        video_context: str = "",
+    ) -> dict[str, Any] | None:
+        """Apply exactly the blocking controls exposed on the Guardian blocklist page."""
+        blacklist_match = await self.db.find_rule_match(
+            video_id,
+            channel_id,
+            preferred_rule_type="blacklist",
+        )
         if blacklist_match:
             return {
                 "verdict": "BLOCK",
@@ -221,7 +244,6 @@ class JudgeService:
                 "source": "blacklist",
             }
 
-        # Always honor file blacklist first.
         if self.blocklists is not None:
             file_block = await self.blocklists.match(video_id=video_id, channel_id=channel_id)
             if file_block:
@@ -231,6 +253,81 @@ class JudgeService:
                     "confidence": 100,
                     "source": "file_blacklist",
                 }
+
+        policy_key = await self.match_policy_key(
+            title=title,
+            channel_title=channel_title,
+            video_url=video_url,
+            video_context=video_context,
+        )
+        if policy_key:
+            return {
+                "verdict": "BLOCK",
+                "reason": policy_block_reason(policy_key),
+                "confidence": 100,
+                "source": "policy",
+            }
+        return None
+
+    async def match_catalog_source_blocklist(self, source: dict[str, Any]) -> dict[str, Any] | None:
+        reference = str(source.get("reference", "")).strip()
+        return await self.match_blocklist(
+            video_id="",
+            title=str(source.get("title", "")),
+            channel_id=_channel_id_from_reference(reference),
+            channel_title=str(source.get("title", "")),
+            video_url=reference,
+            video_context=reference,
+        )
+
+    async def match_catalog_item_blocklist(
+        self,
+        item: dict[str, Any],
+        source: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        source = source or {}
+        source_reference = str(
+            item.get("source_reference") or source.get("reference") or ""
+        ).strip()
+        source_title = str(
+            item.get("source_title") or source.get("title") or ""
+        ).strip()
+        return await self.match_blocklist(
+            video_id=str(item.get("video_id", "")),
+            title=str(item.get("title", "")),
+            channel_id=(
+                str(item.get("channel_id", "")).strip()
+                or _channel_id_from_reference(source_reference)
+            ),
+            channel_title=str(item.get("channel_title", "")),
+            video_url=f"https://www.youtubekids.com/watch?v={item.get('video_id', '')}",
+            video_context=f"{source_title} {source_reference}",
+        )
+
+    async def evaluate(
+        self,
+        *,
+        video_id: str,
+        title: str,
+        channel_id: str,
+        channel_title: str,
+        video_url: str,
+        video_context: str = "",
+        enforcement_mode: str = "blocklist",
+    ) -> dict[str, Any]:
+        mode = "whitelist" if enforcement_mode == "whitelist" else "blocklist"
+        cache_key = f"{mode}:{video_id}"
+
+        blocklist_match = await self.match_blocklist(
+            video_id=video_id,
+            title=title,
+            channel_id=channel_id,
+            channel_title=channel_title,
+            video_url=video_url,
+            video_context=video_context,
+        )
+        if blocklist_match:
+            return blocklist_match
 
         # Whitelist-only mode: only explicit allowlist/profile match should pass.
         if mode == "whitelist":
@@ -331,19 +428,6 @@ class JudgeService:
 
         # Blocklist mode: only blocklist path is enforced. Non-blocked content can proceed.
 
-        policy_hit = await self._match_policy_override(
-            title=title,
-            channel_title=channel_title,
-            video_url=video_url,
-        )
-        if policy_hit:
-            return {
-                "verdict": "BLOCK",
-                "reason": f'Blocked by policy toggle "{policy_hit}"',
-                "confidence": 100,
-                "source": "policy",
-            }
-
         cached = await self.db.cache_get(cache_key)
         if cached:
             cached["source"] = cached.get("source", "gemini")
@@ -394,6 +478,108 @@ class JudgeService:
             video_url=video_url,
         )
 
+    async def match_policy_key(
+        self,
+        *,
+        title: str,
+        channel_title: str,
+        video_url: str,
+        video_context: str = "",
+    ) -> str | None:
+        policy_flags_raw = (await self.db.get_setting("policy_flags_json")) or "{}"
+        return match_policy_keywords(
+            normalize_policy_flags(policy_flags_raw),
+            title=title,
+            channel_title=channel_title,
+            video_url=video_url,
+            video_context=video_context,
+        )
+
+    async def match_policy_override(
+        self,
+        *,
+        title: str,
+        channel_title: str,
+        video_url: str,
+        video_context: str = "",
+    ) -> str | None:
+        policy_key = await self.match_policy_key(
+            title=title,
+            channel_title=channel_title,
+            video_url=video_url,
+            video_context=video_context,
+        )
+        return _POLICY_LABELS.get(policy_key, policy_key) if policy_key else None
+
+    async def reconcile_catalog_policy(self) -> int:
+        """Reconcile catalog rows against the live Guardian blocklist controls."""
+        blocked = 0
+        for source in await self.db.catalog_sources_list():
+            if source.get("reference") == KIDS_HOME_SOURCE_REFERENCE:
+                continue
+            decision = await self.match_catalog_source_blocklist(source)
+            if decision and source.get("state") not in {"blocked", "revoked"}:
+                transitioned = await self.db.catalog_transition(
+                    "source",
+                    int(source["id"]),
+                    {
+                        "state": "blocked",
+                        "actor": "kids-guardian-blocklist",
+                        "reason": decision["reason"],
+                        "correlation_id": f"kids-blocklist-source-{source['id']}",
+                    },
+                )
+                if transitioned is not None:
+                    blocked += 1
+
+        for item in await self.db.catalog_approved_items_for_policy():
+            decision = await self.match_catalog_item_blocklist(item)
+            if not decision:
+                continue
+            transitioned = await self.db.catalog_transition(
+                "item",
+                int(item["id"]),
+                {
+                    "state": "blocked",
+                    "actor": "kids-guardian-blocklist",
+                    "reason": decision["reason"],
+                    "correlation_id": f"kids-blocklist-item-{item['video_id']}",
+                },
+                expected_state="approved",
+            )
+            if transitioned is not None:
+                blocked += 1
+
+        for row in await self.db.catalog_blocklist_restore_candidates():
+            entity_type = str(row["entity_type"])
+            entity_id = int(row["entity_id"])
+            current = await self.db.catalog_get(entity_type, entity_id)
+            if current is None:
+                continue
+            if entity_type == "source":
+                decision = await self.match_catalog_source_blocklist(current)
+            else:
+                source = (
+                    await self.db.catalog_get("source", int(current["source_id"]))
+                    if current.get("source_id") is not None
+                    else None
+                )
+                decision = await self.match_catalog_item_blocklist(current, source)
+            if decision:
+                continue
+            await self.db.catalog_transition(
+                entity_type,
+                entity_id,
+                {
+                    "state": row["previous_state"],
+                    "actor": "kids-guardian-blocklist-reconcile",
+                    "reason": "Blocklist no longer matches; restored previous catalog state",
+                    "correlation_id": f"kids-blocklist-restore-{entity_type}-{entity_id}",
+                },
+                expected_state="blocked",
+            )
+        return blocked
+
     async def _effective_prompt(self) -> str:
         custom = (await self.db.get_setting("custom_prompt")) or ""
         base = custom.strip() or DEFAULT_SAFE_PROMPT
@@ -418,18 +604,20 @@ class JudgeService:
     async def get_effective_whitelist_prompt_preview(self) -> str:
         return await self._effective_whitelist_prompt()
 
-    async def _match_policy_override(self, *, title: str, channel_title: str, video_url: str) -> str | None:
-        policy_flags_raw = (await self.db.get_setting("policy_flags_json")) or "{}"
-        flags = normalize_policy_flags(policy_flags_raw)
-        hay = f" {title} {channel_title} {video_url} ".lower()
-
-        for key, enabled in flags.items():
-            if not enabled:
-                continue
-            for needle in _POLICY_KEYWORDS.get(key, []):
-                if needle in hay:
-                    return _POLICY_LABELS.get(key, key)
-        return None
+    async def _match_policy_override(
+        self,
+        *,
+        title: str,
+        channel_title: str,
+        video_url: str,
+        video_context: str = "",
+    ) -> str | None:
+        return await self.match_policy_override(
+            title=title,
+            channel_title=channel_title,
+            video_url=video_url,
+            video_context=video_context,
+        )
 
     async def _match_allow_policy(self, *, title: str, channel_title: str, video_url: str) -> str | None:
         allow_flags_raw = (await self.db.get_setting("allow_policy_flags_json")) or "{}"
@@ -510,15 +698,6 @@ class JudgeService:
                 "source": "policy",
             }
 
-        hay = f" {title} {channel_title} {video_url} ".lower()
-        for needle in _STRICT_CLICKBAIT_KEYWORDS:
-            if needle in hay:
-                return {
-                    "verdict": "BLOCK",
-                    "reason": "Strict nanny mode: blocked by clickbait-animal safety filter.",
-                    "confidence": 100,
-                    "source": "policy",
-                }
         return decision
 
     @staticmethod

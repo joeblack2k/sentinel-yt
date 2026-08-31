@@ -54,10 +54,7 @@ def test_catalog_default_deny_transitions_and_listing(tmp_path, monkeypatch):
             },
         )
         assert approved_item.json()["state"] == "approved"
-        assert [
-            x["video_id"]
-            for x in client.get("/api/kids/catalog/items").json()["items"]
-        ] == ["video-1"]
+        assert client.get("/api/kids/catalog/items").json()["items"] == []
         assert client.get(
             "/api/kids/catalog/revision",
         ).json()["revision"] == 4
