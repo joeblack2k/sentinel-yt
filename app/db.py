@@ -4,10 +4,97 @@ import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import aiosqlite
 
-from .config import get_host_timezone_name
+from .config import DEFAULT_POLICY_FLAGS, get_host_timezone_name
+
+
+KIDS_HOME_SOURCE_REFERENCE = "__youtube_kids_home__"
+
+
+def _source_channel_id(kind: Any, reference: Any) -> str | None:
+    if str(kind or "") != "channel":
+        return None
+    raw = str(reference or "").strip()
+    if not raw or raw == KIDS_HOME_SOURCE_REFERENCE:
+        return None
+    parsed = urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        parts = [part for part in parsed.path.split("/") if part]
+        return parts[1] if len(parts) == 2 and parts[0] == "channel" else None
+    return raw
+
+
+def _catalog_identity_is_known(item: dict[str, Any], source: dict[str, Any]) -> bool:
+    channel_id = str(item.get("channel_id") or "").strip()
+    channel_title = str(item.get("channel_title") or "").strip()
+    if not channel_id or not channel_title:
+        return False
+    expected_channel_id = _source_channel_id(source.get("kind"), source.get("reference"))
+    return expected_channel_id is None or channel_id == expected_channel_id
+
+
+def _catalog_item_is_authorized(item: dict[str, Any], source: dict[str, Any]) -> bool:
+    if (
+        item.get("state") != "approved"
+        or source.get("state") != "approved"
+        or source.get("safety_verdict") != "SAFE"
+        or source.get("reference") == KIDS_HOME_SOURCE_REFERENCE
+        or not _catalog_identity_is_known(item, source)
+    ):
+        return False
+    return True
+
+
+def _quality_height_or_default(value: Any) -> int:
+    return value if type(value) is int and 720 <= value <= 1080 else 720
+
+
+def _stored_candidate_meets_policy(
+    candidate_json: Any,
+    quality_height: Any,
+    minimum_quality_height: int,
+) -> bool:
+    if (
+        type(quality_height) is not int
+        or not minimum_quality_height <= quality_height <= 1080
+    ):
+        return False
+    try:
+        candidate = json.loads(str(candidate_json))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(candidate, dict) or candidate.get("kind") not in (None, "adaptive_mpv"):
+        return False
+    media_url = candidate.get("media_url")
+    audio_url = candidate.get("audio_url")
+    return (
+        type(candidate.get("quality_height")) is int
+        and candidate["quality_height"] == quality_height
+        and isinstance(media_url, str)
+        and bool(media_url)
+        and isinstance(audio_url, str)
+        and bool(audio_url)
+        and media_url != audio_url
+    )
+
+
+def _catalog_row_context(
+    row: tuple[Any, ...],
+    columns: list[str],
+) -> tuple[dict[str, Any], dict[str, Any], Any]:
+    values = dict(zip(columns, row))
+    source = {
+        "kind": values.pop("_source_kind", None),
+        "reference": values.pop("_source_reference", None),
+        "title": values.pop("_source_title", None),
+        "state": values.pop("_source_state", None),
+        "safety_verdict": values.pop("_source_safety_verdict", None),
+    }
+    candidate_json = values.pop("_candidate_json", None)
+    return values, source, candidate_json
 
 
 def utc_now_iso() -> str:
@@ -126,6 +213,8 @@ class Database:
                     video_id TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL DEFAULT '',
                     source_id INTEGER REFERENCES catalog_sources(id),
+                    channel_id TEXT NOT NULL DEFAULT '',
+                    channel_title TEXT NOT NULL DEFAULT '',
                     thumbnail_url TEXT NOT NULL DEFAULT '',
                     duration_seconds INTEGER NOT NULL DEFAULT 0,
                     visual_category TEXT NOT NULL DEFAULT 'general',
@@ -233,6 +322,10 @@ class Database:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0")
             if "visual_category" not in item_cols:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN visual_category TEXT NOT NULL DEFAULT 'general'")
+            if "channel_id" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN channel_id TEXT NOT NULL DEFAULT ''")
+            if "channel_title" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN channel_title TEXT NOT NULL DEFAULT ''")
             cur = await db.execute("PRAGMA table_info(kids_watch_events)")
             watch_cols = {row[1] for row in await cur.fetchall()}
             if "startup_ms" not in watch_cols:
@@ -287,8 +380,15 @@ class Database:
                 )
             else:
                 cur = await db.execute(
-                    "INSERT INTO catalog_items(video_id,title,source_id,thumbnail_url,duration_seconds,visual_category,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    """
+                    INSERT INTO catalog_items(
+                        video_id,title,source_id,channel_id,channel_title,thumbnail_url,
+                        duration_seconds,visual_category,actor,changed_at,reason,revision,correlation_id
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
                     (values["video_id"].strip(), values.get("title", "").strip(), values.get("source_id"),
+                     str(values.get("channel_id", "") or "").strip()[:128],
+                     str(values.get("channel_title", "") or "").strip()[:500],
                      values.get("thumbnail_url", "").strip(), int(values.get("duration_seconds", 0) or 0),
                      values.get("visual_category", "general").strip() or "general",
                      "system", now, "candidate created", revision, values["correlation_id"]),
@@ -313,15 +413,28 @@ class Database:
             cols = [d[0] for d in cur.description] if row else []
         return dict(zip(cols, row)) if row else None
 
-    async def catalog_transition(self, entity: str, entity_id: int, values: dict[str, Any]) -> dict[str, Any]:
+    async def catalog_transition(
+        self,
+        entity: str,
+        entity_id: int,
+        values: dict[str, Any],
+        *,
+        expected_state: str | None = None,
+    ) -> dict[str, Any] | None:
         table = "catalog_sources" if entity == "source" else "catalog_items"
         now = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
             row = await (await db.execute(f"SELECT state FROM {table} WHERE id=?", (entity_id,))).fetchone()
             if not row:
+                await db.rollback()
                 return None
             old = row[0]
+            if expected_state is not None and old != expected_state:
+                await db.rollback()
+                return None
             if old == "revoked" and values["state"] == "approved":
+                await db.rollback()
                 raise ValueError("revoked entries cannot be approved")
             revision = await self._catalog_revision(db)
             await db.execute(
@@ -342,6 +455,43 @@ class Database:
             await db.commit()
         await self.kids_resolve_sync_backlog()
         return await self.catalog_get(entity, entity_id)
+
+    async def catalog_blocklist_restore_candidates(self) -> list[dict[str, Any]]:
+        """Return rows whose latest blocklist transition can be safely reversed."""
+        actors = ("kids-guardian-blocklist", "kids-guardian-policy")
+        result: list[dict[str, Any]] = []
+        async with aiosqlite.connect(self.db_path) as db:
+            for entity_type, table in (("source", "catalog_sources"), ("item", "catalog_items")):
+                cur = await db.execute(
+                    f"SELECT id FROM {table} WHERE state='blocked' AND actor IN (?, ?)",
+                    actors,
+                )
+                for (entity_id,) in await cur.fetchall():
+                    transition = await (
+                        await db.execute(
+                            """
+                            SELECT from_state,to_state,actor
+                            FROM catalog_transitions
+                            WHERE entity_type=? AND entity_id=?
+                            ORDER BY id DESC LIMIT 1
+                            """,
+                            (entity_type, entity_id),
+                        )
+                    ).fetchone()
+                    if (
+                        transition
+                        and transition[1] == "blocked"
+                        and transition[2] in actors
+                        and transition[0] in {"candidate", "approved", "unknown"}
+                    ):
+                        result.append(
+                            {
+                                "entity_type": entity_type,
+                                "entity_id": int(entity_id),
+                                "previous_state": transition[0],
+                            }
+                        )
+        return result
 
     async def catalog_source_safety_update(
         self,
@@ -421,10 +571,14 @@ class Database:
         visual_category: str,
         correlation_id: str,
         sync_backlog: bool = True,
+        channel_id: str = "",
+        channel_title: str = "",
     ) -> dict[str, Any] | None:
         values = (
             title.strip()[:500],
             source_id,
+            channel_id.strip()[:128],
+            channel_title.strip()[:500],
             thumbnail_url.strip()[:2000],
             max(0, int(duration_seconds)),
             visual_category.strip()[:64] or "general",
@@ -434,7 +588,8 @@ class Database:
             row = await (
                 await db.execute(
                     """
-                    SELECT title,source_id,thumbnail_url,duration_seconds,visual_category
+                    SELECT title,source_id,channel_id,channel_title,thumbnail_url,
+                           duration_seconds,visual_category
                     FROM catalog_items WHERE id=?
                     """,
                     (item_id,),
@@ -449,7 +604,8 @@ class Database:
                 await db.execute(
                     """
                     UPDATE catalog_items
-                    SET title=?,source_id=?,thumbnail_url=?,duration_seconds=?,visual_category=?,
+                    SET title=?,source_id=?,channel_id=?,channel_title=?,thumbnail_url=?,
+                        duration_seconds=?,visual_category=?,
                         actor='kids-ingest',changed_at=?,reason='metadata refreshed',
                         revision=?,correlation_id=?
                     WHERE id=?
@@ -469,37 +625,90 @@ class Database:
             await self.kids_resolve_sync_backlog()
         return await self.catalog_get("item", item_id)
 
-    async def catalog_items_list(self, minimum_remaining_seconds: int = 300) -> list[dict[str, Any]]:
-        # Feed consumers must only ever see items from an approved source.
-        query = (
-            "SELECT i.* FROM catalog_items i "
-            "JOIN catalog_sources s ON s.id = i.source_id "
-            "WHERE i.state='approved' AND s.state='approved'"
-        )
-        async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute(query + " ORDER BY i.id ASC")
-            rows = await cur.fetchall()
-            cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in rows]
-
-    async def kids_eligible_feed_list(self, minimum_remaining_seconds: int) -> list[dict[str, Any]]:
+    async def catalog_approved_items_for_policy(self) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 """
-                SELECT i.* FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
-                JOIN kids_resolve_backlog b ON b.item_id=i.id
-                WHERE i.state='approved' AND s.state='approved' AND s.safety_verdict='SAFE'
-                  AND b.status='ready' AND b.expires_at>?
-                ORDER BY b.resolved_at DESC,i.id ASC
-                """,
-                ((datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat(),),
+                SELECT i.*,COALESCE(s.title,'') AS source_title,
+                       COALESCE(s.reference,'') AS source_reference
+                FROM catalog_items i
+                LEFT JOIN catalog_sources s ON s.id=i.source_id
+                WHERE i.state='approved'
+                ORDER BY i.id ASC
+                """
             )
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in rows]
 
-    async def kids_resolve_sync_backlog(self) -> None:
+    async def catalog_items_list(self, minimum_remaining_seconds: int = 300) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict
+                FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
+                WHERE i.state='approved' AND s.state='approved'
+                  AND s.safety_verdict='SAFE' AND s.reference!=?
+                ORDER BY i.id ASC
+                """,
+                (KIDS_HOME_SOURCE_REFERENCE,),
+            )
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item, source, _candidate_json = _catalog_row_context(row, cols)
+            if _catalog_item_is_authorized(item, source):
+                result.append(item)
+        return result
+
+    async def kids_eligible_feed_list(
+        self,
+        minimum_remaining_seconds: int,
+        minimum_quality_height: int = 720,
+    ) -> list[dict[str, Any]]:
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict,
+                       b.candidate_json AS _candidate_json,b.quality_height AS _backlog_quality_height
+                FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
+                JOIN kids_resolve_backlog b ON b.item_id=i.id
+                WHERE i.state='approved' AND s.state='approved' AND s.safety_verdict='SAFE'
+                  AND s.reference!=? AND b.status='ready' AND b.quality_height>=? AND b.expires_at>?
+                ORDER BY b.resolved_at DESC,i.id ASC
+                """,
+                (
+                    KIDS_HOME_SOURCE_REFERENCE,
+                    minimum_quality_height,
+                    (datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat(),
+                ),
+            )
+            rows = await cur.fetchall()
+            cols = [d[0] for d in cur.description]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item, source, candidate_json = _catalog_row_context(row, cols)
+            quality_height = item.pop("_backlog_quality_height", None)
+            if (
+                _catalog_item_is_authorized(item, source)
+                and _stored_candidate_meets_policy(
+                    candidate_json,
+                    quality_height,
+                    minimum_quality_height,
+                )
+            ):
+                result.append(item)
+        return result
+
+    async def kids_resolve_sync_backlog(self, *, minimum_quality_height: int = 720) -> None:
         """Make eligibility changes immediately remove technical playback authority."""
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         now = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
@@ -508,27 +717,72 @@ class Database:
                 SELECT i.id,i.video_id,'pending',?
                 FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
                 WHERE i.state='approved' AND s.state='approved' AND s.safety_verdict='SAFE'
+                  AND s.reference!=?
                 ON CONFLICT(item_id) DO UPDATE SET
                     video_id=excluded.video_id,
-                    status=CASE WHEN kids_resolve_backlog.status='blocked' THEN 'pending' ELSE kids_resolve_backlog.status END,
-                    updated_at=excluded.updated_at
+                    status=CASE WHEN kids_resolve_backlog.status='blocked' THEN 'pending'
+                                ELSE kids_resolve_backlog.status END,
+                    updated_at=CASE WHEN kids_resolve_backlog.status='blocked'
+                                    THEN excluded.updated_at ELSE kids_resolve_backlog.updated_at END
                 """,
-                (now,),
+                (now, KIDS_HOME_SOURCE_REFERENCE),
             )
-            await db.execute(
+            cur = await db.execute(
                 """
-                UPDATE kids_resolve_backlog
-                SET status='blocked', candidate_json='', quality_height=NULL, codec='', resolved_at=NULL,
-                    expires_at=NULL, next_attempt_at=NULL, last_error_code='ineligible', updated_at=?
-                WHERE item_id IN (
-                    SELECT b.item_id FROM kids_resolve_backlog b
-                    LEFT JOIN catalog_items i ON i.id=b.item_id
-                    LEFT JOIN catalog_sources s ON s.id=i.source_id
-                    WHERE i.id IS NULL OR i.state!='approved' OR s.state!='approved' OR s.safety_verdict!='SAFE'
-                )
+                SELECT b.item_id,b.status,b.candidate_json,b.quality_height AS _backlog_quality_height,
+                       i.*,s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict
+                FROM kids_resolve_backlog b
+                LEFT JOIN catalog_items i ON i.id=b.item_id
+                LEFT JOIN catalog_sources s ON s.id=i.source_id
                 """,
-                (now,),
             )
+            rows = await cur.fetchall()
+            columns = [d[0] for d in cur.description]
+            for row in rows:
+                values = dict(zip(columns, row))
+                item_id = values["item_id"]
+                status = values["status"]
+                candidate_json = values["_candidate_json"] if "_candidate_json" in values else values["candidate_json"]
+                quality_height = values["_backlog_quality_height"]
+                item = {key: value for key, value in values.items() if key not in {
+                    "item_id", "status", "candidate_json", "_candidate_json",
+                    "_backlog_quality_height",
+                }}
+                source = {
+                    "kind": values.get("_source_kind"),
+                    "reference": values.get("_source_reference"),
+                    "title": values.get("_source_title"),
+                    "state": values.get("_source_state"),
+                    "safety_verdict": values.get("_source_safety_verdict"),
+                }
+                if not _catalog_item_is_authorized(item, source):
+                    await db.execute(
+                        """
+                        UPDATE kids_resolve_backlog
+                        SET status='blocked',candidate_json='',quality_height=NULL,codec='',
+                            resolved_at=NULL,expires_at=NULL,next_attempt_at=NULL,
+                            last_error_code='ineligible',updated_at=?
+                        WHERE item_id=?
+                        """,
+                        (now, item_id),
+                    )
+                elif status == "ready" and not _stored_candidate_meets_policy(
+                    candidate_json,
+                    quality_height,
+                    minimum_quality_height,
+                ):
+                    await db.execute(
+                        """
+                        UPDATE kids_resolve_backlog
+                        SET status='pending',candidate_json='',quality_height=NULL,codec='',
+                            resolved_at=NULL,expires_at=NULL,next_attempt_at=NULL,
+                            last_error_code='quality_below_policy',updated_at=?
+                        WHERE item_id=?
+                        """,
+                        (now, item_id),
+                    )
             await db.execute(
                 """
                 UPDATE kids_resolve_backlog
@@ -660,25 +914,60 @@ class Database:
         return [dict(zip(cols, row)) for row in rows]
 
     async def kids_playback_authorization(
-        self, video_id: str, *, minimum_remaining_seconds: int
+        self,
+        video_id: str,
+        *,
+        minimum_remaining_seconds: int,
+        minimum_quality_height: int = 720,
     ) -> dict[str, Any] | None:
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         expires_after = (datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat()
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 """
-                SELECT i.id AS item_id,i.video_id,b.candidate_json,b.expires_at,b.quality_height,b.codec
+                SELECT i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
+                       b.candidate_json,b.expires_at,b.quality_height,b.codec,
+                       s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict
                 FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
                 JOIN kids_resolve_backlog b ON b.item_id=i.id
                 WHERE i.video_id=? AND i.state='approved' AND s.state='approved'
-                  AND s.safety_verdict='SAFE' AND b.status='ready' AND b.expires_at>?
+                  AND s.safety_verdict='SAFE' AND s.reference!=?
+                  AND b.status='ready' AND b.quality_height>=? AND b.expires_at>?
                 """,
-                (video_id, expires_after),
+                (video_id, KIDS_HOME_SOURCE_REFERENCE, minimum_quality_height, expires_after),
             )
             row = await cur.fetchone()
             cols = [d[0] for d in cur.description] if row else []
         if not row:
             return None
         result = dict(zip(cols, row))
+        source = {
+            "kind": result.pop("_source_kind", None),
+            "reference": result.pop("_source_reference", None),
+            "title": result.pop("_source_title", None),
+            "state": result.pop("_source_state", None),
+            "safety_verdict": result.pop("_source_safety_verdict", None),
+        }
+        item = {
+            "state": "approved",
+            "video_id": result["video_id"],
+            "title": result["title"],
+            "channel_id": result["channel_id"],
+            "channel_title": result["channel_title"],
+        }
+        candidate_json = result["candidate_json"]
+        quality_height = result["quality_height"]
+        if (
+            not _catalog_item_is_authorized(item, source)
+            or not _stored_candidate_meets_policy(
+                candidate_json,
+                quality_height,
+                minimum_quality_height,
+            )
+        ):
+            return None
         try:
             candidate = json.loads(str(result.pop("candidate_json")))
         except (TypeError, json.JSONDecodeError):
@@ -691,16 +980,38 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 """
-                SELECT i.id AS item_id,i.video_id
+                SELECT i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
+                       s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict
                 FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
                 WHERE i.video_id=? AND i.state='approved' AND s.state='approved'
-                  AND s.safety_verdict='SAFE'
+                  AND s.safety_verdict='SAFE' AND s.reference!=?
                 """,
-                (video_id,),
+                (video_id, KIDS_HOME_SOURCE_REFERENCE),
             )
             row = await cur.fetchone()
             cols = [d[0] for d in cur.description] if row else []
-        return dict(zip(cols, row)) if row else None
+        if not row:
+            return None
+        result = dict(zip(cols, row))
+        source = {
+            "kind": result.pop("_source_kind", None),
+            "reference": result.pop("_source_reference", None),
+            "title": result.pop("_source_title", None),
+            "state": result.pop("_source_state", None),
+            "safety_verdict": result.pop("_source_safety_verdict", None),
+        }
+        item = {
+            "state": "approved",
+            "video_id": result["video_id"],
+            "title": result["title"],
+            "channel_id": result["channel_id"],
+            "channel_title": result["channel_title"],
+        }
+        if not _catalog_item_is_authorized(item, source):
+            return None
+        return {"item_id": result["item_id"], "video_id": result["video_id"]}
 
     async def catalog_item_list_all(self) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
@@ -874,7 +1185,7 @@ class Database:
             "last_error": "",
             "gemini_api_key_runtime": "",
             "last_failure_alert_at": "",
-            "policy_flags_json": "{}",
+            "policy_flags_json": json.dumps(DEFAULT_POLICY_FLAGS, separators=(",", ":")),
             "gemini_enabled": "true",
             "sponsorblock_active": "false",
             "sponsorblock_schedule_enabled": "false",
@@ -904,6 +1215,13 @@ class Database:
         }
         for key, value in defaults.items():
             existing = await self.get_setting(key)
+            if key == "policy_flags_json" and existing is not None:
+                try:
+                    parsed = json.loads(existing)
+                except (TypeError, json.JSONDecodeError):
+                    parsed = None
+                if not isinstance(parsed, dict) or not parsed:
+                    existing = None
             if existing is None:
                 await self.set_setting(key, value)
 

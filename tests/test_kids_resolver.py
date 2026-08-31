@@ -10,11 +10,57 @@ from app.db import Database
 from app.services.kids_resolver import PRACTICAL_CANDIDATE_TTL, normalize_candidate, run_once
 
 
+def adaptive_payload(quality_height: object) -> dict:
+    resolved_at = datetime.now(timezone.utc)
+    expiry = resolved_at + timedelta(hours=1)
+    return {
+        "status": "ready",
+        "resolved_at": resolved_at.isoformat(),
+        "expires_at": expiry.isoformat(),
+        "candidate": {
+            "media_url": signed_url("video", expiry),
+            "audio_url": signed_url("audio", expiry),
+            "quality_height": quality_height,
+            "codec": "avc1.640028",
+            "video_headers": {},
+            "audio_headers": {},
+        },
+    }
+
+
 def signed_url(kind: str, expires_at: datetime) -> str:
     return (
         f"https://rr1---sn.example.googlevideo.com/videoplayback/{kind}"
         f"?expire={int(expires_at.timestamp())}&sig=opaque"
     )
+
+
+def test_minimum_quality_height_setting_is_configurable_and_fail_closed(monkeypatch):
+    monkeypatch.delenv("KIDS_RESOLVER_MIN_QUALITY_HEIGHT", raising=False)
+    assert Settings().kids_resolver_min_quality_height == 720
+
+    monkeypatch.setenv("KIDS_RESOLVER_MIN_QUALITY_HEIGHT", "1080")
+    assert Settings().kids_resolver_min_quality_height == 1080
+
+    for value in ("360", "1081", "invalid"):
+        monkeypatch.setenv("KIDS_RESOLVER_MIN_QUALITY_HEIGHT", value)
+        assert Settings().kids_resolver_min_quality_height == 720
+
+
+@pytest.mark.parametrize(
+    ("quality_height", "accepted"),
+    [(719, False), (720, True), (1080, True), (1081, False), (True, False), (720.0, False)],
+)
+def test_normalize_candidate_enforces_configured_quality_range(quality_height, accepted):
+    normalized = normalize_candidate(adaptive_payload(quality_height))
+    assert (normalized is not None) is accepted
+
+
+def test_normalize_candidate_uses_configured_minimum():
+    payload = adaptive_payload(720)
+    assert normalize_candidate(payload, minimum_quality_height=720) is not None
+    assert normalize_candidate(payload, minimum_quality_height=1080) is None
+    assert normalize_candidate(payload, minimum_quality_height=360) is None
 
 
 def test_resolved_candidate_is_capped_before_po_token_goes_stale():
@@ -41,7 +87,7 @@ def test_resolved_candidate_is_capped_before_po_token_goes_stale():
     assert practical_expiry == resolved_at + PRACTICAL_CANDIDATE_TTL
 
 
-def test_progressive_muxed_candidate_requires_one_signed_media_url():
+def test_progressive_muxed_candidate_is_rejected():
     resolved_at = datetime.now(timezone.utc)
     signed_expiry = resolved_at + timedelta(hours=1)
     normalized = normalize_candidate(
@@ -53,7 +99,7 @@ def test_progressive_muxed_candidate_requires_one_signed_media_url():
                 "kind": "progressive_muxed",
                 "media_url": signed_url("muxed", signed_expiry),
                 "audio_url": None,
-                "quality_height": 360,
+                "quality_height": 720,
                 "codec": "avc1.42001e",
                 "container": "mp4",
                 "mime_type": "video/mp4",
@@ -63,8 +109,7 @@ def test_progressive_muxed_candidate_requires_one_signed_media_url():
         }
     )
 
-    assert normalized is not None
-    assert normalized[0]["kind"] == "progressive_muxed"
+    assert normalized is None
     assert normalize_candidate(
         {
             "status": "ready",
@@ -74,7 +119,7 @@ def test_progressive_muxed_candidate_requires_one_signed_media_url():
                 "kind": "progressive_muxed",
                 "media_url": signed_url("muxed", signed_expiry),
                 "audio_url": signed_url("audio", signed_expiry),
-                "quality_height": 360,
+                "quality_height": 720,
                 "codec": "avc1.42001e",
                 "video_headers": {},
                 "audio_headers": {},
@@ -95,7 +140,7 @@ def test_unknown_candidate_transport_is_denied():
                 "kind": "hls",
                 "media_url": signed_url("muxed", signed_expiry),
                 "audio_url": None,
-                "quality_height": 360,
+                "quality_height": 720,
                 "codec": "avc1.42001e",
                 "video_headers": {},
                 "audio_headers": {},
@@ -105,8 +150,15 @@ def test_unknown_candidate_transport_is_denied():
 
 
 async def eligible_item(db: Database, video_id: str = "video-ready") -> dict:
+    channel_id = f"UC-{video_id}"
     source = await db.catalog_create(
-        "source", {"kind": "channel", "reference": f"UC-{video_id}", "correlation_id": "source"}
+        "source",
+        {
+            "kind": "channel",
+            "reference": channel_id,
+            "title": "Approved channel",
+            "correlation_id": "source",
+        },
     )
     await db.catalog_source_safety_update(
         source["id"], verdict="SAFE", reason="safe", actor="guardian", correlation_id="safe"
@@ -115,12 +167,148 @@ async def eligible_item(db: Database, video_id: str = "video-ready") -> dict:
         "source", source["id"], {"state": "approved", "actor": "parent", "reason": "approved", "correlation_id": "source-state"}
     )
     item = await db.catalog_create(
-        "item", {"video_id": video_id, "source_id": source["id"], "correlation_id": "item"}
+        "item",
+        {
+            "video_id": video_id,
+            "source_id": source["id"],
+            "channel_id": channel_id,
+            "channel_title": "Approved channel",
+            "correlation_id": "item",
+        },
     )
     await db.catalog_transition(
         "item", item["id"], {"state": "approved", "actor": "parent", "reason": "approved", "correlation_id": "item-state"}
     )
     return item
+
+
+async def persist_ready_candidate(db: Database, item_id: int, quality_height: int = 1080) -> None:
+    payload = adaptive_payload(quality_height)
+    await db.kids_resolve_success(
+        item_id=item_id,
+        candidate=payload["candidate"],
+        quality_height=quality_height,
+        codec="avc1.640028",
+        resolved_at=payload["resolved_at"],
+        expires_at=payload["expires_at"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_catalog_and_playback_authorization_fail_closed_for_identity_and_safety(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+
+    missing_identity_source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": "UC-missing-identity",
+            "title": "Approved channel",
+            "correlation_id": "missing-identity-source",
+        },
+    )
+    await db.catalog_source_safety_update(
+        missing_identity_source["id"],
+        verdict="SAFE",
+        reason="safe",
+        actor="guardian",
+        correlation_id="missing-identity-safe",
+    )
+    await db.catalog_transition(
+        "source",
+        missing_identity_source["id"],
+        {
+            "state": "approved",
+            "actor": "parent",
+            "reason": "approved",
+            "correlation_id": "missing-identity-approve-source",
+        },
+    )
+    missing_identity_item = await db.catalog_create(
+        "item",
+        {
+            "video_id": "video-missing",
+            "source_id": missing_identity_source["id"],
+            "correlation_id": "missing-identity-item",
+        },
+    )
+    await db.catalog_transition(
+        "item",
+        missing_identity_item["id"],
+        {
+            "state": "approved",
+            "actor": "parent",
+            "reason": "approved",
+            "correlation_id": "missing-identity-approve-item",
+        },
+    )
+    await persist_ready_candidate(db, missing_identity_item["id"])
+
+    assert await db.catalog_items_list() == []
+    assert await db.kids_eligible_feed_list(300) == []
+    assert await db.kids_playback_authorization("video-missing", minimum_remaining_seconds=300) is None
+    assert await db.kids_playback_policy_authorization("video-missing") is None
+
+    uncertain_source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": "UC-uncertain",
+            "title": "Approved channel",
+            "correlation_id": "uncertain-source",
+        },
+    )
+    await db.catalog_source_safety_update(
+        uncertain_source["id"],
+        verdict="SAFE",
+        reason="safe",
+        actor="guardian",
+        correlation_id="uncertain-safe",
+    )
+    await db.catalog_transition(
+        "source",
+        uncertain_source["id"],
+        {
+            "state": "approved",
+            "actor": "parent",
+            "reason": "approved",
+            "correlation_id": "uncertain-approve-source",
+        },
+    )
+    uncertain_item = await db.catalog_create(
+        "item",
+        {
+            "video_id": "video-uncertain",
+            "source_id": uncertain_source["id"],
+            "channel_id": "UC-uncertain",
+            "channel_title": "Approved channel",
+            "correlation_id": "uncertain-item",
+        },
+    )
+    await db.catalog_transition(
+        "item",
+        uncertain_item["id"],
+        {
+            "state": "approved",
+            "actor": "parent",
+            "reason": "approved",
+            "correlation_id": "uncertain-approve-item",
+        },
+    )
+    await persist_ready_candidate(db, uncertain_item["id"])
+    await db.catalog_source_safety_update(
+        uncertain_source["id"],
+        verdict="UNCERTAIN",
+        reason="unknown",
+        actor="guardian",
+        correlation_id="uncertain-revoked",
+    )
+
+    assert await db.catalog_items_list() == []
+    assert await db.kids_eligible_feed_list(300) == []
+    assert await db.kids_playback_authorization("video-uncertain", minimum_remaining_seconds=300) is None
+    assert await db.kids_playback_policy_authorization("video-uncertain") is None
 
 
 @pytest.mark.asyncio
@@ -207,22 +395,21 @@ async def test_resolver_worker_keeps_candidate_scoped_to_authorization_storage(t
 
 
 @pytest.mark.asyncio
-async def test_resolver_worker_requests_muxed_transport(tmp_path):
+async def test_resolver_worker_requests_adaptive_transport(tmp_path):
     db = Database(str(tmp_path / "sentinel.db"))
     await db.init()
-    item = await eligible_item(db, "video-muxed")
+    item = await eligible_item(db, "video-adaptive")
     expiry = datetime.now(timezone.utc) + timedelta(minutes=10)
     payload = {
-        "youtube_id": "video-muxed",
+        "youtube_id": "video-adaptive",
         "status": "ready",
         "resolved_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": expiry.isoformat(),
         "candidate": {
-            "kind": "progressive_muxed",
-            "media_url": signed_url("muxed", expiry),
-            "audio_url": None,
-            "quality_height": 360,
-            "codec": "avc1.42001e",
+            "media_url": signed_url("video", expiry),
+            "audio_url": signed_url("audio", expiry),
+            "quality_height": 720,
+            "codec": "avc1.4d401f",
             "video_headers": {},
             "audio_headers": {},
         },
@@ -247,10 +434,81 @@ async def test_resolver_worker_requests_muxed_transport(tmp_path):
     assert result["ready"] == 1
     assert requests and dict(httpx.QueryParams(requests[0].url.query)) == {
         "target_height": "1080",
-        "transport": "muxed",
+        "transport": "adaptive",
     }
-    auth = await db.kids_playback_authorization("video-muxed", minimum_remaining_seconds=300)
-    assert auth and auth["candidate"]["audio_url"] is None
+    auth = await db.kids_playback_authorization("video-adaptive", minimum_remaining_seconds=300)
+    assert auth and auth["candidate"]["quality_height"] == 720
+
+
+@pytest.mark.asyncio
+async def test_resolver_worker_retries_underquality_candidate(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    await eligible_item(db, "video-underquality")
+    payload = adaptive_payload(360)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    )
+    settings = Settings(
+        db_path=db.db_path,
+        kids_resolver_backend_url="http://backend",
+        kids_resolver_batch_size=1,
+    )
+    try:
+        result = await run_once(db=db, settings=settings, client=client)
+    finally:
+        await client.aclose()
+
+    assert result["ready"] == 0
+    assert result["retry"] == 1
+    assert result["invalid_candidate"] == 1
+    assert await db.kids_playback_authorization("video-underquality", minimum_remaining_seconds=300) is None
+    row = (await db.kids_resolve_recent_rows())[0]
+    assert row["status"] == "retry"
+    assert row["quality_height"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_worker_requeues_legacy_360p_ready_row(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    item = await eligible_item(db, "video-legacy-360")
+    old = adaptive_payload(360)
+    await db.kids_resolve_success(
+        item_id=item["id"],
+        candidate=old["candidate"],
+        quality_height=360,
+        codec="avc1.640028",
+        resolved_at=old["resolved_at"],
+        expires_at=old["expires_at"],
+    )
+    assert (await db.kids_resolve_recent_rows())[0]["status"] == "ready"
+
+    requests: list[httpx.Request] = []
+    payload = adaptive_payload(720)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=payload)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(
+        db_path=db.db_path,
+        kids_resolver_backend_url="http://backend",
+        kids_resolver_batch_size=1,
+    )
+    try:
+        result = await run_once(db=db, settings=settings, client=client)
+    finally:
+        await client.aclose()
+
+    assert result["claimed"] == 1
+    assert result["ready"] == 1
+    assert len(requests) == 1
+    row = (await db.kids_resolve_recent_rows())[0]
+    assert row["status"] == "ready"
+    assert row["quality_height"] == 720
 
 
 @pytest.mark.asyncio

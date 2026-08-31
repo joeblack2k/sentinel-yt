@@ -1017,6 +1017,9 @@ judge = JudgeService(db, settings, webhook_client, blocklists=blocklists, allowl
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await db.init()
+    await db.kids_resolve_sync_backlog(
+        minimum_quality_height=settings.kids_resolver_min_quality_height,
+    )
     await blocklists.reload(db)
     await allowlists.reload(db)
     mqtt_bridge.set_event_loop(asyncio.get_running_loop())
@@ -1333,6 +1336,7 @@ async def api_catalog_items(request: Request) -> dict[str, Any]:
         return {"state": "kill_switch", "items": []}
     if not await runtime.monitoring_enabled_now():
         return {"state": "schedule_closed", "items": []}
+    await runtime.judge.reconcile_catalog_policy()
     return {
         "state": "ready",
         "items": await runtime.db.kids_eligible_feed_list(runtime.settings.kids_playback_min_remaining_seconds),
@@ -1384,8 +1388,19 @@ async def api_catalog_item_create(payload: CatalogItemRequest, request: Request)
 
 @app.patch("/api/kids/sources/{source_id}/state")
 async def api_catalog_source_state(source_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    if payload.state == "approved":
+        source = await runtime.db.catalog_get("source", source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="catalog source not found")
+        decision = await runtime.judge.match_catalog_source_blocklist(source)
+        if decision:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot approve a source blocked by /blocklist",
+            )
     try:
-        result = await request.app.state.runtime.db.catalog_transition("source", source_id, payload.model_dump())
+        result = await runtime.db.catalog_transition("source", source_id, payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result is None:
@@ -1395,8 +1410,24 @@ async def api_catalog_source_state(source_id: int, payload: CatalogTransitionReq
 
 @app.patch("/api/kids/catalog/items/{item_id}/state")
 async def api_catalog_item_state(item_id: int, payload: CatalogTransitionRequest, request: Request) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    if payload.state == "approved":
+        item = await runtime.db.catalog_get("item", item_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="catalog item not found")
+        source = (
+            await runtime.db.catalog_get("source", int(item["source_id"]))
+            if item.get("source_id") is not None
+            else None
+        )
+        decision = await runtime.judge.match_catalog_item_blocklist(item, source)
+        if decision:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot approve an item blocked by /blocklist",
+            )
     try:
-        result = await request.app.state.runtime.db.catalog_transition("item", item_id, payload.model_dump())
+        result = await runtime.db.catalog_transition("item", item_id, payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result is None:
@@ -1531,6 +1562,7 @@ async def api_kids_playback_authorization(
     runtime: RuntimeState = request.app.state.runtime
     if await runtime.db.kids_kill_switch_enabled() or not await runtime.monitoring_enabled_now():
         raise HTTPException(status_code=403, detail="Kids playback is unavailable")
+    await runtime.judge.reconcile_catalog_policy()
     if include_candidate:
         row = await runtime.db.kids_playback_authorization(
             video_id,
@@ -1891,14 +1923,17 @@ async def api_blacklist(payload: RuleRequest, request: Request) -> dict[str, Any
         url=url,
         source_list="manual",
     )
-    return {"ok": True}
+    blocked = await runtime.judge.reconcile_catalog_policy()
+    return {"ok": True, "blocked": blocked}
 
 
 @app.post("/api/blocklist/policies")
 @app.post("/api/rules/policies")
 async def api_rules_policies(payload: PolicyFlagsRequest, request: Request) -> dict[str, Any]:
     flags = normalize_policy_flags(payload.flags)
-    await request.app.state.runtime.db.set_setting("policy_flags_json", json.dumps(flags))
+    runtime: RuntimeState = request.app.state.runtime
+    await runtime.db.set_setting("policy_flags_json", json.dumps(flags))
+    await runtime.judge.reconcile_catalog_policy()
     return {"ok": True, "flags": flags}
 
 
@@ -1915,7 +1950,8 @@ async def api_rules_blocklists_sources(payload: RulesImportSourcesRequest, reque
     runtime: RuntimeState = request.app.state.runtime
     await runtime.blocklists.set_sources(runtime.db, payload.urls)
     summary = await runtime.blocklists.reload(runtime.db)
-    return {"ok": True, "summary": summary, "sources": payload.urls}
+    blocked = await runtime.judge.reconcile_catalog_policy()
+    return {"ok": True, "summary": summary, "blocked": blocked, "sources": payload.urls}
 
 
 @app.post("/api/blocklist/reload")
@@ -1923,7 +1959,8 @@ async def api_rules_blocklists_sources(payload: RulesImportSourcesRequest, reque
 async def api_rules_blocklists_reload(request: Request) -> dict[str, Any]:
     runtime: RuntimeState = request.app.state.runtime
     summary = await runtime.blocklists.reload(runtime.db)
-    return {"ok": True, "summary": summary}
+    blocked = await runtime.judge.reconcile_catalog_policy()
+    return {"ok": True, "summary": summary, "blocked": blocked}
 
 
 @app.post("/api/blocklist/local")
@@ -1932,7 +1969,8 @@ async def api_rules_blocklists_local(payload: LocalBlocklistContentRequest, requ
     runtime: RuntimeState = request.app.state.runtime
     await runtime.blocklists.save_local_content(payload.content)
     summary = await runtime.blocklists.reload(runtime.db)
-    return {"ok": True, "summary": summary}
+    blocked = await runtime.judge.reconcile_catalog_policy()
+    return {"ok": True, "summary": summary, "blocked": blocked}
 
 
 @app.post("/api/allowlist/sources")

@@ -1,10 +1,14 @@
 import asyncio
 import json
+import sqlite3
 from dataclasses import dataclass
 
 import pytest
 
+from app.config import Settings
 from app.db import Database
+from app.services.blocklists import BlocklistService
+from app.services.judge import JudgeService
 from app.services.kids_ingest import (
     HOME_SOURCE_REFERENCE,
     YouTubeKidsCDP,
@@ -12,6 +16,7 @@ from app.services.kids_ingest import (
     parse_cards,
     source_url,
 )
+from app.services.webhook import WebhookClient
 
 
 def test_source_url_stays_inside_youtube_kids():
@@ -294,6 +299,23 @@ class ChannelHomeBrowser:
 
 
 @dataclass
+class BlocklistedBrowser:
+    async def cards_for_source(self, kind, reference):
+        if reference == HOME_SOURCE_REFERENCE:
+            return [
+                {
+                    "href": "/watch?v=deny0000001",
+                    "title": "Blocked test item",
+                    "label": "Blocked test item by Approved Channel 10 views",
+                    "duration": "5:00",
+                    "thumbnail_url": "https://i.ytimg.com/vi/deny0000001/hqdefault.jpg",
+                    "channel_id": "UC123",
+                }
+            ]
+        return []
+
+
+@dataclass
 class FakeClassifier:
     verdict: str
     calls: list[dict] = None
@@ -338,6 +360,8 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
     items = await db.catalog_items_list()
     assert {item["video_id"] for item in items} == {"abcdefghijk"}
     assert items[0]["source_id"] == source["id"]
+    assert items[0]["channel_id"] == "UC123"
+    assert items[0]["channel_title"] == "Kids Channel"
     checked_source = await db.catalog_get("source", source["id"])
     assert checked_source["safety_policy_version"] == "sampled-channel-v1"
     assert checked_source["safety_sample_count"] == 1
@@ -402,3 +426,107 @@ async def test_safe_channel_stays_hidden_until_parent_approval(tmp_path):
         "zyxwvutsrqp",
     ]
     assert {item["source_id"] for item in await db.catalog_items_list()} == {source["id"]}
+
+
+@pytest.mark.asyncio
+async def test_ingest_honors_local_blocklist_and_demotes_existing_approved_item(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": "UC123",
+            "title": "Approved Channel",
+            "correlation_id": "source",
+        },
+    )
+    await db.catalog_transition(
+        "source",
+        source["id"],
+        {
+            "state": "approved",
+            "actor": "parent",
+            "reason": "test",
+            "correlation_id": "approve-source",
+        },
+    )
+    item = await db.catalog_create(
+        "item",
+        {
+            "video_id": "deny0000001",
+            "title": "Blocked test item",
+            "source_id": source["id"],
+            "channel_id": "UC123",
+            "channel_title": "Approved Channel",
+            "correlation_id": "item",
+        },
+    )
+    await db.catalog_transition(
+        "item",
+        item["id"],
+        {
+            "state": "approved",
+            "actor": "parent",
+            "reason": "legacy approval",
+            "correlation_id": "approve-item",
+        },
+    )
+
+    settings = Settings(
+        db_path=str(tmp_path / "sentinel.db"),
+        data_dir=str(tmp_path / "data"),
+    )
+    blocklists = BlocklistService(settings)
+    await blocklists.save_local_content("video:deny0000001 | configured block\n")
+    await blocklists.reload(db)
+    judge = JudgeService(db, settings, WebhookClient(), blocklists=blocklists)
+    classifier = FakeClassifier("SAFE")
+    report = await ingest_once(db, BlocklistedBrowser(), classifier, judge=judge)
+
+    assert report.blocked == 1
+    assert (await db.catalog_item_by_video("deny0000001"))["state"] == "blocked"
+    assert await db.catalog_items_list() == []
+
+
+@pytest.mark.asyncio
+async def test_catalog_item_channel_identity_columns_migrate(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE catalog_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL DEFAULT '',
+                source_id INTEGER REFERENCES catalog_sources(id),
+                thumbnail_url TEXT NOT NULL DEFAULT '',
+                duration_seconds INTEGER NOT NULL DEFAULT 0,
+                visual_category TEXT NOT NULL DEFAULT 'general',
+                state TEXT NOT NULL DEFAULT 'candidate',
+                actor TEXT NOT NULL,
+                changed_at TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                correlation_id TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+    db = Database(str(db_path))
+    await db.init()
+    item = await db.catalog_create(
+        "item",
+        {
+            "video_id": "legacy-item",
+            "title": "Legacy item",
+            "correlation_id": "legacy-item",
+        },
+    )
+
+    assert item["channel_id"] == ""
+    assert item["channel_title"] == ""
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(catalog_items)")}
+    assert {"channel_id", "channel_title"} <= columns

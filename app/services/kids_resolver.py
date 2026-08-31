@@ -15,6 +15,8 @@ from ..db import Database
 logger = logging.getLogger(__name__)
 
 PRACTICAL_CANDIDATE_TTL = timedelta(minutes=20)
+MIN_CANDIDATE_QUALITY_HEIGHT = 720
+MAX_CANDIDATE_QUALITY_HEIGHT = 1080
 
 
 def _utc_timestamp(value: Any) -> str | None:
@@ -53,8 +55,17 @@ def _signed_expiry(value: Any) -> datetime | None:
     return expiry
 
 
-def normalize_candidate(payload: Any) -> tuple[dict[str, Any], int, str, str, str] | None:
+def normalize_candidate(
+    payload: Any,
+    *,
+    minimum_quality_height: int = MIN_CANDIDATE_QUALITY_HEIGHT,
+) -> tuple[dict[str, Any], int, str, str, str] | None:
     if not isinstance(payload, dict) or payload.get("status") != "ready":
+        return None
+    if (
+        type(minimum_quality_height) is not int
+        or not MIN_CANDIDATE_QUALITY_HEIGHT <= minimum_quality_height <= MAX_CANDIDATE_QUALITY_HEIGHT
+    ):
         return None
     candidate = payload.get("candidate")
     expires_at = _utc_timestamp(payload.get("expires_at"))
@@ -63,28 +74,26 @@ def normalize_candidate(payload: Any) -> tuple[dict[str, Any], int, str, str, st
         return None
     quality = candidate.get("quality_height")
     codec = candidate.get("codec")
-    if not isinstance(quality, int) or not 144 <= quality <= 1080 or not isinstance(codec, str) or not codec:
+    if (
+        type(quality) is not int
+        or not minimum_quality_height <= quality <= MAX_CANDIDATE_QUALITY_HEIGHT
+        or not isinstance(codec, str)
+        or not codec
+    ):
         return None
     video_headers = candidate.get("video_headers")
     audio_headers = candidate.get("audio_headers")
     if not isinstance(video_headers, dict) or not isinstance(audio_headers, dict):
         return None
     kind = candidate.get("kind")
-    if kind == "progressive_muxed":
-        if candidate.get("audio_url") is not None:
-            return None
-        expiries = [_signed_expiry(candidate.get("media_url"))]
-        required = {"kind", "media_url", "audio_url", "quality_height", "codec", "video_headers", "audio_headers"}
-    elif kind in (None, "adaptive_mpv"):
-        if not isinstance(candidate.get("audio_url"), str):
-            return None
-        expiries = [
-            _signed_expiry(candidate.get("media_url")),
-            _signed_expiry(candidate.get("audio_url")),
-        ]
-        required = {"media_url", "audio_url", "quality_height", "codec", "video_headers", "audio_headers"}
-    else:
+    if kind not in (None, "adaptive_mpv"):
         return None
+    media_url = candidate.get("media_url")
+    audio_url = candidate.get("audio_url")
+    if not isinstance(media_url, str) or not isinstance(audio_url, str) or media_url == audio_url:
+        return None
+    expiries = [_signed_expiry(media_url), _signed_expiry(audio_url)]
+    required = {"media_url", "audio_url", "quality_height", "codec", "video_headers", "audio_headers"}
     if any(expiry is None for expiry in expiries):
         return None
     resolved_datetime = datetime.fromisoformat(resolved_at)
@@ -106,7 +115,9 @@ async def run_once(
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, int]:
     await db.init()
-    await db.kids_resolve_sync_backlog()
+    await db.kids_resolve_sync_backlog(
+        minimum_quality_height=settings.kids_resolver_min_quality_height,
+    )
     jobs = await db.kids_resolve_claim_due(
         limit=settings.kids_resolver_batch_size,
         refresh_margin_seconds=settings.kids_resolve_refresh_margin_seconds,
@@ -120,7 +131,7 @@ async def run_once(
             try:
                 response = await client.post(
                     f"{settings.kids_resolver_backend_url}/api/youtube/videos/{job['video_id']}/resolve-adaptive",
-                    params={"target_height": 1080, "transport": "muxed"},
+                    params={"target_height": 1080, "transport": "adaptive"},
                 )
                 if response.status_code == 422:
                     reason = "no_compatible_stream"
@@ -129,7 +140,10 @@ async def run_once(
                 elif response.status_code >= 400:
                     reason = "resolver_error"
                 else:
-                    normalized = normalize_candidate(response.json())
+                    normalized = normalize_candidate(
+                        response.json(),
+                        minimum_quality_height=settings.kids_resolver_min_quality_height,
+                    )
                     if normalized is None:
                         reason = "invalid_candidate"
                     else:

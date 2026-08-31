@@ -15,7 +15,10 @@ import websockets
 
 from ..config import Settings
 from ..db import Database, utc_now_iso
+from .blocklists import BlocklistService
 from .kids_classifier import KidsClassificationError, OpenCodexKidsClassifier
+from .judge import JudgeService
+from .webhook import WebhookClient
 
 logger = logging.getLogger("sentinel.kids_ingest")
 
@@ -159,11 +162,12 @@ def parse_cards(
         seen.add(video_id)
         label = str(card.get("label", ""))
         channel_match = _CHANNEL_FROM_LABEL.search(label)
+        channel_title = str(card.get("channel_title", "")).strip()
         result.append(
             KidsVideoCandidate(
                 video_id=video_id,
                 title=title[:500],
-                channel_title=(channel_match.group(1).strip() if channel_match else "")[:500],
+                channel_title=(channel_title or (channel_match.group(1).strip() if channel_match else ""))[:500],
                 channel_id=channel_id[:128],
                 thumbnail_url=thumbnail_url.split("?", 1)[0][:2000],
                 duration_seconds=duration,
@@ -322,8 +326,11 @@ async def ingest_once(
     channel_policy_version: str = "sampled-channel-v1",
     channel_recheck_seconds: int = 604800,
     channel_sample_size: int = 8,
+    judge: JudgeService | None = None,
 ) -> IngestReport:
     report = IngestReport()
+    if judge is not None:
+        report.blocked += await judge.reconcile_catalog_policy()
     all_sources = await db.catalog_sources_list()
     home_source = next((source for source in all_sources if source.get("reference") == HOME_SOURCE_REFERENCE), None)
     if home_source is None:
@@ -365,15 +372,28 @@ async def ingest_once(
         channel_id = str(card.get("channel_id", "")).strip()
         if not _CHANNEL_ID.fullmatch(channel_id) or channel_id in known_references:
             continue
+        channel_title = (
+            str(card.get("channel_title", "")).strip()
+            or str(card.get("label", "")).strip()
+        )[:500]
+        if judge is not None:
+            decision = await judge.match_blocklist(
+                video_id="",
+                title=str(card.get("title", "")),
+                channel_id=channel_id,
+                channel_title=channel_title,
+                video_url=str(card.get("href", "")),
+                video_context=channel_id,
+            )
+            if decision:
+                report.blocked += 1
+                continue
         source = await db.catalog_create(
             "source",
             {
                 "kind": "channel",
                 "reference": channel_id,
-                "title": (
-                    str(card.get("channel_title", "")).strip()
-                    or str(card.get("label", "")).strip()
-                )[:500],
+                "title": channel_title,
                 "correlation_id": f"kids-discovered-channel-{channel_id}",
             },
         )
@@ -398,6 +418,28 @@ async def ingest_once(
     safe_source_by_channel: dict[str, dict[str, Any]] = {}
     for source in sources:
         channel_id = channel_id_from_reference(str(source["reference"]))
+        if judge is not None:
+            decision = await judge.match_blocklist(
+                video_id="",
+                title=str(source.get("title", "")),
+                channel_id=channel_id,
+                channel_title=str(source.get("title", "")),
+                video_url=str(source.get("reference", "")),
+                video_context=str(source.get("reference", "")),
+            )
+            if decision:
+                report.blocked += 1
+                await db.catalog_transition(
+                    "source",
+                    int(source["id"]),
+                    {
+                        "state": "blocked",
+                        "actor": "kids-guardian-blocklist",
+                        "reason": decision["reason"],
+                        "correlation_id": f"kids-blocklist-source-{source['id']}",
+                    },
+                )
+                continue
         try:
             channel_cards = await browser.cards_for_source("channel", channel_id)
             report.cards_seen += len(channel_cards)
@@ -509,15 +551,14 @@ async def ingest_once(
                 int(existing["id"]),
                 title=candidate.title,
                 source_id=candidate.source_id,
+                channel_id=candidate.channel_id,
+                channel_title=candidate.channel_title,
                 thumbnail_url=candidate.thumbnail_url,
                 duration_seconds=candidate.duration_seconds,
                 visual_category=str(existing.get("visual_category", "general")),
                 correlation_id=f"kids-refresh-{candidate.video_id}",
                 sync_backlog=False,
             )
-            if existing.get("state") == "approved":
-                report.skipped += 1
-                continue
         else:
             item = await db.catalog_create(
                 "item",
@@ -525,6 +566,8 @@ async def ingest_once(
                     "video_id": candidate.video_id,
                     "title": candidate.title,
                     "source_id": candidate.source_id,
+                    "channel_id": candidate.channel_id,
+                    "channel_title": candidate.channel_title,
                     "thumbnail_url": candidate.thumbnail_url,
                     "duration_seconds": candidate.duration_seconds,
                     "visual_category": "general",
@@ -534,6 +577,40 @@ async def ingest_once(
             report.candidates_created += 1
         if item is None:
             report.errors += 1
+            continue
+        if judge is not None:
+            source_title = str(
+                safe_source_by_channel.get(candidate.source_reference, {}).get("title", "")
+            ).strip()
+            decision = await judge.match_blocklist(
+                video_id=candidate.video_id,
+                title=candidate.title,
+                channel_id=candidate.channel_id,
+                channel_title=candidate.channel_title,
+                video_url=f"https://www.youtubekids.com/watch?v={candidate.video_id}",
+                video_context=f"{source_title} {candidate.source_reference}",
+            )
+        else:
+            decision = None
+        if decision:
+            transitioned = await db.catalog_transition(
+                "item",
+                int(item["id"]),
+                {
+                    "state": "blocked",
+                    "actor": "kids-guardian-blocklist",
+                    "reason": decision["reason"],
+                    "correlation_id": f"kids-blocklist-item-{candidate.video_id}",
+                },
+                expected_state=str(item.get("state", "candidate")),
+            )
+            if transitioned is not None:
+                report.blocked += 1
+            else:
+                report.skipped += 1
+            continue
+        if existing and existing.get("state") == "approved":
+            report.skipped += 1
             continue
         await db.catalog_transition(
             "item",
@@ -554,6 +631,14 @@ async def _main() -> None:
     settings = Settings()
     db = Database(settings.db_path)
     await db.init()
+    blocklists = BlocklistService(settings)
+    await blocklists.reload(db)
+    judge = JudgeService(
+        db,
+        settings,
+        WebhookClient(settings.webhook_timeout_seconds),
+        blocklists=blocklists,
+    )
     classifier = OpenCodexKidsClassifier(
         base_url=settings.opencodex_base_url,
         model=settings.opencodex_model,
@@ -567,6 +652,7 @@ async def _main() -> None:
             channel_policy_version=settings.kids_channel_policy_version,
             channel_recheck_seconds=settings.kids_channel_recheck_seconds,
             channel_sample_size=settings.kids_channel_sample_size,
+            judge=judge,
         )
         if report.errors == 0:
             await db.set_setting("kids_ingest_last_success_at", utc_now_iso())

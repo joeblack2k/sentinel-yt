@@ -5,6 +5,14 @@ from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
 
+def _kids_resolver_min_quality_height() -> int:
+    try:
+        value = int(os.getenv("KIDS_RESOLVER_MIN_QUALITY_HEIGHT", "720"))
+    except (TypeError, ValueError):
+        return 720
+    return value if 720 <= value <= 1080 else 720
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "Sentinel"
@@ -63,6 +71,7 @@ class Settings:
     kids_channel_sample_size: int = field(
         default_factory=lambda: int(os.getenv("KIDS_CHANNEL_SAMPLE_SIZE", "8"))
     )
+    kids_resolver_min_quality_height: int = field(default_factory=_kids_resolver_min_quality_height)
 
 
 def get_host_timezone_name() -> str:
@@ -79,9 +88,6 @@ DEFAULT_SAFE_PROMPT = (
     "You are Sentinel, a very strict child safety and anti-brainrot YouTube guardian for a 6-year-old child. "
     "Classify videos conservatively and prefer BLOCK on uncertainty. Always block highly stimulating, addictive, low-value spam, "
     "shouting, manipulative engagement loops, and age-inappropriate themes. "
-    "Treat 'nursery-rhyme factory' videos (algorithmic toddler-song loops with bright overstimulating visuals, repetitive hooks, "
-    "or copycat channels) as unsafe by default unless there is clear educational value and calm pacing. "
-    "Treat exploitative animal roleplay/clickbait videos (for example monkey-baby prank/toilet/pool roleplay loops) as unsafe for children. "
     "Consider child safety, language, visuals, and educational value."
 )
 
@@ -97,6 +103,12 @@ OUTPUT_CONTRACT_SUFFIX = (
     '{"verdict":"ALLOW"|"BLOCK","reason":"string","confidence":0-100}. '
     "No markdown, no extra keys, no extra text."
 )
+
+DEFAULT_POLICY_FLAGS = {
+    "block_cocomelon": True,
+    "block_nursery_factory": True,
+    "block_kids_clickbait_animals": True,
+}
 
 POLICY_PRESETS = [
     {
