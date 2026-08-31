@@ -65,20 +65,36 @@ def normalize_candidate(payload: Any) -> tuple[dict[str, Any], int, str, str, st
     codec = candidate.get("codec")
     if not isinstance(quality, int) or not 144 <= quality <= 1080 or not isinstance(codec, str) or not codec:
         return None
-    media_expiry = _signed_expiry(candidate.get("media_url"))
-    audio_expiry = _signed_expiry(candidate.get("audio_url"))
-    if media_expiry is None or audio_expiry is None:
+    video_headers = candidate.get("video_headers")
+    audio_headers = candidate.get("audio_headers")
+    if not isinstance(video_headers, dict) or not isinstance(audio_headers, dict):
+        return None
+    kind = candidate.get("kind")
+    if kind == "progressive_muxed":
+        if candidate.get("audio_url") is not None:
+            return None
+        expiries = [_signed_expiry(candidate.get("media_url"))]
+        required = {"kind", "media_url", "audio_url", "quality_height", "codec", "video_headers", "audio_headers"}
+    elif kind in (None, "adaptive_mpv"):
+        if not isinstance(candidate.get("audio_url"), str):
+            return None
+        expiries = [
+            _signed_expiry(candidate.get("media_url")),
+            _signed_expiry(candidate.get("audio_url")),
+        ]
+        required = {"media_url", "audio_url", "quality_height", "codec", "video_headers", "audio_headers"}
+    else:
+        return None
+    if any(expiry is None for expiry in expiries):
         return None
     resolved_datetime = datetime.fromisoformat(resolved_at)
     earliest_expiry = min(
-        media_expiry,
-        audio_expiry,
+        *(expiry for expiry in expiries if expiry is not None),
         resolved_datetime + PRACTICAL_CANDIDATE_TTL,
     )
     if earliest_expiry <= datetime.now(timezone.utc) + timedelta(seconds=120):
         return None
-    required = {"media_url", "audio_url", "quality_height", "codec", "video_headers", "audio_headers"}
-    if not required.issubset(candidate) or not isinstance(candidate["video_headers"], dict) or not isinstance(candidate["audio_headers"], dict):
+    if not required.issubset(candidate):
         return None
     return candidate, quality, codec, resolved_at, earliest_expiry.isoformat()
 
@@ -104,7 +120,7 @@ async def run_once(
             try:
                 response = await client.post(
                     f"{settings.kids_resolver_backend_url}/api/youtube/videos/{job['video_id']}/resolve-adaptive",
-                    params={"target_height": 1080},
+                    params={"target_height": 1080, "transport": "muxed"},
                 )
                 if response.status_code == 422:
                     reason = "no_compatible_stream"

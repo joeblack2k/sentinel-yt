@@ -41,6 +41,69 @@ def test_resolved_candidate_is_capped_before_po_token_goes_stale():
     assert practical_expiry == resolved_at + PRACTICAL_CANDIDATE_TTL
 
 
+def test_progressive_muxed_candidate_requires_one_signed_media_url():
+    resolved_at = datetime.now(timezone.utc)
+    signed_expiry = resolved_at + timedelta(hours=1)
+    normalized = normalize_candidate(
+        {
+            "status": "ready",
+            "resolved_at": resolved_at.isoformat(),
+            "expires_at": signed_expiry.isoformat(),
+            "candidate": {
+                "kind": "progressive_muxed",
+                "media_url": signed_url("muxed", signed_expiry),
+                "audio_url": None,
+                "quality_height": 360,
+                "codec": "avc1.42001e",
+                "container": "mp4",
+                "mime_type": "video/mp4",
+                "video_headers": {},
+                "audio_headers": {},
+            },
+        }
+    )
+
+    assert normalized is not None
+    assert normalized[0]["kind"] == "progressive_muxed"
+    assert normalize_candidate(
+        {
+            "status": "ready",
+            "resolved_at": resolved_at.isoformat(),
+            "expires_at": signed_expiry.isoformat(),
+            "candidate": {
+                "kind": "progressive_muxed",
+                "media_url": signed_url("muxed", signed_expiry),
+                "audio_url": signed_url("audio", signed_expiry),
+                "quality_height": 360,
+                "codec": "avc1.42001e",
+                "video_headers": {},
+                "audio_headers": {},
+            },
+        }
+    ) is None
+
+
+def test_unknown_candidate_transport_is_denied():
+    resolved_at = datetime.now(timezone.utc)
+    signed_expiry = resolved_at + timedelta(hours=1)
+    assert normalize_candidate(
+        {
+            "status": "ready",
+            "resolved_at": resolved_at.isoformat(),
+            "expires_at": signed_expiry.isoformat(),
+            "candidate": {
+                "kind": "hls",
+                "media_url": signed_url("muxed", signed_expiry),
+                "audio_url": None,
+                "quality_height": 360,
+                "codec": "avc1.42001e",
+                "video_headers": {},
+                "audio_headers": {},
+            },
+        }
+    ) is None
+
+
 async def eligible_item(db: Database, video_id: str = "video-ready") -> dict:
     source = await db.catalog_create(
         "source", {"kind": "channel", "reference": f"UC-{video_id}", "correlation_id": "source"}
@@ -141,6 +204,53 @@ async def test_resolver_worker_keeps_candidate_scoped_to_authorization_storage(t
         1, verdict="UNSAFE", reason="revoked", actor="guardian", correlation_id="unsafe"
     )
     assert await db.kids_playback_authorization("video-ready", minimum_remaining_seconds=300) is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_worker_requests_muxed_transport(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    item = await eligible_item(db, "video-muxed")
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=10)
+    payload = {
+        "youtube_id": "video-muxed",
+        "status": "ready",
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": expiry.isoformat(),
+        "candidate": {
+            "kind": "progressive_muxed",
+            "media_url": signed_url("muxed", expiry),
+            "audio_url": None,
+            "quality_height": 360,
+            "codec": "avc1.42001e",
+            "video_headers": {},
+            "audio_headers": {},
+        },
+    }
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=payload)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(
+        db_path=db.db_path,
+        kids_resolver_backend_url="http://backend",
+        kids_resolver_batch_size=1,
+    )
+    try:
+        result = await run_once(db=db, settings=settings, client=client)
+    finally:
+        await client.aclose()
+
+    assert result["ready"] == 1
+    assert requests and dict(httpx.QueryParams(requests[0].url.query)) == {
+        "target_height": "1080",
+        "transport": "muxed",
+    }
+    auth = await db.kids_playback_authorization("video-muxed", minimum_remaining_seconds=300)
+    assert auth and auth["candidate"]["audio_url"] is None
 
 
 @pytest.mark.asyncio
