@@ -565,7 +565,12 @@ class Database:
             rows = await cur.fetchall()
             for item_id, _video_id in rows:
                 await db.execute(
-                    "UPDATE kids_resolve_backlog SET status='running', updated_at=? WHERE item_id=?",
+                    """
+                    UPDATE kids_resolve_backlog
+                    SET status=CASE WHEN status='ready' THEN 'ready' ELSE 'running' END,
+                        updated_at=?
+                    WHERE item_id=?
+                    """,
                     (now_iso, item_id),
                 )
             await db.commit()

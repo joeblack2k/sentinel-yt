@@ -97,6 +97,8 @@ async def test_resolver_queue_persists_success_expiry_backoff_and_bounded_claim(
     assert "candidate_json" not in retry
     refresh_claim = await db.kids_resolve_claim_due(limit=1, refresh_margin_seconds=1800)
     assert refresh_claim == [{"item_id": first["id"], "video_id": "video-one"}]
+    assert await db.kids_playback_authorization("video-one", minimum_remaining_seconds=300)
+    assert [item["video_id"] for item in await db.kids_eligible_feed_list(300)] == ["video-one"]
 
 
 @pytest.mark.asyncio
