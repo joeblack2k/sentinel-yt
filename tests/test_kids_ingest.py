@@ -117,13 +117,15 @@ async def test_cdp_reuses_existing_kids_page_without_creating_or_closing_target(
                         "result": {
                             "result": {
                                 "value": json.dumps(
-                                    {
-                                        "url": navigation["params"]["url"],
-                                        "ready": "complete",
-                                        "cards": [{"href": "/watch?v=abcdefghijk"}],
-                                    }
-                                )
-                            }
+                                        {
+                                            "url": navigation["params"]["url"],
+                                            "ready": "complete",
+                                            "scroll_y": 0,
+                                            "scroll_height": 0,
+                                            "cards": [{"href": "/watch?v=abcdefghijk"}],
+                                        }
+                                    )
+                                }
                         },
                     }
                 )
@@ -148,6 +150,12 @@ async def test_cdp_reuses_existing_kids_page_without_creating_or_closing_target(
                 "url": "https://www.youtubekids.com/",
                 "webSocketDebuggerUrl": "ws://page",
             },
+            {
+                "id": "account-1",
+                "type": "page",
+                "url": "https://accounts.google.com/signin",
+                "webSocketDebuggerUrl": "ws://account",
+            },
         ]
 
     adapter._json = fake_json
@@ -158,21 +166,139 @@ async def test_cdp_reuses_existing_kids_page_without_creating_or_closing_target(
     assert await adapter.cards_for_source("channel", "UC123") == [
         {"href": "/watch?v=abcdefghijk"}
     ]
-    assert [command["method"] for command in commands] == [
-        "Runtime.enable",
-        "Page.navigate",
-        "Runtime.evaluate",
-        "Runtime.enable",
-        "Page.navigate",
-        "Runtime.evaluate",
+    navigate_urls = [
+        command["params"]["url"]
+        for command in commands
+        if command["method"] == "Page.navigate"
     ]
-    assert commands[1]["params"] == {"url": "https://www.youtubekids.com/"}
-    assert commands[4]["params"] == {"url": "https://www.youtubekids.com/channel/UC123"}
+    assert navigate_urls[0] == "https://www.youtubekids.com/"
+    assert navigate_urls[-1] == "https://www.youtubekids.com/"
+    assert "https://www.youtubekids.com/channel/UC123" in navigate_urls
+    assert [
+        f"https://www.youtubekids.com/search?q={term}"
+        for term in kids_ingest._SEARCH_TERMS
+    ] == navigate_urls[1 : 1 + len(kids_ingest._SEARCH_TERMS)]
     assert json_list_calls == 2
+    assert adapter._target_id == "target-1"
     assert all(
         command["method"] not in {"Target.createTarget", "Target.closeTarget"}
         for command in commands
     )
+
+
+@pytest.mark.asyncio
+async def test_cdp_home_budget_preserves_category_and_language_search_cards(monkeypatch):
+    import app.services.kids_ingest as kids_ingest
+
+    commands: list[dict] = []
+    home_url = "https://www.youtubekids.com/"
+    category_url = "https://www.youtubekids.com/category/animals"
+    home_cards = [{"href": f"/watch?v=h{index:010d}"} for index in range(160)]
+
+    class FakeWebSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def send(self, message):
+            commands.append(json.loads(message))
+
+        async def recv(self):
+            command = commands[-1]
+            if command["method"] == "Runtime.evaluate":
+                navigation = next(
+                    command
+                    for command in reversed(commands)
+                    if command["method"] == "Page.navigate"
+                )
+                url = navigation["params"]["url"]
+                if url == home_url:
+                    payload = {
+                        "url": url,
+                        "ready": "complete",
+                        "scroll_y": 0,
+                        "scroll_height": 0,
+                        "cards": home_cards,
+                        "category_urls": [category_url],
+                    }
+                elif url == category_url:
+                    payload = {
+                        "url": url,
+                        "ready": "complete",
+                        "scroll_y": 0,
+                        "scroll_height": 0,
+                        "cards": [{"href": "/watch?v=c0000000001"}],
+                    }
+                elif "q=dieren" in url:
+                    payload = {
+                        "url": url,
+                        "ready": "complete",
+                        "scroll_y": 0,
+                        "scroll_height": 0,
+                        "cards": [{"href": "/watch?v=n0000000001"}],
+                    }
+                elif "q=animals" in url:
+                    payload = {
+                        "url": url,
+                        "ready": "complete",
+                        "scroll_y": 0,
+                        "scroll_height": 0,
+                        "cards": [{"href": "/watch?v=e0000000001"}],
+                    }
+                else:
+                    payload = {
+                        "url": url,
+                        "ready": "complete",
+                        "scroll_y": 0,
+                        "scroll_height": 0,
+                        "cards": [],
+                    }
+                return json.dumps(
+                    {
+                        "id": command["id"],
+                        "result": {"result": {"value": json.dumps(payload)}},
+                    }
+                )
+            return json.dumps({"id": command["id"], "result": {}})
+
+    monkeypatch.setattr(
+        kids_ingest.websockets,
+        "connect",
+        lambda url, **kwargs: FakeWebSocket(),
+    )
+    adapter = YouTubeKidsCDP(wait_seconds=0.2)
+
+    async def fake_json(path):
+        assert path == "/json/list"
+        return [
+            {
+                "id": "target-1",
+                "type": "page",
+                "url": home_url,
+                "webSocketDebuggerUrl": "ws://page",
+            }
+        ]
+
+    adapter._json = fake_json
+
+    cards = await adapter.cards_for_source("channel", HOME_SOURCE_REFERENCE)
+    card_ids = {
+        item["href"].split("v=", 1)[1]
+        for item in cards
+        if "v=" in item.get("href", "")
+    }
+    navigate_urls = [
+        command["params"]["url"]
+        for command in commands
+        if command["method"] == "Page.navigate"
+    ]
+
+    assert len(cards) == 43
+    assert {"c0000000001", "n0000000001", "e0000000001"} <= card_ids
+    assert navigate_urls[-1] == home_url
+    assert len(cards) <= kids_ingest._MAX_COLLECTED_CARDS
 
 
 @pytest.mark.asyncio
@@ -234,11 +360,17 @@ async def test_cdp_rejects_navigation_away_without_closing_existing_target(monke
 
     with pytest.raises(RuntimeError, match="left YouTube Kids"):
         await adapter.cards_for_source("channel", HOME_SOURCE_REFERENCE)
-    assert [command["method"] for command in commands] == [
-        "Runtime.enable",
-        "Page.navigate",
-        "Runtime.evaluate",
+    navigate_urls = [
+        command["params"]["url"]
+        for command in commands
+        if command["method"] == "Page.navigate"
     ]
+    assert navigate_urls[0] == "https://www.youtubekids.com/"
+    assert navigate_urls[-1] == "https://www.youtubekids.com/"
+    assert all(
+        command["method"] not in {"Target.createTarget", "Target.closeTarget"}
+        for command in commands
+    )
 
 
 @pytest.mark.asyncio
@@ -246,18 +378,6 @@ async def test_cdp_allows_transient_external_redirect_only_until_kids_returns(mo
     import app.services.kids_ingest as kids_ingest
 
     commands: list[dict] = []
-    evaluations = [
-        {
-            "url": "https://www.youtube.com/",
-            "ready": "complete",
-            "cards": [{"href": "/watch?v=must-not-be-read"}],
-        },
-        {
-            "url": "https://www.youtubekids.com/",
-            "ready": "complete",
-            "cards": [{"href": "/watch?v=abcdefghijk"}],
-        },
-    ]
     evaluation_index = 0
 
     class FakeWebSocket:
@@ -274,7 +394,26 @@ async def test_cdp_allows_transient_external_redirect_only_until_kids_returns(mo
             nonlocal evaluation_index
             command = commands[-1]
             if command["method"] == "Runtime.evaluate":
-                payload = evaluations[min(evaluation_index, len(evaluations) - 1)]
+                navigation = next(
+                    command
+                    for command in reversed(commands)
+                    if command["method"] == "Page.navigate"
+                )
+                payload = (
+                    {
+                        "url": "https://www.youtube.com/",
+                        "ready": "complete",
+                        "cards": [{"href": "/watch?v=must-not-be-read"}],
+                    }
+                    if evaluation_index == 0
+                    else {
+                        "url": navigation["params"]["url"],
+                        "ready": "complete",
+                        "scroll_y": 0,
+                        "scroll_height": 0,
+                        "cards": [{"href": "/watch?v=abcdefghijk"}],
+                    }
+                )
                 evaluation_index += 1
                 return json.dumps(
                     {
@@ -315,6 +454,11 @@ async def test_cdp_allows_transient_external_redirect_only_until_kids_returns(mo
         command["method"] not in {"Target.createTarget", "Target.closeTarget"}
         for command in commands
     )
+    assert all(
+        "youtube.com" not in command.get("params", {}).get("url", "")
+        for command in commands
+        if command["method"] == "Page.navigate"
+    )
 
 
 @pytest.mark.asyncio
@@ -329,6 +473,67 @@ async def test_cdp_does_not_create_a_new_target_when_existing_kids_page_is_missi
 
     with pytest.raises(RuntimeError, match="No existing YouTube Kids CDP target"):
         await adapter.cards_for_source("channel", HOME_SOURCE_REFERENCE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra_page",
+    [
+        {
+            "id": "second-kids",
+            "type": "page",
+            "url": "https://www.youtubekids.com/channel/UC123",
+            "webSocketDebuggerUrl": "ws://second-kids",
+        },
+        {
+            "id": "youtube",
+            "type": "page",
+            "url": "https://www.youtube.com/",
+            "webSocketDebuggerUrl": "ws://youtube",
+        },
+    ],
+)
+async def test_cdp_rejects_multiple_or_non_kids_pages(extra_page):
+    adapter = YouTubeKidsCDP()
+
+    async def invalid_targets(path):
+        assert path == "/json/list"
+        return [
+            {
+                "id": "target-1",
+                "type": "page",
+                "url": "https://www.youtubekids.com/",
+                "webSocketDebuggerUrl": "ws://page",
+            },
+            extra_page,
+        ]
+
+    adapter._json = invalid_targets
+
+    with pytest.raises(RuntimeError, match="exactly one YouTube Kids page"):
+        await adapter._reusable_target()
+
+
+@pytest.mark.asyncio
+async def test_cdp_keeps_using_the_persistent_target_id():
+    adapter = YouTubeKidsCDP()
+    adapter._target_id = "target-1"
+
+    async def changed_target(path):
+        assert path == "/json/list"
+        return [
+            {
+                "id": "target-2",
+                "type": "page",
+                "url": "https://www.youtubekids.com/",
+                "webSocketDebuggerUrl": "ws://page",
+            }
+        ]
+
+    adapter._json = changed_target
+
+    with pytest.raises(RuntimeError, match="Persistent.*changed"):
+        await adapter._reusable_target()
 
 
 @pytest.mark.asyncio
@@ -414,6 +619,7 @@ class BlocklistedBrowser:
 @dataclass
 class FakeClassifier:
     verdict: str
+    language: str = "unknown"
     calls: list[dict] = None
 
     def __post_init__(self):
@@ -421,7 +627,7 @@ class FakeClassifier:
 
     async def classify(self, metadata):
         self.calls.append(metadata)
-        return {"verdict": self.verdict, "reason": "test"}
+        return {"verdict": self.verdict, "language": self.language, "reason": "test"}
 
 
 @pytest.mark.asyncio
@@ -447,7 +653,7 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
             "correlation_id": "approve-source",
         },
     )
-    classifier = FakeClassifier("SAFE")
+    classifier = FakeClassifier("SAFE", "en")
     report = await ingest_once(db, FakeBrowser(), classifier)
     assert report.approved == 1
     assert len(classifier.calls) == 1
@@ -460,6 +666,7 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
     assert items[0]["channel_title"] == "Kids Channel"
     checked_source = await db.catalog_get("source", source["id"])
     assert checked_source["safety_policy_version"] == "sampled-channel-v1"
+    assert checked_source["language"] == "en"
     assert checked_source["safety_sample_count"] == 1
     assert json.loads(checked_source["safety_evidence_json"])[0]["video_id"] == "abcdefghijk"
 
@@ -479,7 +686,7 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_safe_channel_stays_hidden_until_parent_approval(tmp_path):
+async def test_safe_new_channel_auto_approves_and_publishes_only_approved_source_items(tmp_path):
     db = Database(str(tmp_path / "sentinel.db"))
     await db.init()
     source = await db.catalog_create(
@@ -499,29 +706,83 @@ async def test_safe_channel_stays_hidden_until_parent_approval(tmp_path):
         correlation_id="classify-source",
     )
 
-    first = await ingest_once(db, ChannelHomeBrowser(), FakeClassifier("SAFE"))
-    assert first.approved == 0
-    assert await db.catalog_items_list() == []
-
-    await db.catalog_transition(
-        "source",
-        source["id"],
-        {
-            "state": "approved",
-            "actor": "parent",
-            "reason": "approved for Noah",
-            "correlation_id": "approve-source",
-        },
-    )
-    cached_classifier = FakeClassifier("SAFE")
-    second = await ingest_once(db, ChannelHomeBrowser(), cached_classifier)
-    assert second.approved == 2
-    assert cached_classifier.calls == []
+    classifier = FakeClassifier("SAFE", "nl")
+    first = await ingest_once(db, ChannelHomeBrowser(), classifier)
+    assert first.approved == 2
+    assert classifier.calls
+    assert (await db.catalog_get("source", source["id"]))["state"] == "approved"
+    assert (await db.catalog_get("source", source["id"]))["language"] == "nl"
     assert [item["video_id"] for item in await db.catalog_items_list()] == [
         "abcdefghijk",
         "zyxwvutsrqp",
     ]
     assert {item["source_id"] for item in await db.catalog_items_list()} == {source["id"]}
+
+    cached_classifier = FakeClassifier("SAFE")
+    second = await ingest_once(db, ChannelHomeBrowser(), cached_classifier)
+    assert second.approved == 0
+    assert second.skipped == 2
+    assert cached_classifier.calls == []
+
+
+@pytest.mark.asyncio
+async def test_uncertain_or_unknown_source_stays_hidden(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": "UC123",
+            "title": "Uncertain channel",
+            "correlation_id": "source",
+        },
+    )
+
+    report = await ingest_once(db, ChannelHomeBrowser(), FakeClassifier("UNKNOWN", "nl"))
+
+    assert report.approved == 0
+    assert report.uncertain == 1
+    stored = await db.catalog_get("source", source["id"])
+    assert stored["state"] == "candidate"
+    assert stored["safety_verdict"] == "UNCERTAIN"
+    assert stored["language"] == "nl"
+    assert await db.catalog_items_list() == []
+
+
+@pytest.mark.asyncio
+async def test_safe_new_source_blocked_by_judge_does_not_auto_approve(tmp_path):
+    db_path = tmp_path / "sentinel.db"
+    db = Database(str(db_path))
+    await db.init()
+    channel_id = "UC" + "a" * 22
+    source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": channel_id,
+            "title": "Blocked discovered channel",
+            "correlation_id": "source",
+        },
+    )
+    settings = Settings(db_path=str(db_path), data_dir=str(tmp_path / "data"))
+    blocklists = BlocklistService(settings)
+    await blocklists.save_local_content(f"channel:{channel_id} | configured block\n")
+    await blocklists.reload(db)
+    judge = JudgeService(db, settings, WebhookClient(), blocklists=blocklists)
+
+    classifier = FakeClassifier("SAFE")
+    report = await ingest_once(
+        db,
+        ChannelHomeBrowser(),
+        classifier,
+        judge=judge,
+    )
+
+    assert report.blocked == 1
+    assert classifier.calls == []
+    assert (await db.catalog_get("source", source["id"]))["state"] == "blocked"
+    assert await db.catalog_items_list() == []
 
 
 @pytest.mark.asyncio

@@ -51,10 +51,16 @@ class Settings:
     kids_ingest_freshness_seconds: int = field(
         default_factory=lambda: int(os.getenv("KIDS_INGEST_FRESHNESS_SECONDS", "1800"))
     )
-    kids_resolver_backend_url: str = field(
-        default_factory=lambda: os.getenv("KIDS_RESOLVER_BACKEND_URL", "http://127.0.0.1:8081").rstrip("/")
+    kids_resolver_cdp_url: str = field(
+        default_factory=lambda: os.getenv("KIDS_BROWSER_CDP_URL", "http://127.0.0.1:9223").rstrip("/")
     )
     kids_resolver_batch_size: int = field(default_factory=lambda: int(os.getenv("KIDS_RESOLVER_BATCH_SIZE", "2")))
+    kids_resolver_timeout_seconds: int = field(
+        default_factory=lambda: max(5, min(120, int(os.getenv("KIDS_RESOLVER_TIMEOUT_SECONDS", "35"))))
+    )
+    kids_resolver_js_runtime: str = field(
+        default_factory=lambda: os.getenv("KIDS_YTDLP_JS_RUNTIME", "node").strip() or "node"
+    )
     kids_resolve_refresh_margin_seconds: int = field(
         default_factory=lambda: int(os.getenv("KIDS_RESOLVE_REFRESH_MARGIN_SECONDS", "300"))
     )

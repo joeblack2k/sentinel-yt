@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 
 from fastapi.testclient import TestClient
@@ -9,6 +10,7 @@ def test_catalog_default_deny_transitions_and_listing(tmp_path, monkeypatch):
     module = importlib.reload(importlib.import_module("app.main"))
 
     with TestClient(module.app) as client:
+        asyncio.run(client.app.state.runtime.db.set_setting("kids_kill_switch", "false"))
         source = client.post(
             "/api/kids/sources",
             headers={"X-Correlation-ID": "c-source"},

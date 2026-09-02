@@ -16,7 +16,9 @@ async def test_classifier_checks_exact_model_and_returns_strict_safe_result():
             return httpx.Response(200, json={"data": [{"id": "gemini-kids"}]})
         assert request.url.path == "/v1/chat/completions"
         assert "authorization" not in request.headers
-        user_content = json.loads(request.content)["messages"][1]["content"]
+        payload = json.loads(request.content)
+        assert "language exactly one of nl, en, mixed, or unknown" in payload["messages"][0]["content"]
+        user_content = payload["messages"][1]["content"]
         assert user_content[0]["type"] == "text"
         assert user_content[1] == {
             "type": "image_url",
@@ -56,6 +58,7 @@ async def test_classifier_checks_exact_model_and_returns_strict_safe_result():
     }
     assert await classifier.classify(metadata) == {
         "verdict": "SAFE",
+        "language": "unknown",
         "reason": "calm animals",
         "confidence": 96,
     }
@@ -66,9 +69,10 @@ async def test_classifier_checks_exact_model_and_returns_strict_safe_result():
 
 def test_classifier_accepts_observed_markdown_fence_but_not_extra_prose():
     fenced = OpenCodexKidsClassifier._parse_json(
-        '```json\n{"verdict":"SAFE","reason":"ok","confidence":99}\n```'
+        '```json\n{"verdict":"SAFE","language":"nl","reason":"ok","confidence":99}\n```'
     )
     assert fenced["verdict"] == "SAFE"
+    assert fenced["language"] == "nl"
     with pytest.raises((ValueError, json.JSONDecodeError)):
         OpenCodexKidsClassifier._parse_json("Here is the JSON: {}")
 
@@ -77,6 +81,38 @@ def test_classifier_accepts_observed_markdown_fence_but_not_extra_prose():
 async def test_classifier_fails_closed_for_unknown_model_or_bad_json():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": [{"id": "other-model"}]})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    classifier = OpenCodexKidsClassifier(
+        base_url="http://opencodex.test/v1",
+        model="gemini-kids",
+        client=client,
+    )
+    with pytest.raises(KidsClassificationError):
+        await classifier.classify({"video_id": "v1"})
+    await classifier.close()
+
+
+@pytest.mark.asyncio
+async def test_classifier_fails_closed_for_invalid_language():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "gemini-kids"}]})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"verdict":"SAFE","language":"de",'
+                                '"reason":"ok","confidence":99}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     classifier = OpenCodexKidsClassifier(

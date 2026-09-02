@@ -11,7 +11,11 @@ WorkingDirectory=/opt/sentinel-yt
 EnvironmentFile=-/opt/sentinel-yt/.env
 Environment=PATH=/opt/sentinel-yt/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
+Environment=KIDS_BROWSER_CDP_URL=http://127.0.0.1:9223
 Environment=KIDS_RESOLVER_BATCH_SIZE=6
+Environment=KIDS_RESOLVER_TIMEOUT_SECONDS=35
+Environment=KIDS_YTDLP_JS_RUNTIME=node
+TimeoutStartSec=8min
 Nice=10
 CPUQuota=50%
 IOSchedulingClass=idle

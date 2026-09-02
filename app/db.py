@@ -198,6 +198,8 @@ class Database:
                     kind TEXT NOT NULL CHECK(kind IN ('channel', 'playlist')),
                     reference TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL DEFAULT '',
+                    language TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(language IN ('nl', 'en', 'mixed', 'unknown')),
                     safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN',
                     safety_reason TEXT NOT NULL DEFAULT '',
                     safety_checked_at TEXT,
@@ -284,6 +286,54 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_kids_resolve_due ON kids_resolve_backlog(status, next_attempt_at);
                 CREATE INDEX IF NOT EXISTS idx_kids_resolve_expiry ON kids_resolve_backlog(expires_at);
 
+                CREATE TABLE IF NOT EXISTS feed_sessions (
+                    id TEXT PRIMARY KEY,
+                    profile TEXT NOT NULL DEFAULT 'noah',
+                    catalog_revision INTEGER NOT NULL CHECK(catalog_revision >= 0),
+                    policy_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS feed_session_items (
+                    feed_session_id TEXT NOT NULL REFERENCES feed_sessions(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                    item_id INTEGER NOT NULL REFERENCES catalog_items(id) ON DELETE CASCADE,
+                    asset_id TEXT NOT NULL,
+                    PRIMARY KEY(feed_session_id, ordinal),
+                    UNIQUE(feed_session_id, item_id),
+                    UNIQUE(feed_session_id, asset_id)
+                ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS relay_leases (
+                    id TEXT PRIMARY KEY,
+                    item_id INTEGER NOT NULL REFERENCES catalog_items(id) ON DELETE CASCADE,
+                    feed_session_id TEXT NOT NULL REFERENCES feed_sessions(id) ON DELETE CASCADE,
+                    state TEXT NOT NULL DEFAULT 'active'
+                        CHECK(state IN ('active', 'revoked', 'expired', 'closed')),
+                    candidate_json TEXT NOT NULL CHECK(json_valid(candidate_json)),
+                    quality_height INTEGER NOT NULL CHECK(quality_height BETWEEN 720 AND 1080),
+                    revoked_reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    CHECK(
+                        CASE WHEN json_valid(candidate_json) THEN
+                            COALESCE(
+                                json_type(candidate_json, '$.quality_height') = 'integer'
+                                AND json_extract(candidate_json, '$.quality_height')
+                                    BETWEEN 720 AND 1080
+                                AND json_extract(candidate_json, '$.quality_height') = quality_height,
+                                0
+                            )
+                        ELSE 0 END
+                    )
+                ) WITHOUT ROWID;
+
+                CREATE INDEX IF NOT EXISTS idx_feed_sessions_expires
+                    ON feed_sessions(expires_at);
+                CREATE INDEX IF NOT EXISTS idx_feed_session_assets
+                    ON feed_session_items(asset_id);
+                CREATE INDEX IF NOT EXISTS idx_relay_leases_active
+                    ON relay_leases(state, expires_at);
                 CREATE INDEX IF NOT EXISTS idx_rules_scope_value ON rules(scope, value);
                 CREATE INDEX IF NOT EXISTS idx_rules_type_scope ON rules(rule_type, scope);
                 CREATE INDEX IF NOT EXISTS idx_schedules_enabled_id ON schedules(enabled, id);
@@ -318,6 +368,16 @@ class Database:
                     await db.execute("ALTER TABLE schedules ADD COLUMN mode TEXT NOT NULL DEFAULT 'blocklist'")
                 if "updated_at" not in sched_cols:
                     await db.execute("ALTER TABLE schedules ADD COLUMN updated_at TEXT")
+            cur = await db.execute("PRAGMA table_info(catalog_sources)")
+            source_cols = {row[1] for row in await cur.fetchall()}
+            if "language" not in source_cols:
+                await db.execute(
+                    """
+                    ALTER TABLE catalog_sources
+                    ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(language IN ('nl', 'en', 'mixed', 'unknown'))
+                    """
+                )
             cur = await db.execute("PRAGMA table_info(catalog_items)")
             item_cols = {row[1] for row in await cur.fetchall()}
             if "thumbnail_url" not in item_cols:
@@ -367,8 +427,6 @@ class Database:
             watch_cols = {row[1] for row in await cur.fetchall()}
             if "startup_ms" not in watch_cols:
                 await db.execute("ALTER TABLE kids_watch_events ADD COLUMN startup_ms INTEGER")
-            cur = await db.execute("PRAGMA table_info(catalog_sources)")
-            source_cols = {row[1] for row in await cur.fetchall()}
             if "safety_verdict" not in source_cols:
                 await db.execute(
                     "ALTER TABLE catalog_sources ADD COLUMN safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN'"
@@ -391,6 +449,7 @@ class Database:
                 await db.execute(
                     "ALTER TABLE catalog_sources ADD COLUMN safety_sample_count INTEGER NOT NULL DEFAULT 0"
                 )
+
             await db.commit()
 
     async def _catalog_revision(self, db: aiosqlite.Connection) -> int:
@@ -411,9 +470,22 @@ class Database:
             revision = await self._catalog_revision(db)
             if entity == "source":
                 cur = await db.execute(
-                    "INSERT INTO catalog_sources(kind,reference,title,actor,changed_at,reason,revision,correlation_id) VALUES(?,?,?,?,?,?,?,?)",
-                    (values["kind"], values["reference"].strip(), values.get("title", "").strip(), "system",
-                     now, "candidate created", revision, values["correlation_id"]),
+                    """
+                    INSERT INTO catalog_sources(
+                        kind,reference,title,language,actor,changed_at,reason,revision,correlation_id
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        values["kind"],
+                        values["reference"].strip(),
+                        values.get("title", "").strip(),
+                        values.get("language", "unknown"),
+                        "system",
+                        now,
+                        "candidate created",
+                        revision,
+                        values["correlation_id"],
+                    ),
                 )
             else:
                 cur = await db.execute(
@@ -489,6 +561,28 @@ class Database:
                 """,
                 ("state_changed", entity, entity_id, values["actor"], values["reason"], revision, values["correlation_id"], now),
             )
+            if values["state"] in {"blocked", "revoked"}:
+                revoke_reason = values["reason"][:1000]
+                if entity == "source":
+                    await db.execute(
+                        """
+                        UPDATE relay_leases
+                        SET state='revoked',revoked_reason=?,heartbeat_at=?
+                        WHERE state='active' AND item_id IN (
+                            SELECT id FROM catalog_items WHERE source_id=?
+                        )
+                        """,
+                        (revoke_reason, now, entity_id),
+                    )
+                else:
+                    await db.execute(
+                        """
+                        UPDATE relay_leases
+                        SET state='revoked',revoked_reason=?,heartbeat_at=?
+                        WHERE state='active' AND item_id=?
+                        """,
+                        (revoke_reason, now, entity_id),
+                    )
             await db.commit()
         await self.kids_resolve_sync_backlog()
         return await self.catalog_get(entity, entity_id)
@@ -538,62 +632,86 @@ class Database:
         reason: str,
         actor: str,
         correlation_id: str,
+        language: str = "unknown",
         policy_version: str = "",
         evidence: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
+        if not isinstance(language, str):
+            raise ValueError("invalid source language")
+        language = language.strip().lower()
+        if language not in {"nl", "en", "mixed", "unknown"}:
+            raise ValueError("invalid source language")
         verdict = verdict.strip().upper()
         if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
             raise ValueError("invalid source safety verdict")
         now = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
-            row = await (
-                await db.execute("SELECT id FROM catalog_sources WHERE id=?", (source_id,))
-            ).fetchone()
-            if not row:
-                return None
-            revision = await self._catalog_revision(db)
-            await db.execute(
-                """
-                UPDATE catalog_sources
-                SET safety_verdict=?, safety_reason=?, safety_checked_at=?,
-                    safety_policy_version=?, safety_evidence_json=?, safety_sample_count=?,
-                    actor=?, changed_at=?, reason=?, revision=?, correlation_id=?
-                WHERE id=?
-                """,
-                (
-                    verdict,
-                    reason[:1000],
-                    now,
-                    policy_version[:128],
-                    json.dumps((evidence or [])[:20], separators=(",", ":"), ensure_ascii=True),
-                    min(len(evidence or []), 20),
-                    actor,
-                    now,
-                    reason[:1000],
-                    revision,
-                    correlation_id,
-                    source_id,
-                ),
-            )
-            await db.execute(
-                """
-                INSERT INTO kids_audit_events(
-                    event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                row = await (
+                    await db.execute("SELECT id FROM catalog_sources WHERE id=?", (source_id,))
+                ).fetchone()
+                if not row:
+                    await db.rollback()
+                    return None
+                revision = await self._catalog_revision(db)
+                await db.execute(
+                    """
+                    UPDATE catalog_sources
+                    SET language=?, safety_verdict=?, safety_reason=?, safety_checked_at=?,
+                        safety_policy_version=?, safety_evidence_json=?, safety_sample_count=?,
+                        actor=?, changed_at=?, reason=?, revision=?, correlation_id=?
+                    WHERE id=?
+                    """,
+                    (
+                        language,
+                        verdict,
+                        reason[:1000],
+                        now,
+                        policy_version[:128],
+                        json.dumps((evidence or [])[:20], separators=(",", ":"), ensure_ascii=True),
+                        min(len(evidence or []), 20),
+                        actor,
+                        now,
+                        reason[:1000],
+                        revision,
+                        correlation_id,
+                        source_id,
+                    ),
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "source_safety_changed",
-                    "source",
-                    source_id,
-                    actor,
-                    f"{verdict}: {reason[:1000]}",
-                    revision,
-                    correlation_id,
-                    now,
-                ),
-            )
-            await db.commit()
+                if verdict != "SAFE":
+                    await db.execute(
+                        """
+                        UPDATE relay_leases
+                        SET state='revoked',revoked_reason=?,heartbeat_at=?
+                        WHERE state='active' AND item_id IN (
+                            SELECT id FROM catalog_items WHERE source_id=?
+                        )
+                        """,
+                        (reason[:1000], now, source_id),
+                    )
+                await db.execute(
+                    """
+                    INSERT INTO kids_audit_events(
+                        event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "source_safety_changed",
+                        "source",
+                        source_id,
+                        actor,
+                        f"{verdict}: {reason[:1000]}",
+                        revision,
+                        correlation_id,
+                        now,
+                    ),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         await self.kids_resolve_sync_backlog()
         return await self.catalog_get("source", source_id)
 
@@ -805,6 +923,19 @@ class Database:
                         """,
                         (now, item_id),
                     )
+                    await db.execute(
+                        """
+                        UPDATE relay_leases
+                        SET state='revoked',
+                            revoked_reason=CASE
+                                WHEN trim(coalesce(revoked_reason,''))='' THEN 'catalog_ineligible'
+                                ELSE revoked_reason
+                            END,
+                            heartbeat_at=?
+                        WHERE item_id=? AND state='active'
+                        """,
+                        (now, item_id),
+                    )
                 elif status == "ready" and not _stored_candidate_meets_policy(
                     candidate_json,
                     quality_height,
@@ -820,6 +951,28 @@ class Database:
                         """,
                         (now, item_id),
                     )
+            await db.execute(
+                """
+                UPDATE relay_leases
+                SET state='revoked',
+                    revoked_reason=CASE
+                        WHEN trim(coalesce(revoked_reason,''))='' THEN 'catalog_ineligible'
+                        ELSE revoked_reason
+                    END,
+                    heartbeat_at=?
+                WHERE state='active' AND item_id IN (
+                    SELECT i.id
+                    FROM catalog_items i
+                    LEFT JOIN catalog_sources s ON s.id=i.source_id
+                    WHERE i.state != 'approved'
+                       OR s.id IS NULL
+                       OR s.state != 'approved'
+                       OR s.safety_verdict != 'SAFE'
+                       OR s.reference=?
+                )
+                """,
+                (now, KIDS_HOME_SOURCE_REFERENCE),
+            )
             await db.execute(
                 """
                 UPDATE kids_resolve_backlog
@@ -876,7 +1029,17 @@ class Database:
         codec: str,
         resolved_at: str,
         expires_at: str,
+        minimum_quality_height: int = 720,
     ) -> None:
+        if (
+            type(minimum_quality_height) is not int
+            or not 720 <= minimum_quality_height <= 1080
+            or type(quality_height) is not int
+            or not minimum_quality_height <= quality_height <= 1080
+            or not isinstance(candidate, dict)
+            or candidate.get("quality_height") != quality_height
+        ):
+            return
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
@@ -1073,7 +1236,7 @@ class Database:
 
     async def kids_kill_switch_enabled(self) -> bool:
         value = await self.get_setting("kids_kill_switch")
-        return (value or "false").strip().lower() == "true"
+        return (value or "true").strip().lower() not in {"", "0", "false", "off", "no"}
 
     async def set_kids_kill_switch(
         self,
@@ -1247,7 +1410,7 @@ class Database:
             "allowlist_source_urls": "",
             "allow_policy_flags_json": "{}",
             "schedule_mode": "blocklist",
-            "kids_kill_switch": "false",
+            "kids_kill_switch": "true",
             "kids_resolver_last_success_at": "",
         }
         for key, value in defaults.items():

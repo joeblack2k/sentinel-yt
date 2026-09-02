@@ -77,8 +77,10 @@ class OpenCodexKidsClassifier:
                                 "horror, violence, weapons, pranks, Elsagate patterns, purchase pressure, and repetitive "
                                 "low-value content UNSAFE. Calm animals, nature, building, LEGO-style creativity, stories, "
                                 "and age-appropriate learning may be SAFE. "
-                                "Return only JSON with verdict SAFE, UNSAFE, or UNCERTAIN, "
-                                "a short reason, and confidence 0-100. "
+                                "Return only strict JSON with verdict SAFE, UNSAFE, or UNCERTAIN, "
+                                "language exactly one of nl, en, mixed, or unknown, a short reason, and confidence 0-100. "
+                                "Always include the language field: use nl for Dutch, en for English, mixed for both, "
+                                "and unknown when language evidence is incomplete. "
                                 "Choose UNCERTAIN whenever evidence is incomplete."
                             ),
                         },
@@ -92,11 +94,15 @@ class OpenCodexKidsClassifier:
             verdict = result.get("verdict")
             if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
                 raise ValueError("invalid verdict")
+            language = result.get("language", "unknown")
+            if not isinstance(language, str) or language not in {"nl", "en", "mixed", "unknown"}:
+                raise ValueError("invalid language")
             confidence = int(result.get("confidence", 0))
             if not 0 <= confidence <= 100:
                 raise ValueError("invalid confidence")
             return {
                 "verdict": verdict,
+                "language": language,
                 "reason": str(result.get("reason", ""))[:1000],
                 "confidence": confidence,
             }

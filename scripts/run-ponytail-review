@@ -1,0 +1,61 @@
+#!/bin/sh
+set -eu
+
+mode=${1:?usage: run-ponytail-review commit|push}
+shift
+root=$(git rev-parse --show-toplevel)
+output=$(mktemp "${TMPDIR:-/tmp}/ponytail-review.XXXXXX")
+patch=
+cleanup() {
+  rm -f "$output"
+  [ -z "$patch" ] || rm -f "$patch"
+}
+trap cleanup EXIT HUP INT TERM
+
+case "$mode" in
+  commit)
+    scope='Review only the exact staged changes from `git diff --cached`.'
+    ;;
+  push)
+    zero=0000000000000000000000000000000000000000
+    empty=$(git hash-object -t tree /dev/null)
+    patch=$(mktemp "${TMPDIR:-/tmp}/ponytail-push.XXXXXX")
+    while read -r local_ref local_sha remote_ref remote_sha; do
+      printf '\n### %s -> %s\n' "$local_ref" "$remote_ref"
+      if [ "$local_sha" = "$zero" ]; then
+        git diff --binary "$remote_sha" "$empty"
+      elif [ "$remote_sha" = "$zero" ]; then
+        git diff --binary "$empty" "$local_sha"
+      else
+        git diff --binary "$remote_sha" "$local_sha"
+      fi
+    done >"$patch"
+    scope="Review only the exact pre-push patch in $patch."
+    ;;
+  *)
+    echo "unknown review mode: $mode" >&2
+    exit 2
+    ;;
+esac
+
+echo "Running /ponytail-review before $mode..." >&2
+codex exec \
+  --ephemeral \
+  --cd "$root" \
+  --sandbox read-only \
+  --config 'approval_policy="never"' \
+  --config 'model_reasoning_effort="low"' \
+  --color never \
+  --output-last-message "$output" \
+  "/ponytail-review
+$scope
+Do not modify files. Ignore unrelated working-tree changes.
+End with PONYTAIL_STATUS: PASS after Lean already. Ship. when there are no
+findings; otherwise end with PONYTAIL_STATUS: FAIL."
+
+cat "$output"
+
+grep -Fq 'PONYTAIL_STATUS: PASS' "$output" || {
+  echo "Ponytail findings must be resolved before $mode." >&2
+  exit 1
+}

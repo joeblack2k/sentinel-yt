@@ -16,6 +16,7 @@ class CatalogSourceRequest(BaseModel):
     kind: Literal["channel", "playlist"]
     reference: str = Field(min_length=1, max_length=256)
     title: str = Field(default="", max_length=500)
+    language: Literal["nl", "en", "mixed", "unknown"] = "unknown"
 
 
 class CatalogItemRequest(BaseModel):

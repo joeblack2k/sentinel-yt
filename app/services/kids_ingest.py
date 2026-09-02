@@ -23,11 +23,46 @@ from .webhook import WebhookClient
 logger = logging.getLogger("sentinel.kids_ingest")
 
 HOME_SOURCE_REFERENCE = "__youtube_kids_home__"
+_KIDS_HOST = "www.youtubekids.com"
+_ACCOUNTS_HOST = "accounts.google.com"
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _CHANNEL_ID = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 _DURATION = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})$")
 _CHANNEL_FROM_LABEL = re.compile(r"\sby\s(.+?)(?:\s[\d,]+ views|\s\d+ views|\s*$)", re.IGNORECASE)
 _MAX_COLLECTED_CARDS = 160
+_MAX_CARDS_PER_DISCOVERY_BUCKET = _MAX_COLLECTED_CARDS // 4
+_MAX_SCROLL_STEPS = 12
+_SEARCH_TERMS = (
+    "animals",
+    "dieren",
+    "lego",
+    "building",
+    "bouwen",
+    "science",
+    "wetenschap",
+    "stories",
+    "verhalen",
+    "learning",
+    "leren",
+    "nature",
+    "natuur",
+    "creative",
+    "knutselen",
+    "space",
+    "ruimte",
+)
+_DUTCH_SEARCH_TERMS = frozenset(
+    {
+        "dieren",
+        "bouwen",
+        "wetenschap",
+        "verhalen",
+        "leren",
+        "natuur",
+        "knutselen",
+        "ruimte",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -66,11 +101,11 @@ def _duration_seconds(value: str) -> int:
 def source_url(kind: str, reference: str) -> str:
     raw = reference.strip()
     if kind == "channel" and raw == HOME_SOURCE_REFERENCE:
-        return "https://www.youtubekids.com/"
+        return f"https://{_KIDS_HOST}/"
     parsed = urllib.parse.urlparse(raw)
     if parsed.scheme or parsed.netloc:
-        if parsed.scheme != "https" or parsed.netloc.lower() != "www.youtubekids.com":
-            raise ValueError("Kids source URLs must stay on www.youtubekids.com")
+        if parsed.scheme != "https" or parsed.netloc.lower() != _KIDS_HOST:
+            raise ValueError(f"Kids source URLs must stay on {_KIDS_HOST}")
         path = parsed.path.rstrip("/")
         if kind == "channel" and not path.startswith("/channel/"):
             raise ValueError("channel source URLs must use the Kids channel route")
@@ -230,98 +265,139 @@ class YouTubeKidsCDP:
     @staticmethod
     def _is_kids_page(target: dict[str, Any]) -> bool:
         parsed = urllib.parse.urlparse(str(target.get("url", "")))
-        return parsed.scheme == "https" and parsed.hostname == "www.youtubekids.com"
+        return parsed.scheme == "https" and parsed.hostname == _KIDS_HOST
+
+    @staticmethod
+    def _is_accounts_page(target: dict[str, Any]) -> bool:
+        parsed = urllib.parse.urlparse(str(target.get("url", "")))
+        return parsed.scheme == "https" and parsed.hostname == _ACCOUNTS_HOST
+
+    @classmethod
+    def _validate_target_set(
+        cls,
+        targets: Any,
+        *,
+        target_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(targets, list):
+            raise RuntimeError("CDP target list is invalid")
+        pages = [target for target in targets if target.get("type") == "page"]
+        kids_pages = [target for target in pages if cls._is_kids_page(target)]
+        allowed_pages = [target for target in pages if cls._is_kids_page(target) or cls._is_accounts_page(target)]
+        if not kids_pages:
+            raise RuntimeError("No existing YouTube Kids CDP target")
+        if len(kids_pages) != 1 or len(allowed_pages) != len(pages):
+            raise RuntimeError(
+                "CDP target set must contain exactly one YouTube Kids page and optional accounts.google.com pages"
+            )
+        target = kids_pages[0]
+        if not target.get("id") or not target.get("webSocketDebuggerUrl"):
+            raise RuntimeError("YouTube Kids CDP page is not connectable")
+        if target_id is not None and str(target["id"]) != target_id:
+            raise RuntimeError("Persistent YouTube Kids CDP target changed")
+        return target
 
     @staticmethod
     def _is_requested_kids_url(actual: urllib.parse.ParseResult, requested: str) -> bool:
         expected = urllib.parse.urlparse(requested)
         return (
             actual.scheme == "https"
-            and actual.hostname == "www.youtubekids.com"
+            and actual.hostname == _KIDS_HOST
             and actual.path.rstrip("/") == expected.path.rstrip("/")
             and actual.query == expected.query
         )
 
     async def _reusable_target(self) -> dict[str, Any]:
-        if self._target_id is not None:
-            try:
-                target = await self._target(self._target_id)
-            except Exception:
-                self._target_id = None
-            else:
-                # A navigation can briefly expose the intermediate YouTube URL.
-                # The requested URL is still checked before cards are accepted.
-                return target
-
         targets = await self._json("/json/list")
-        target = next(
-            (
-                item
-                for item in targets
-                if item.get("type") == "page"
-                and item.get("id")
-                and item.get("webSocketDebuggerUrl")
-                and self._is_kids_page(item)
-            ),
-            None,
-        )
-        if target is None:
-            raise RuntimeError("No existing YouTube Kids CDP target")
-        self._target_id = str(target["id"])
-        logger.info("Kids ingest reusing existing YouTube Kids browser page")
+        target = self._validate_target_set(targets, target_id=self._target_id)
+        if self._target_id is None:
+            self._target_id = str(target["id"])
+            logger.info("Kids ingest reusing existing YouTube Kids browser page")
         return target
 
-    async def cards_for_source(self, kind: str, reference: str) -> list[dict[str, Any]]:
-        target_url = source_url(kind, reference)
-        target = await self._reusable_target()
-        async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
-            command_timeout = max(5.0, min(15.0, self.wait_seconds))
+    @staticmethod
+    def _search_url(term: str) -> str:
+        query = urllib.parse.urlencode({"q": term})
+        return f"https://{_KIDS_HOST}/search?{query}"
+
+    @staticmethod
+    def _card_key(card: dict[str, Any]) -> str:
+        href = str(card.get("href", "")).strip()
+        parsed = urllib.parse.urlparse(href)
+        video_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+        if _VIDEO_ID.fullmatch(video_id):
+            return f"video:{video_id}"
+        return href
+
+    @staticmethod
+    def _card_expression() -> str:
+        return """(() => {
+          const payload = {
+            url: window.location.href,
+            ready: document.readyState,
+            scroll_y: window.scrollY || 0,
+            scroll_height: document.documentElement.scrollHeight || 0,
+            cards: Array.from(document.querySelectorAll("ytk-compact-video-renderer")).map(x => {
+                const data = x.data || (typeof x.get === "function" ? x.get("data") : {}) || {};
+                return {
+                  href: x.querySelector('a[href*="/watch?v="]')?.getAttribute("href") || "",
+                  title: x.querySelector(".primary-text span")?.textContent?.trim() || "",
+                  label: x.querySelector(".primary-text span")?.getAttribute("aria-label") || "",
+                  channel_title: data.shortBylineText?.runs?.map(r => r.text).join("") || "",
+                  duration: x.querySelector(".overlay")?.textContent?.trim() || "",
+                  thumbnail_url: x.querySelector("img")?.src || "",
+                  channel_id: data.kidsVideoOwnerExtension?.externalChannelId
+                    || data.shortBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId
+                    || ""
+                };
+            }),
+            category_urls: Array.from(document.querySelectorAll("a[href]"))
+              .map(x => new URL(x.href, window.location.href))
+              .filter(x => x.protocol === "https:" && x.hostname === "www.youtubekids.com"
+                && (x.pathname.startsWith("/category/") || x.pathname.startsWith("/categories/")))
+              .map(x => x.href)
+          };
+          const viewport = Math.max(window.innerHeight || 0, 480);
+          const max_scroll = Math.max(0, document.documentElement.scrollHeight - viewport);
+          window.scrollTo(0, Math.min(max_scroll, (window.scrollY || 0) + Math.floor(viewport * 0.8)));
+          return JSON.stringify(payload);
+        })()"""
+
+    async def _collect_route(
+        self,
+        page: Any,
+        target_url: str,
+        collected: dict[str, dict[str, Any]],
+        *,
+        category_urls: set[str] | None = None,
+        max_cards: int = _MAX_COLLECTED_CARDS,
+    ) -> None:
+        command_timeout = max(5.0, min(15.0, self.wait_seconds))
+        try:
+            navigation = await self._command(
+                page,
+                3,
+                "Page.navigate",
+                {"url": target_url},
+                timeout=command_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Kids page navigation command timed out; waiting for requested route")
+            navigation = {}
+        if navigation.get("errorText"):
+            raise RuntimeError("CDP navigation failed")
+
+        expression = self._card_expression()
+        stable_rounds = 0
+        last_position: tuple[int, int] | None = None
+        ready_seen = False
+        external_url = ""
+        wrong_kids_url = ""
+        scroll_steps = 0
+        deadline = asyncio.get_running_loop().time() + max(0.1, self.wait_seconds)
+        sleep_seconds = min(0.25, max(0.01, self.wait_seconds / 10))
+        while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
             try:
-                await self._command(page, 2, "Runtime.enable", timeout=command_timeout)
-            except asyncio.TimeoutError:
-                await self._command(page, 20, "Runtime.enable", timeout=command_timeout)
-            try:
-                navigation = await self._command(
-                    page,
-                    3,
-                    "Page.navigate",
-                    {"url": target_url},
-                    timeout=command_timeout,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Kids page navigation command timed out; waiting for requested route")
-                navigation = {}
-            if navigation.get("errorText"):
-                raise RuntimeError("CDP navigation failed")
-            expression = """(() => {
-              const payload = {
-                url: window.location.href,
-                ready: document.readyState,
-                cards: Array.from(document.querySelectorAll("ytk-compact-video-renderer")).map(x => {
-                    const data = x.get("data") || {};
-                    return {
-                    href: x.querySelector('a[href*="/watch?v="]')?.getAttribute("href") || "",
-                    title: x.querySelector(".primary-text span")?.textContent?.trim() || "",
-                    label: x.querySelector(".primary-text span")?.getAttribute("aria-label") || "",
-                    channel_title: data.shortBylineText?.runs?.map(r => r.text).join("") || "",
-                    duration: x.querySelector(".overlay")?.textContent?.trim() || "",
-                    thumbnail_url: x.querySelector("img")?.src || "",
-                    channel_id: data.kidsVideoOwnerExtension?.externalChannelId
-                        || data.shortBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId
-                        || ""
-                    };
-                })
-              };
-              window.scrollTo(0, document.documentElement.scrollHeight);
-              return JSON.stringify(payload);
-            })()"""
-            collected: dict[str, dict[str, Any]] = {}
-            stable_rounds = 0
-            ready_seen = False
-            external_url = ""
-            wrong_kids_url = ""
-            deadline = asyncio.get_running_loop().time() + max(0.5, self.wait_seconds)
-            while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
                 result = await self._command(
                     page,
                     4,
@@ -329,36 +405,157 @@ class YouTubeKidsCDP:
                     {"expression": expression, "returnByValue": True},
                     timeout=remaining,
                 )
-                payload = json.loads(result["result"].get("value", "{}"))
-                actual_url = urllib.parse.urlparse(str(payload.get("url", "")))
-                if not self._is_requested_kids_url(actual_url, target_url):
-                    if payload.get("url") != "about:blank":
-                        if actual_url.hostname == "www.youtubekids.com":
-                            wrong_kids_url = str(payload.get("url", ""))
-                        else:
-                            external_url = str(payload.get("url", ""))
-                    await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
-                    continue
-                if payload.get("ready") not in {"interactive", "complete"}:
-                    await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
-                    continue
-                ready_seen = True
-                before = len(collected)
-                for card in payload.get("cards", []):
-                    key = str(card.get("href", ""))
-                    if key:
-                        collected[key] = card
-                stable_rounds = stable_rounds + 1 if len(collected) == before else 0
-                if len(collected) >= _MAX_COLLECTED_CARDS or (collected and stable_rounds >= 3):
+            except asyncio.TimeoutError:
+                break
+            payload = json.loads(result["result"].get("value", "{}"))
+            actual_url = urllib.parse.urlparse(str(payload.get("url", "")))
+            if not self._is_requested_kids_url(actual_url, target_url):
+                if payload.get("url") != "about:blank":
+                    if actual_url.hostname == _KIDS_HOST:
+                        wrong_kids_url = str(payload.get("url", ""))
+                    else:
+                        external_url = str(payload.get("url", ""))
+                await asyncio.sleep(min(sleep_seconds, max(0, deadline - asyncio.get_running_loop().time())))
+                continue
+            if payload.get("ready") not in {"interactive", "complete"}:
+                await asyncio.sleep(min(sleep_seconds, max(0, deadline - asyncio.get_running_loop().time())))
+                continue
+            ready_seen = True
+            if category_urls is not None:
+                for value in payload.get("category_urls", []):
+                    parsed = urllib.parse.urlparse(str(value))
+                    if parsed.scheme == "https" and parsed.hostname == _KIDS_HOST and parsed.path.startswith(
+                        ("/category/", "/categories/")
+                    ):
+                        category_urls.add(urllib.parse.urlunparse(parsed))
+            before = len(collected)
+            for card in payload.get("cards", []):
+                key = self._card_key(card)
+                if key and key not in collected:
+                    if len(collected) >= max_cards:
+                        break
+                    collected[key] = card
+            position = (
+                int(payload.get("scroll_y", 0) or 0),
+                int(payload.get("scroll_height", 0) or 0),
+            )
+            if len(collected) >= max_cards:
+                return
+            stable_rounds = (
+                stable_rounds + 1
+                if len(collected) == before and position == last_position
+                else 0
+            )
+            last_position = position
+            scroll_steps += 1
+            if stable_rounds >= 3 or scroll_steps >= _MAX_SCROLL_STEPS:
+                return
+            await asyncio.sleep(min(sleep_seconds, max(0, deadline - asyncio.get_running_loop().time())))
+        if ready_seen:
+            return
+        if external_url:
+            raise RuntimeError("CDP navigation left YouTube Kids")
+        if wrong_kids_url:
+            raise RuntimeError("CDP navigation did not reach the requested YouTube Kids page")
+        raise RuntimeError("CDP navigation did not reach YouTube Kids")
+
+    async def _restore_home_on_page(self, page: Any) -> None:
+        await self._command(
+            page,
+            6,
+            "Page.navigate",
+            {"url": f"https://{_KIDS_HOST}/"},
+            timeout=max(10.0, self.wait_seconds),
+        )
+
+    async def cards_for_source(self, kind: str, reference: str) -> list[dict[str, Any]]:
+        target_url = source_url(kind, reference)
+        target = await self._reusable_target()
+        async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
+            try:
+                command_timeout = max(5.0, min(15.0, self.wait_seconds))
+                try:
+                    await self._command(page, 2, "Runtime.enable", timeout=command_timeout)
+                except asyncio.TimeoutError:
+                    await self._command(page, 20, "Runtime.enable", timeout=command_timeout)
+                if kind != "channel" or reference != HOME_SOURCE_REFERENCE:
+                    collected: dict[str, dict[str, Any]] = {}
+                    await self._collect_route(page, target_url, collected)
                     return list(collected.values())[:_MAX_COLLECTED_CARDS]
-                await asyncio.sleep(min(0.5, max(0, deadline - asyncio.get_running_loop().time())))
-            if ready_seen:
+
+                home_cards: dict[str, dict[str, Any]] = {}
+                category_urls: set[str] = set()
+                await self._collect_route(
+                    page,
+                    f"https://{_KIDS_HOST}/",
+                    home_cards,
+                    category_urls=category_urls,
+                    max_cards=_MAX_CARDS_PER_DISCOVERY_BUCKET,
+                )
+                category_cards: dict[str, dict[str, Any]] = {}
+                for category_url in sorted(category_urls)[: _MAX_SCROLL_STEPS]:
+                    await self._collect_route(
+                        page,
+                        category_url,
+                        category_cards,
+                        max_cards=_MAX_CARDS_PER_DISCOVERY_BUCKET,
+                    )
+                dutch_search_cards: dict[str, dict[str, Any]] = {}
+                english_search_cards: dict[str, dict[str, Any]] = {}
+                for term in _SEARCH_TERMS:
+                    search_cards = (
+                        dutch_search_cards if term in _DUTCH_SEARCH_TERMS else english_search_cards
+                    )
+                    await self._collect_route(
+                        page,
+                        self._search_url(term),
+                        search_cards,
+                        max_cards=_MAX_CARDS_PER_DISCOVERY_BUCKET,
+                    )
+                collected: dict[str, dict[str, Any]] = {}
+                for cards in (
+                    home_cards,
+                    category_cards,
+                    dutch_search_cards,
+                    english_search_cards,
+                ):
+                    for key, card in cards.items():
+                        collected.setdefault(key, card)
                 return list(collected.values())[:_MAX_COLLECTED_CARDS]
-            if external_url:
-                raise RuntimeError("CDP navigation left YouTube Kids")
-            if wrong_kids_url:
-                raise RuntimeError("CDP navigation did not reach the requested YouTube Kids page")
-            raise RuntimeError("CDP navigation did not reach YouTube Kids")
+            finally:
+                try:
+                    await self._restore_home_on_page(page)
+                except Exception:
+                    logger.warning("Could not restore the persistent YouTube Kids page")
+
+    async def youtube_cookies(self) -> list[dict[str, Any]]:
+        target = await self._reusable_target()
+        async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
+            result = await self._command(
+                page,
+                30,
+                "Network.getAllCookies",
+                timeout=max(5.0, min(15.0, self.wait_seconds)),
+            )
+        cookies = result.get("cookies", [])
+        return [
+            {
+                "domain": str(cookie.get("domain", "")),
+                "path": str(cookie.get("path", "/")),
+                "secure": bool(cookie.get("secure")),
+                "expires": int(cookie.get("expires", 0) or 0),
+                "name": str(cookie.get("name", "")),
+                "value": str(cookie.get("value", "")),
+            }
+            for cookie in cookies
+            if isinstance(cookie, dict)
+            and (
+                "youtube.com" in str(cookie.get("domain", "")).lower()
+                or "google.com" in str(cookie.get("domain", "")).lower()
+            )
+            and cookie.get("name")
+            and cookie.get("value")
+        ]
 
     async def restore_home(self) -> None:
         """Leave the persistent user page on Kids home without creating a target."""
@@ -367,13 +564,7 @@ class YouTubeKidsCDP:
         try:
             target = await self._target(self._target_id)
             async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
-                await self._command(
-                    page,
-                    6,
-                    "Page.navigate",
-                    {"url": "https://www.youtubekids.com/"},
-                    timeout=max(10.0, self.wait_seconds),
-                )
+                await self._restore_home_on_page(page)
         except Exception:
             logger.warning("Could not restore the persistent YouTube Kids page")
 
@@ -423,7 +614,7 @@ async def ingest_once(
             report.errors += 1
             logger.exception("Kids home ingest failed")
 
-    # Discover channel identities from Home, but leave them candidate-only until a parent approves them.
+    # Discover channel identities from Home; SAFE sources are auto-approved and remain parent-revocable.
     known_references = {
         channel_id_from_reference(str(source.get("reference", "")))
         for source in await db.catalog_sources_list()
@@ -540,21 +731,53 @@ async def ingest_once(
                 try:
                     decision = await classifier.classify(metadata)
                 except KidsClassificationError:
-                    decision = {"verdict": "UNCERTAIN", "reason": "OpenCodex unavailable"}
+                    decision = {
+                        "verdict": "UNCERTAIN",
+                        "language": "unknown",
+                        "reason": "OpenCodex unavailable",
+                    }
                 except Exception:
-                    decision = {"verdict": "UNCERTAIN", "reason": "classifier failure"}
+                    decision = {
+                        "verdict": "UNCERTAIN",
+                        "language": "unknown",
+                        "reason": "classifier failure",
+                    }
             verdict = str(decision.get("verdict", "UNCERTAIN")).upper()
+            if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
+                verdict = "UNCERTAIN"
+            language = str(decision.get("language", "unknown")).lower()
+            if language not in {"nl", "en", "mixed", "unknown"}:
+                language = "unknown"
             reason = str(decision.get("reason", ""))[:1000] or "Sampled channel safety classification"
-            await db.catalog_source_safety_update(
+            updated_source = await db.catalog_source_safety_update(
                 int(source["id"]),
                 verdict=verdict,
+                language=language,
                 reason=reason,
                 actor="kids-channel-guardian",
                 correlation_id=f"kids-channel-classify-{source['id']}",
                 policy_version=channel_policy_version,
                 evidence=evidence,
             )
+            if updated_source is not None:
+                source = updated_source
         if verdict == "SAFE":
+            if source.get("state") == "candidate":
+                approved_source = await db.catalog_transition(
+                    "source",
+                    int(source["id"]),
+                    {
+                        "state": "approved",
+                        "actor": "kids-channel-guardian",
+                        "reason": "Automatically approved after SAFE channel classification",
+                        "correlation_id": f"kids-channel-approval-{source['id']}",
+                    },
+                    expected_state="candidate",
+                )
+                if approved_source is None:
+                    report.errors += 1
+                    continue
+                source = approved_source
             if source.get("state") == "approved":
                 safe_source_by_channel[channel_id] = source
         elif verdict == "UNSAFE":
@@ -587,12 +810,13 @@ async def ingest_once(
 
     for source in sources:
         channel_id = channel_id_from_reference(str(source["reference"]))
-        if source.get("state") != "approved" or channel_id not in safe_source_by_channel:
+        approved_source = safe_source_by_channel.get(channel_id)
+        if approved_source is None:
             continue
         candidates.extend(
             parse_cards(
                 channel_cards_by_id.get(channel_id, [])[:max_cards_per_source],
-                source_id=int(source["id"]),
+                source_id=int(approved_source["id"]),
                 source_reference=channel_id,
                 allowed_channel_ids={channel_id},
             )
