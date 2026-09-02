@@ -2,16 +2,10 @@
 set -eu
 
 mode=${1:?usage: run-ponytail-review commit|push}
-shift
-remote_name=${1:-origin}
+remote_name=${2:-origin}
 root=$(git rev-parse --show-toplevel)
-output=$(mktemp "${TMPDIR:-/tmp}/ponytail-review.XXXXXX")
 patch=
-cleanup() {
-  rm -f "$output"
-  [ -z "$patch" ] || rm -f "$patch"
-}
-trap cleanup EXIT HUP INT TERM
+trap '[ -z "$patch" ] || rm -f "$patch"' EXIT HUP INT TERM
 
 case "$mode" in
   commit)
@@ -28,14 +22,9 @@ case "$mode" in
       elif [ "$remote_sha" = "$zero" ]; then
         upstream_ref=$(git for-each-ref --format='%(upstream)' "$local_ref")
         base_sha=$(git rev-parse --verify "$upstream_ref" 2>/dev/null || true)
-        if [ -z "$base_sha" ]; then
-          base_sha=$(git rev-parse --verify "refs/remotes/$remote_name/HEAD" 2>/dev/null || true)
-        fi
-        if [ -n "$base_sha" ]; then
-          base_sha=$(git merge-base "$base_sha" "$local_sha")
-        else
-          base_sha=$empty
-        fi
+        [ -n "$base_sha" ] ||
+          base_sha=$(git rev-parse --verify "refs/remotes/$remote_name/HEAD" 2>/dev/null || printf %s "$empty")
+        [ "$base_sha" = "$empty" ] || base_sha=$(git merge-base "$base_sha" "$local_sha")
         git diff --binary "$base_sha" "$local_sha"
       else
         git diff --binary "$remote_sha" "$local_sha"
@@ -50,23 +39,21 @@ case "$mode" in
 esac
 
 echo "Running /ponytail-review before $mode..." >&2
-codex exec \
+review=$(codex exec \
   --ephemeral \
   --cd "$root" \
   --sandbox read-only \
   --config 'approval_policy="never"' \
   --config 'model_reasoning_effort="low"' \
   --color never \
-  --output-last-message "$output" \
   "/ponytail-review
 $scope
 Do not modify files. Ignore unrelated working-tree changes.
 End with PONYTAIL_STATUS: PASS after Lean already. Ship. when there are no
-findings; otherwise end with PONYTAIL_STATUS: FAIL."
+findings; otherwise end with PONYTAIL_STATUS: FAIL.")
 
-cat "$output"
-
-grep -Fq 'PONYTAIL_STATUS: PASS' "$output" || {
+printf '%s\n' "$review"
+printf '%s\n' "$review" | grep -Fq 'PONYTAIL_STATUS: PASS' || {
   echo "Ponytail findings must be resolved before $mode." >&2
   exit 1
 }
