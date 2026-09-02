@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -103,6 +104,18 @@ def _catalog_row_context(
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 class Database:
@@ -861,6 +874,653 @@ class Database:
                 result.append(item)
         return result
 
+    async def kids_feed_session_create(
+        self,
+        *,
+        profile: str,
+        policy_version: str,
+        minimum_remaining_seconds: int,
+        minimum_quality_height: int = 720,
+        expires_in_seconds: int = 4 * 60 * 60,
+        include_items: bool = True,
+    ) -> dict[str, Any]:
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        expires_at = (now + timedelta(seconds=max(1, int(expires_in_seconds)))).isoformat()
+        expires_after = (
+            now + timedelta(seconds=max(0, int(minimum_remaining_seconds)))
+        ).isoformat()
+        session_id = secrets.token_urlsafe(24)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            revision_row = await (
+                await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")
+            ).fetchone()
+            revision = int(revision_row[0]) if revision_row else 0
+            await db.execute(
+                """
+                INSERT INTO feed_sessions(
+                    id,profile,catalog_revision,policy_version,created_at,expires_at
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (session_id, profile, revision, policy_version, now_iso, expires_at),
+            )
+            if include_items:
+                cur = await db.execute(
+                    """
+                    SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
+                           s.title AS _source_title,s.state AS _source_state,
+                           s.safety_verdict AS _source_safety_verdict,
+                           b.candidate_json AS _candidate_json,
+                           b.quality_height AS _backlog_quality_height
+                    FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
+                    JOIN kids_resolve_backlog b ON b.item_id=i.id
+                    WHERE i.state='approved' AND s.state='approved'
+                      AND s.safety_verdict='SAFE' AND s.reference!=?
+                      AND b.status='ready' AND b.quality_height>=? AND b.expires_at>?
+                    ORDER BY b.resolved_at DESC,i.id ASC
+                    """,
+                    (KIDS_HOME_SOURCE_REFERENCE, minimum_quality_height, expires_after),
+                )
+                rows = await cur.fetchall()
+                columns = [description[0] for description in cur.description]
+                ordinal = 0
+                for row in rows:
+                    item, source, candidate_json = _catalog_row_context(row, columns)
+                    quality_height = item.pop("_backlog_quality_height", None)
+                    if not (
+                        _catalog_item_is_authorized(item, source)
+                        and _stored_candidate_meets_policy(
+                            candidate_json,
+                            quality_height,
+                            minimum_quality_height,
+                        )
+                    ):
+                        continue
+                    await db.execute(
+                        """
+                        INSERT INTO feed_session_items(
+                            feed_session_id,ordinal,item_id,asset_id
+                        ) VALUES(?,?,?,?)
+                        """,
+                        (session_id, ordinal, item["id"], secrets.token_urlsafe(24)),
+                    )
+                    ordinal += 1
+            await db.commit()
+        return {
+            "id": session_id,
+            "profile": profile,
+            "catalog_revision": revision,
+            "policy_version": policy_version,
+            "created_at": now_iso,
+            "expires_at": expires_at,
+        }
+
+    async def kids_feed_session_page(
+        self,
+        session_id: str,
+        *,
+        profile: str,
+        offset: int,
+        limit: int,
+        policy_version: str,
+        minimum_remaining_seconds: int,
+        minimum_quality_height: int = 720,
+    ) -> dict[str, Any]:
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
+        bounded_offset = max(0, int(offset))
+        bounded_limit = max(1, min(int(limit), 60))
+        now = datetime.now(timezone.utc)
+        expires_after = (
+            now + timedelta(seconds=max(0, int(minimum_remaining_seconds)))
+        ).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            session = await (
+                await db.execute(
+                    """
+                    SELECT profile,catalog_revision,policy_version,expires_at
+                    FROM feed_sessions WHERE id=?
+                    """,
+                    (session_id,),
+                )
+            ).fetchone()
+            if not session:
+                return {"status": "not_found"}
+            session_profile, session_revision, session_policy, session_expires = session
+            parsed_expiry = _parse_utc(session_expires)
+            if parsed_expiry is None or parsed_expiry <= now:
+                return {"status": "expired"}
+            if session_profile != profile:
+                return {"status": "profile_mismatch"}
+            if session_policy != policy_version:
+                return {"status": "policy_mismatch"}
+            revision_row = await (
+                await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")
+            ).fetchone()
+            revision = int(revision_row[0]) if revision_row else 0
+            if int(session_revision) != revision:
+                return {"status": "stale_revision"}
+            # Re-check authorization after session creation. A later
+            # blocklist/revoke can invalidate early ordinals, so scan forward
+            # in batches until the page is full or the session is exhausted.
+            page: list[dict[str, Any]] = []
+            scan_ordinal = bounded_offset
+            batch_size = max(64, bounded_limit + 1)
+            while len(page) < bounded_limit + 1:
+                cur = await db.execute(
+                    """
+                    SELECT f.asset_id,f.ordinal,
+                           i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
+                           i.thumbnail_url,i.duration_seconds,i.visual_category,i.state,
+                           s.kind AS _source_kind,s.reference AS _source_reference,
+                           s.title AS _source_title,s.state AS _source_state,
+                           s.safety_verdict AS _source_safety_verdict,
+                           b.candidate_json AS _candidate_json,
+                           b.quality_height AS _backlog_quality_height
+                    FROM feed_session_items f
+                    JOIN catalog_items i ON i.id=f.item_id
+                    JOIN catalog_sources s ON s.id=i.source_id
+                    JOIN kids_resolve_backlog b ON b.item_id=i.id
+                    WHERE f.feed_session_id=? AND f.ordinal>=?
+                      AND i.state='approved' AND s.state='approved'
+                      AND s.safety_verdict='SAFE' AND s.reference!=?
+                      AND b.status='ready' AND b.expires_at>?
+                    ORDER BY f.ordinal ASC
+                    LIMIT ?
+                    """,
+                    (
+                        session_id,
+                        scan_ordinal,
+                        KIDS_HOME_SOURCE_REFERENCE,
+                        expires_after,
+                        batch_size,
+                    ),
+                )
+                rows = await cur.fetchall()
+                columns = [description[0] for description in cur.description]
+                if not rows:
+                    break
+                for row in rows:
+                    values = dict(zip(columns, row))
+                    item = {
+                        "id": values["item_id"],
+                        "state": values["state"],
+                        "video_id": values["video_id"],
+                        "title": values["title"],
+                        "channel_id": values["channel_id"],
+                        "channel_title": values["channel_title"],
+                    }
+                    source = {
+                        "kind": values["_source_kind"],
+                        "reference": values["_source_reference"],
+                        "title": values["_source_title"],
+                        "state": values["_source_state"],
+                        "safety_verdict": values["_source_safety_verdict"],
+                    }
+                    if not (
+                        _catalog_item_is_authorized(item, source)
+                        and _stored_candidate_meets_policy(
+                            values["_candidate_json"],
+                            values["_backlog_quality_height"],
+                            minimum_quality_height,
+                        )
+                    ):
+                        continue
+                    page.append(
+                        {
+                            "asset_id": values["asset_id"],
+                            "ordinal": int(values["ordinal"]),
+                            "thumbnail_url": values["thumbnail_url"] or "",
+                            "duration_seconds": max(
+                                0, int(values["duration_seconds"] or 0)
+                            ),
+                            "visual_category": str(
+                                values["visual_category"] or "general"
+                            ),
+                        }
+                    )
+                    if len(page) >= bounded_limit + 1:
+                        break
+                scan_ordinal = int(rows[-1][1]) + 1
+                if len(rows) < batch_size:
+                    break
+        next_offset = None
+        if len(page) > bounded_limit:
+            page = page[:bounded_limit]
+            next_offset = page[-1]["ordinal"] + 1
+        for item in page:
+            item.pop("ordinal", None)
+        return {"status": "ok", "items": page, "next_offset": next_offset}
+
+    async def kids_feed_asset(
+        self,
+        asset_id: str,
+        *,
+        require_current_authorization: bool = True,
+        minimum_remaining_seconds: int = 0,
+        minimum_quality_height: int = 720,
+    ) -> dict[str, Any] | None:
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
+        now = datetime.now(timezone.utc)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT f.asset_id,f.feed_session_id,fs.profile,fs.catalog_revision,
+                       fs.policy_version,fs.expires_at,
+                       i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
+                       i.thumbnail_url,i.duration_seconds,i.visual_category,i.state,
+                       s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict,
+                       b.candidate_json AS _candidate_json,
+                       b.quality_height AS _backlog_quality_height,
+                       b.status AS _backlog_status,b.expires_at AS _backlog_expires_at,
+                       b.codec
+                FROM feed_session_items f
+                JOIN feed_sessions fs ON fs.id=f.feed_session_id
+                JOIN catalog_items i ON i.id=f.item_id
+                JOIN catalog_sources s ON s.id=i.source_id
+                LEFT JOIN kids_resolve_backlog b ON b.item_id=i.id
+                WHERE f.asset_id=? AND fs.expires_at>?
+                """,
+                (
+                    asset_id,
+                    (now + timedelta(seconds=max(0, int(minimum_remaining_seconds)))).isoformat(),
+                ),
+            )
+            row = await cur.fetchone()
+            columns = [description[0] for description in cur.description] if row else []
+        if not row:
+            return None
+        values = dict(zip(columns, row))
+        item = {
+            "id": values["item_id"],
+            "state": values["state"],
+            "video_id": values["video_id"],
+            "title": values["title"],
+            "channel_id": values["channel_id"],
+            "channel_title": values["channel_title"],
+        }
+        source = {
+            "kind": values["_source_kind"],
+            "reference": values["_source_reference"],
+            "title": values["_source_title"],
+            "state": values["_source_state"],
+            "safety_verdict": values["_source_safety_verdict"],
+        }
+        if require_current_authorization and (
+            not _catalog_item_is_authorized(item, source)
+            or values["_backlog_status"] != "ready"
+            or _parse_utc(values["_backlog_expires_at"]) is None
+            or _parse_utc(values["_backlog_expires_at"])
+            <= now + timedelta(seconds=max(0, int(minimum_remaining_seconds)))
+            or not _stored_candidate_meets_policy(
+                values["_candidate_json"],
+                values["_backlog_quality_height"],
+                minimum_quality_height,
+            )
+        ):
+            return None
+        return {
+            "asset_id": values["asset_id"],
+            "feed_session_id": values["feed_session_id"],
+            "profile": values["profile"],
+            "catalog_revision": int(values["catalog_revision"]),
+            "policy_version": values["policy_version"],
+            "item_id": int(values["item_id"]),
+            "video_id": values["video_id"],
+            "thumbnail_url": values["thumbnail_url"] or "",
+            "duration_seconds": max(0, int(values["duration_seconds"] or 0)),
+            "visual_category": str(values["visual_category"] or "general"),
+            "candidate_json": values["_candidate_json"],
+            "quality_height": values["_backlog_quality_height"],
+            "codec": values["codec"] or "",
+        }
+
+    async def kids_relay_lease_create(
+        self,
+        *,
+        asset_id: str,
+        policy_version: str,
+        minimum_remaining_seconds: int,
+        minimum_quality_height: int = 720,
+        expires_in_seconds: int = 2 * 60 * 60,
+    ) -> dict[str, Any]:
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        candidate_after = (
+            now + timedelta(seconds=max(0, int(minimum_remaining_seconds)))
+        ).isoformat()
+        lease_deadline = now + timedelta(seconds=max(1, int(expires_in_seconds)))
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """
+                SELECT f.feed_session_id,fs.profile,fs.catalog_revision,
+                       fs.policy_version,fs.expires_at,
+                       i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,i.state,
+                       s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict,
+                       b.status AS _backlog_status,b.candidate_json,
+                       b.quality_height,b.codec,b.expires_at AS candidate_expires_at
+                FROM feed_session_items f
+                JOIN feed_sessions fs ON fs.id=f.feed_session_id
+                JOIN catalog_items i ON i.id=f.item_id
+                JOIN catalog_sources s ON s.id=i.source_id
+                LEFT JOIN kids_resolve_backlog b ON b.item_id=i.id
+                WHERE f.asset_id=?
+                """,
+                (asset_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return {"status": "not_found"}
+            values = dict(zip([description[0] for description in cur.description], row))
+            session_expiry = _parse_utc(values["expires_at"])
+            if session_expiry is None or session_expiry <= now:
+                await db.rollback()
+                return {"status": "expired"}
+            if values["policy_version"] != policy_version:
+                await db.rollback()
+                return {"status": "policy_mismatch"}
+            revision_row = await (
+                await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")
+            ).fetchone()
+            revision = int(revision_row[0]) if revision_row else 0
+            if int(values["catalog_revision"]) != revision:
+                await db.rollback()
+                return {"status": "stale_revision"}
+            kill_switch = await (
+                await db.execute(
+                    "SELECT value FROM settings WHERE key='kids_kill_switch'"
+                )
+            ).fetchone()
+            if kill_switch and str(kill_switch[0]).strip().lower() not in {
+                "",
+                "0",
+                "false",
+                "off",
+                "no",
+            }:
+                await db.rollback()
+                return {"status": "kill_switch"}
+            item = {
+                "id": values["item_id"],
+                "state": values["state"],
+                "video_id": values["video_id"],
+                "title": values["title"],
+                "channel_id": values["channel_id"],
+                "channel_title": values["channel_title"],
+            }
+            source = {
+                "kind": values["_source_kind"],
+                "reference": values["_source_reference"],
+                "title": values["_source_title"],
+                "state": values["_source_state"],
+                "safety_verdict": values["_source_safety_verdict"],
+            }
+            if not _catalog_item_is_authorized(item, source):
+                await db.rollback()
+                return {"status": "ineligible"}
+            if (
+                values["_backlog_status"] != "ready"
+                or not _stored_candidate_meets_policy(
+                    values["candidate_json"],
+                    values["quality_height"],
+                    minimum_quality_height,
+                )
+                or _parse_utc(values["candidate_expires_at"]) is None
+                or _parse_utc(values["candidate_expires_at"]) <= datetime.fromisoformat(candidate_after)
+            ):
+                await db.rollback()
+                return {"status": "candidate_unavailable"}
+            try:
+                candidate = json.loads(str(values["candidate_json"]))
+            except (TypeError, json.JSONDecodeError):
+                await db.rollback()
+                return {"status": "candidate_unavailable"}
+            candidate_expiry = _parse_utc(values["candidate_expires_at"])
+            if candidate_expiry is None:
+                await db.rollback()
+                return {"status": "candidate_unavailable"}
+            lease_expires_at = min(lease_deadline, candidate_expiry).isoformat()
+            lease_id = secrets.token_urlsafe(24)
+            await db.execute(
+                """
+                INSERT INTO relay_leases(
+                    id,item_id,feed_session_id,state,candidate_json,quality_height,
+                    revoked_reason,created_at,expires_at,heartbeat_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    lease_id,
+                    values["item_id"],
+                    values["feed_session_id"],
+                    "active",
+                    json.dumps(candidate, separators=(",", ":"), ensure_ascii=True),
+                    values["quality_height"],
+                    "",
+                    now_iso,
+                    lease_expires_at,
+                    now_iso,
+                ),
+            )
+            await db.commit()
+        return {
+            "status": "ok",
+            "id": lease_id,
+            "session_id": lease_id,
+            "quality_height": int(values["quality_height"]),
+            "codec": str(values["codec"] or ""),
+            "expires_at": lease_expires_at,
+        }
+
+    async def kids_relay_lease_get(
+        self,
+        lease_id: str,
+        *,
+        minimum_quality_height: int = 720,
+    ) -> dict[str, Any] | None:
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """
+                SELECT l.id,l.item_id,l.feed_session_id,l.state,l.candidate_json,
+                       l.quality_height,l.expires_at,
+                       i.video_id,i.title,i.channel_id,i.channel_title,i.state AS item_state,
+                       s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict
+                FROM relay_leases l
+                JOIN catalog_items i ON i.id=l.item_id
+                JOIN catalog_sources s ON s.id=i.source_id
+                WHERE l.id=?
+                """,
+                (lease_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return None
+            values = dict(zip([description[0] for description in cur.description], row))
+            if values["state"] != "active":
+                await db.rollback()
+                return None
+            expires_at = _parse_utc(values["expires_at"])
+            if expires_at is None or expires_at <= now:
+                await db.execute(
+                    """
+                    UPDATE relay_leases
+                    SET state='expired',revoked_reason='lease_expired',heartbeat_at=?
+                    WHERE id=? AND state='active'
+                    """,
+                    (now_iso, lease_id),
+                )
+                await db.commit()
+                return None
+            kill_switch = await (
+                await db.execute(
+                    "SELECT value FROM settings WHERE key='kids_kill_switch'"
+                )
+            ).fetchone()
+            if kill_switch and str(kill_switch[0]).strip().lower() not in {
+                "",
+                "0",
+                "false",
+                "off",
+                "no",
+            }:
+                await db.execute(
+                    """
+                    UPDATE relay_leases
+                    SET state='revoked',revoked_reason='kill_switch',heartbeat_at=?
+                    WHERE id=? AND state='active'
+                    """,
+                    (now_iso, lease_id),
+                )
+                await db.commit()
+                return None
+            item = {
+                "state": values["item_state"],
+                "video_id": values["video_id"],
+                "title": values["title"],
+                "channel_id": values["channel_id"],
+                "channel_title": values["channel_title"],
+            }
+            source = {
+                "kind": values["_source_kind"],
+                "reference": values["_source_reference"],
+                "title": values["_source_title"],
+                "state": values["_source_state"],
+                "safety_verdict": values["_source_safety_verdict"],
+            }
+            try:
+                candidate = json.loads(str(values["candidate_json"]))
+            except (TypeError, json.JSONDecodeError):
+                candidate = None
+            if not (
+                _catalog_item_is_authorized(item, source)
+                and _stored_candidate_meets_policy(
+                    values["candidate_json"],
+                    values["quality_height"],
+                    minimum_quality_height,
+                )
+                and isinstance(candidate, dict)
+            ):
+                await db.execute(
+                    """
+                    UPDATE relay_leases
+                    SET state='revoked',revoked_reason='catalog_ineligible',heartbeat_at=?
+                    WHERE id=? AND state='active'
+                    """,
+                    (now_iso, lease_id),
+                )
+                await db.commit()
+                return None
+            await db.execute(
+                "UPDATE relay_leases SET heartbeat_at=? WHERE id=? AND state='active'",
+                (now_iso, lease_id),
+            )
+            await db.commit()
+        return {
+            "id": values["id"],
+            "item_id": int(values["item_id"]),
+            "feed_session_id": values["feed_session_id"],
+            "video_id": values["video_id"],
+            "candidate": candidate,
+            "quality_height": int(values["quality_height"]),
+            "expires_at": values["expires_at"],
+        }
+
+    async def kids_relay_lease_close(self, lease_id: str) -> bool:
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """
+                UPDATE relay_leases
+                SET state='closed',revoked_reason='client_closed',heartbeat_at=?
+                WHERE id=? AND state='active'
+                """,
+                (now, lease_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def kids_relay_lease_item_id(self, lease_id: str) -> int | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute("SELECT item_id FROM relay_leases WHERE id=?", (lease_id,))
+            ).fetchone()
+        return int(row[0]) if row else None
+
+    async def kids_relay_lease_event_context(
+        self,
+        lease_id: str,
+    ) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute(
+                    """
+                    SELECT l.item_id,l.feed_session_id,l.state,fs.profile
+                    FROM relay_leases l
+                    JOIN feed_sessions fs ON fs.id=l.feed_session_id
+                    WHERE l.id=?
+                    """,
+                    (lease_id,),
+                )
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "item_id": int(row[0]),
+            "feed_session_id": str(row[1]),
+            "state": str(row[2]),
+            "profile": str(row[3]),
+        }
+
+    async def kids_revoke_active_leases(self, *, reason: str) -> int:
+        now = utc_now_iso()
+        safe_reason = str(reason or "policy_closed")[:1000]
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """
+                UPDATE relay_leases
+                SET state='revoked',revoked_reason=?,heartbeat_at=?
+                WHERE state='active'
+                """,
+                (safe_reason, now),
+            )
+            revoked = int(cur.rowcount)
+            if revoked:
+                await db.execute(
+                    """
+                    INSERT INTO kids_audit_events(
+                        event,entity_type,entity_id,actor,reason,revision,correlation_id,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "relay_leases_revoked",
+                        "policy",
+                        None,
+                        "system",
+                        f"{safe_reason} ({revoked})",
+                        0,
+                        "",
+                        now,
+                    ),
+                )
+            await db.commit()
+        return revoked
+
     async def kids_resolve_sync_backlog(self, *, minimum_quality_height: int = 720) -> None:
         """Make eligibility changes immediately remove technical playback authority."""
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
@@ -1246,20 +1906,51 @@ class Database:
         reason: str,
         correlation_id: str,
     ) -> bool:
+        now = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 "INSERT INTO settings(key, value) VALUES('kids_kill_switch', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 ("true" if enabled else "false",),
             )
+            revoked = 0
+            if enabled:
+                cur = await db.execute(
+                    """
+                    UPDATE relay_leases
+                    SET state='revoked',revoked_reason='kill_switch',heartbeat_at=?
+                    WHERE state='active'
+                    """,
+                    (now,),
+                )
+                revoked = int(cur.rowcount)
             await db.execute(
                 """
                 INSERT INTO kids_audit_events(
                     event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at
                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                ("kill_switch_changed", "control", None, actor, reason, 0, correlation_id, utc_now_iso()),
+                ("kill_switch_changed", "control", None, actor, reason, 0, correlation_id, now),
             )
+            if revoked:
+                await db.execute(
+                    """
+                    INSERT INTO kids_audit_events(
+                        event,entity_type,entity_id,actor,reason,revision,correlation_id,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "relay_leases_revoked",
+                        "policy",
+                        None,
+                        actor,
+                        f"kill_switch ({revoked})",
+                        0,
+                        correlation_id,
+                        now,
+                    ),
+                )
             await db.commit()
         return await self.kids_kill_switch_enabled() == enabled
 

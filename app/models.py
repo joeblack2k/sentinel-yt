@@ -51,6 +51,20 @@ class KidsWatchEventRequest(BaseModel):
     correlation_id: str = Field(min_length=1, max_length=128)
 
 
+class KidsPlaybackSessionRequest(BaseModel):
+    asset_id: str = Field(min_length=8, max_length=128)
+
+
+class KidsDataplaneEventRequest(BaseModel):
+    asset_id: str = Field(min_length=8, max_length=128)
+    event: Literal["selected", "started", "completed", "stopped"]
+    profile: str = Field(default="noah", min_length=1, max_length=64)
+    position_seconds: float | None = Field(default=None, ge=0, le=86400)
+    session_id: str = Field(default="", max_length=128)
+    startup_ms: int | None = Field(default=None, ge=0, le=120000)
+    correlation_id: str = Field(default="", max_length=128)
+
+
 class WebhookControlRequest(BaseModel):
     active: bool
     source: str = "home_assistant"

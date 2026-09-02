@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import random
@@ -10,11 +11,13 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Any, AsyncGenerator
+from urllib.parse import urlsplit
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Request
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -35,6 +38,8 @@ from .models import (
     CatalogTransitionRequest,
     ControlStateRequest,
     GeminiSettingsRequest,
+    KidsDataplaneEventRequest,
+    KidsPlaybackSessionRequest,
     KidsWatchEventRequest,
     LocalBlocklistContentRequest,
     KidsKillSwitchRequest,
@@ -67,6 +72,7 @@ from .services.sponsorblock import SponsorBlockService
 from .services.webhook import WebhookClient
 
 logger = logging.getLogger("sentinel")
+KIDS_DATAPLANE_POLICY_VERSION = "sentinel-kids-v1"
 
 
 @dataclass
@@ -81,6 +87,7 @@ class RuntimeState:
     allowlists: BlocklistService
     sponsorblock: SponsorBlockService
     mqtt: MQTTBridge
+    kids_http_client: httpx.AsyncClient
     discovered_devices: list[dict[str, Any]] = field(default_factory=list)
     live_subscribers: set[asyncio.Queue[dict[str, Any]]] = field(default_factory=set)
     supervisor_task: asyncio.Task[None] | None = None
@@ -185,6 +192,20 @@ class RuntimeState:
         schedule_ctx = await self.current_schedule_context(settings_map=settings)
         return active and bool(schedule_ctx.get("active", True))
 
+    async def kids_policy_state(self) -> str:
+        if await self.db.kids_kill_switch_enabled():
+            await self.db.kids_revoke_active_leases(reason="kill_switch")
+            return "kill_switch"
+        settings = await self.db.all_settings()
+        if settings.get("active", "true") != "true":
+            await self.db.kids_revoke_active_leases(reason="monitoring_disabled")
+            return "schedule_closed"
+        schedule_ctx = await self.current_schedule_context(settings_map=settings)
+        if not schedule_ctx.get("active", True):
+            await self.db.kids_revoke_active_leases(reason="schedule_closed")
+            return "schedule_closed"
+        return "ready"
+
     async def sponsorblock_enabled_now(self, settings_map: dict[str, str] | None = None) -> bool:
         settings = settings_map or await self.db.all_settings()
         active = settings.get("sponsorblock_active", "false") == "true"
@@ -256,6 +277,7 @@ class RuntimeState:
         await self._set_bool_setting_confirmed("active", active)
         logger.info("monitoring_active updated to %s", active)
         if not active:
+            await self.db.kids_revoke_active_leases(reason="monitoring_disabled")
             await self._cancel_reinforce_tasks()
             self.block_retry_at.clear()
             self.up_next_candidates.clear()
@@ -1014,6 +1036,10 @@ mqtt_bridge = MQTTBridge(settings)
 judge = JudgeService(db, settings, webhook_client, blocklists=blocklists, allowlists=allowlists)
 
 
+def _new_kids_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=20.0, follow_redirects=False)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await db.init()
@@ -1023,6 +1049,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await blocklists.reload(db)
     await allowlists.reload(db)
     mqtt_bridge.set_event_loop(asyncio.get_running_loop())
+    kids_http_client = _new_kids_http_client()
     runtime = RuntimeState(
         settings=settings,
         db=db,
@@ -1034,21 +1061,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         allowlists=allowlists,
         sponsorblock=sponsorblock,
         mqtt=mqtt_bridge,
+        kids_http_client=kids_http_client,
     )
     app.state.runtime = runtime
-    await runtime.publish_mqtt_snapshot(force_discovery=True)
-    runtime.supervisor_task = asyncio.create_task(runtime.supervisor(), name="sentinel-supervisor")
-    yield
-    if runtime.supervisor_task:
-        runtime.supervisor_task.cancel()
-        await asyncio.gather(runtime.supervisor_task, return_exceptions=True)
-    if runtime.reinforce_tasks:
-        for task in runtime.reinforce_tasks.values():
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*runtime.reinforce_tasks.values(), return_exceptions=True)
-    await runtime.mqtt.close()
-    await runtime.lounge.stop_all()
+    try:
+        await runtime.publish_mqtt_snapshot(force_discovery=True)
+        runtime.supervisor_task = asyncio.create_task(runtime.supervisor(), name="sentinel-supervisor")
+        yield
+    finally:
+        if runtime.supervisor_task:
+            runtime.supervisor_task.cancel()
+            await asyncio.gather(runtime.supervisor_task, return_exceptions=True)
+        if runtime.reinforce_tasks:
+            for task in runtime.reinforce_tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*runtime.reinforce_tasks.values(), return_exceptions=True)
+        await runtime.mqtt.close()
+        await runtime.lounge.stop_all()
+        await kids_http_client.aclose()
 
 
 app = FastAPI(title="Sentinel", lifespan=lifespan)
@@ -1327,6 +1358,403 @@ async def api_status(request: Request) -> dict[str, Any]:
 @app.get("/api/kids/catalog/revision")
 async def api_catalog_revision(request: Request) -> dict[str, Any]:
     return {"revision": await request.app.state.runtime.db.catalog_revision()}
+
+
+def _encode_kids_cursor(session_id: str, offset: int) -> str:
+    payload = json.dumps([session_id, int(offset)], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_kids_cursor(value: str) -> tuple[str, int]:
+    try:
+        if not value or len(value) > 512 or any(
+            character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            for character in value
+        ):
+            raise ValueError
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        payload = json.loads(decoded)
+        if (
+            not isinstance(payload, list)
+            or len(payload) != 2
+            or not isinstance(payload[0], str)
+            or not payload[0]
+            or len(payload[0]) > 128
+            or type(payload[1]) is not int
+            or payload[1] < 0
+        ):
+            raise ValueError
+        return payload[0], payload[1]
+    except (ValueError, TypeError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_cursor", "message": "Invalid Kids feed cursor."},
+        ) from None
+
+
+def _kids_unavailable(state: str) -> HTTPException:
+    return HTTPException(
+        status_code=403,
+        detail={"code": "kids_unavailable", "state": state},
+    )
+
+
+def _kids_lease_failure(result: dict[str, Any]) -> HTTPException:
+    failure = result.get("status", "ineligible")
+    if failure == "not_found":
+        status_code = 404
+    elif failure in {"expired", "policy_mismatch", "stale_revision"}:
+        status_code = 409
+    else:
+        status_code = 403
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": f"kids_{failure}", "message": "Kids playback is not authorized."},
+    )
+
+
+async def _kids_checked_lease(
+    request: Request,
+    lease_id: str,
+    *,
+    reconcile: bool = True,
+) -> tuple[RuntimeState, dict[str, Any]]:
+    runtime: RuntimeState = request.app.state.runtime
+    if reconcile:
+        await runtime.judge.reconcile_catalog_policy()
+    state = await runtime.kids_policy_state()
+    if state != "ready":
+        raise _kids_unavailable(state)
+    lease = await runtime.db.kids_relay_lease_get(
+        lease_id,
+        minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+    )
+    if lease is None:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "kids_lease_inactive", "message": "Kids playback lease is inactive."},
+        )
+    return runtime, lease
+
+
+def _kids_candidate_headers(
+    candidate: dict[str, Any],
+    stream_name: str,
+    request: Request,
+) -> dict[str, str]:
+    headers: dict[str, str] = {"Accept-Encoding": "identity"}
+    allowed = {"user-agent", "origin", "referer", "x-goog-visitor-id"}
+    raw_headers = candidate.get(f"{stream_name}_headers", {})
+    if isinstance(raw_headers, dict):
+        for name, value in raw_headers.items():
+            if str(name).lower() in allowed and isinstance(value, str):
+                headers[str(name)] = value
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+    return headers
+
+
+def _kids_upstream_headers(response: httpx.Response) -> dict[str, str]:
+    return {
+        name: response.headers[name]
+        for name in ("accept-ranges", "content-length", "content-range", "content-type")
+        if name in response.headers
+    }
+
+
+@app.get("/v1/kids/feed")
+async def kids_feed(
+    request: Request,
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=36, ge=1, le=60),
+    profile: str = Query(default="noah", min_length=1, max_length=64),
+) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    await runtime.judge.reconcile_catalog_policy()
+    state = await runtime.kids_policy_state()
+    if cursor:
+        session_id, offset = _decode_kids_cursor(cursor)
+    else:
+        session = await runtime.db.kids_feed_session_create(
+            profile=profile,
+            policy_version=KIDS_DATAPLANE_POLICY_VERSION,
+            minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+            minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+            include_items=state == "ready",
+        )
+        session_id, offset = session["id"], 0
+    page = await runtime.db.kids_feed_session_page(
+        session_id,
+        profile=profile,
+        offset=offset,
+        limit=limit,
+        policy_version=KIDS_DATAPLANE_POLICY_VERSION,
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+    )
+    if page["status"] != "ok":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": f"kids_feed_{page['status']}", "message": "Kids feed cursor is no longer valid."},
+        )
+    items = page["items"] if state == "ready" else []
+    base_url = str(request.base_url).rstrip("/")
+    response_items = [
+        {
+            "id": item["asset_id"],
+            "thumbnail_url": f"{base_url}/v1/kids/thumbnails/{item['asset_id']}",
+            "duration_seconds": item["duration_seconds"],
+            "visual_category": item["visual_category"],
+        }
+        for item in items
+    ]
+    next_offset = page["next_offset"] if state == "ready" else None
+    return {
+        "state": state,
+        "catalog_revision": str(await runtime.db.catalog_revision()),
+        "items": response_items,
+        "next_cursor": (
+            _encode_kids_cursor(session_id, next_offset)
+            if next_offset is not None
+            else None
+        ),
+        "retry_after_seconds": 30,
+    }
+
+
+@app.get("/v1/kids/thumbnails/{asset_id}")
+async def kids_thumbnail(asset_id: str, request: Request) -> Response:
+    runtime: RuntimeState = request.app.state.runtime
+    await runtime.judge.reconcile_catalog_policy()
+    state = await runtime.kids_policy_state()
+    if state != "ready":
+        raise _kids_unavailable(state)
+    asset = await runtime.db.kids_feed_asset(
+        asset_id,
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+    )
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Kids asset not found")
+    if asset["catalog_revision"] != await runtime.db.catalog_revision():
+        raise HTTPException(status_code=409, detail="Kids asset is stale")
+    parsed = urlsplit(str(asset["thumbnail_url"]))
+    if parsed.scheme != "https" or parsed.hostname != "i.ytimg.com":
+        raise HTTPException(status_code=404, detail="Kids thumbnail is unavailable")
+    try:
+        upstream = await runtime.kids_http_client.get(str(asset["thumbnail_url"]))
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Kids thumbnail upstream unavailable") from exc
+    content_type = upstream.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if upstream.status_code != 200 or not content_type.startswith("image/"):
+        await upstream.aclose()
+        raise HTTPException(status_code=502, detail="Kids thumbnail upstream unavailable")
+    content = upstream.content
+    await upstream.aclose()
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.post("/v1/kids/playback-sessions")
+async def kids_playback_session(
+    payload: KidsPlaybackSessionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    await runtime.judge.reconcile_catalog_policy()
+    state = await runtime.kids_policy_state()
+    if state != "ready":
+        raise _kids_unavailable(state)
+    result = await runtime.db.kids_relay_lease_create(
+        asset_id=payload.asset_id,
+        policy_version=KIDS_DATAPLANE_POLICY_VERSION,
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+    )
+    if result["status"] != "ok":
+        raise _kids_lease_failure(result)
+    base_url = str(request.base_url).rstrip("/")
+    lease_id = result["id"]
+    return {
+        "id": lease_id,
+        "session_id": result["session_id"],
+        "manifest_url": f"{base_url}/v1/kids/playback-sessions/{lease_id}/manifest",
+        "quality_height": result["quality_height"],
+        "codec": result["codec"],
+        "expires_at": result["expires_at"],
+    }
+
+
+@app.get("/v1/kids/playback-sessions/{lease_id}/manifest")
+async def kids_playback_manifest(lease_id: str, request: Request) -> dict[str, Any]:
+    runtime, lease = await _kids_checked_lease(request, lease_id)
+    base_url = str(request.base_url).rstrip("/")
+    prefix = f"{base_url}/v1/kids/playback-sessions/{lease_id}"
+    candidate = lease["candidate"]
+    return {
+        "session_id": lease_id,
+        "transport": "adaptive_mpv",
+        "video_url": f"{prefix}/video",
+        "audio_url": f"{prefix}/audio",
+        "status_url": f"{prefix}/status",
+        "quality_height": lease["quality_height"],
+        "codec": str(candidate.get("codec") or ""),
+        "expires_at": lease["expires_at"],
+    }
+
+
+@app.get("/v1/kids/playback-sessions/{lease_id}/status")
+async def kids_playback_status(lease_id: str, request: Request) -> Response:
+    await _kids_checked_lease(request, lease_id)
+    return Response(status_code=204)
+
+
+@app.api_route(
+    "/v1/kids/playback-sessions/{lease_id}/{stream_name}",
+    methods=["GET", "HEAD"],
+    response_model=None,
+)
+async def kids_playback_stream(
+    lease_id: str,
+    stream_name: str,
+    request: Request,
+) -> Response | StreamingResponse:
+    if stream_name not in {"video", "audio"}:
+        raise HTTPException(status_code=404, detail="Kids media stream not found")
+    runtime, lease = await _kids_checked_lease(request, lease_id)
+    candidate = lease["candidate"]
+    source_url = candidate.get("media_url" if stream_name == "video" else "audio_url")
+    parsed = urlsplit(str(source_url))
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise HTTPException(status_code=403, detail="Kids media source is unavailable")
+    headers = _kids_candidate_headers(candidate, stream_name, request)
+    try:
+        upstream = await runtime.kids_http_client.send(
+            runtime.kids_http_client.build_request(
+                request.method,
+                str(source_url),
+                headers=headers,
+            ),
+            stream=request.method != "HEAD",
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Kids media upstream unavailable") from exc
+    response_headers = _kids_upstream_headers(upstream)
+    if request.method == "HEAD" or upstream.status_code >= 400:
+        status_code = upstream.status_code
+        await upstream.aclose()
+        return Response(status_code=status_code, headers=response_headers)
+
+    async def body() -> AsyncGenerator[bytes, None]:
+        try:
+            async for chunk in upstream.aiter_bytes():
+                if not await _kids_checked_stream(
+                    runtime,
+                    lease_id,
+                    minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+                ):
+                    break
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(
+        body(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+async def _kids_checked_stream(
+    runtime: RuntimeState,
+    lease_id: str,
+    *,
+    minimum_quality_height: int = 720,
+) -> bool:
+    if await runtime.kids_policy_state() != "ready":
+        return False
+    return (
+        await runtime.db.kids_relay_lease_get(
+            lease_id,
+            minimum_quality_height=minimum_quality_height,
+        )
+        is not None
+    )
+
+
+@app.delete("/v1/kids/playback-sessions/{lease_id}")
+async def kids_playback_delete(lease_id: str, request: Request) -> dict[str, Any]:
+    closed = await request.app.state.runtime.db.kids_relay_lease_close(lease_id)
+    return {"closed": closed}
+
+
+@app.post("/v1/kids/events", status_code=202)
+async def kids_dataplane_event(
+    payload: KidsDataplaneEventRequest,
+    request: Request,
+) -> dict[str, Any]:
+    runtime: RuntimeState = request.app.state.runtime
+    asset = await runtime.db.kids_feed_asset(
+        payload.asset_id,
+        require_current_authorization=payload.event == "selected",
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+    )
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Kids asset not found")
+    if payload.session_id:
+        lease_context = await runtime.db.kids_relay_lease_event_context(
+            payload.session_id
+        )
+        if (
+            lease_context is None
+            or lease_context["item_id"] != asset["item_id"]
+            or lease_context["feed_session_id"] != asset["feed_session_id"]
+            or lease_context["profile"] != payload.profile
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "kids_event_session_mismatch", "message": "Kids session does not match asset."},
+            )
+        if payload.event in {"started", "completed"}:
+            await _kids_checked_lease(request, payload.session_id)
+        elif payload.event == "stopped" and lease_context["state"] not in {
+            "active",
+            "revoked",
+            "expired",
+            "closed",
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "kids_event_session_inactive", "message": "Kids session state is invalid."},
+            )
+    elif payload.event != "selected":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "kids_event_session_required", "message": "Kids playback events require a session."},
+        )
+    correlation_id = (
+        payload.correlation_id
+        or request.headers.get("X-Correlation-ID")
+        or "kids-dataplane"
+    )
+    event = await runtime.db.kids_watch_event_record(
+        video_id=asset["video_id"],
+        event=payload.event,
+        profile=payload.profile,
+        position_seconds=payload.position_seconds,
+        session_id=payload.session_id,
+        startup_ms=payload.startup_ms,
+        correlation_id=correlation_id,
+    )
+    if event is None:
+        raise HTTPException(status_code=404, detail="Kids catalog item not found")
+    return {"status": "accepted", "event_id": event["id"]}
 
 
 @app.get("/api/kids/catalog/items")
@@ -2045,6 +2473,7 @@ async def api_schedule_add(payload: ScheduleWindowRequest, request: Request) -> 
         mode=payload.mode,
     )
     await runtime.sync_workers()
+    await runtime.kids_policy_state()
     return {"ok": True, "id": schedule_id}
 
 
@@ -2063,6 +2492,7 @@ async def api_schedule_update(schedule_id: int, payload: ScheduleWindowRequest, 
     if not updated:
         raise HTTPException(status_code=404, detail={"code": "schedule_not_found", "message": "Schedule not found."})
     await runtime.sync_workers()
+    await runtime.kids_policy_state()
     return {"ok": True}
 
 
@@ -2079,6 +2509,7 @@ async def api_schedule_delete(schedule_id: int, request: Request) -> dict[str, A
     if not deleted:
         raise HTTPException(status_code=404, detail={"code": "schedule_not_found", "message": "Schedule not found."})
     await runtime.sync_workers()
+    await runtime.kids_policy_state()
     return {"ok": True}
 
 
@@ -2112,6 +2543,7 @@ async def api_settings_schedule(payload: ScheduleRequest, request: Request) -> d
     await runtime.db.set_setting("schedule_end", payload.end)
     await runtime.db.set_setting("timezone", payload.timezone)
     await runtime.sync_workers()
+    await runtime.kids_policy_state()
     return {"ok": True}
 
 
