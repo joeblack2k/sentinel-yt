@@ -6,7 +6,6 @@ url: https://github.com/joeblack2k/sentinel-yt
 arch:
   - amd64
   - aarch64
-  - armv7
 startup: services
 boot: auto
 init: false
@@ -25,4 +24,3 @@ schema:
   gemini_api_key: password
   gemini_model: str
   build_version: str
-
