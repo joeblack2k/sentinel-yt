@@ -18,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 
 from .config import POLICY_PRESETS, SUPPORTED_TIMEZONES, Settings
 from .db import Database, utc_now_iso
-from .kids_api import router as kids_router
+from .kids_api import kids_profile_payload, router as kids_router
 from .models import (
     ControlStateRequest,
     LocalBlocklistContentRequest,
@@ -387,6 +387,7 @@ async def page_settings(request: Request) -> HTMLResponse:
 @app.get("/kids", response_class=HTMLResponse)
 async def page_kids(request: Request) -> HTMLResponse:
     runtime: RuntimeState = request.app.state.runtime
+    profiles = await runtime.db.kids_profiles_list()
     return templates.TemplateResponse(
         request,
         "kids.html",
@@ -404,7 +405,7 @@ async def page_kids(request: Request) -> HTMLResponse:
             "items": await runtime.db.catalog_item_list_all(),
             "watch_events": await runtime.db.kids_watch_events_list(),
             "resolve_rows": await runtime.db.kids_resolve_recent_rows(),
-            "profiles": await runtime.db.kids_profiles_list(),
+            "profiles": [kids_profile_payload(request, profile) for profile in profiles],
             "page": "kids",
         },
     )

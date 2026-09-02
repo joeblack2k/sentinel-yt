@@ -118,6 +118,60 @@ def test_source_api_exposes_profiles_and_assignment_endpoint(tmp_path, monkeypat
         assert [row["reference"] for row in rows] == ["UC-profile-api"]
 
 
+def test_profile_avatar_can_be_uploaded_read_replaced_and_deleted(tmp_path, monkeypatch):
+    monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
+    module = importlib.reload(importlib.import_module("app.main"))
+
+    with TestClient(module.app) as client:
+        noah = client.get("/api/kids/profiles").json()["profiles"][0]
+        assert noah["avatar_url"] is None
+
+        jpeg = b"\xff\xd8\xff\xe0" + b"profile-photo"
+        uploaded = client.put(
+            "/api/kids/profiles/noah/avatar",
+            content=jpeg,
+            headers={"Content-Type": "image/jpeg"},
+        )
+        assert uploaded.status_code == 200
+        avatar_url = uploaded.json()["profile"]["avatar_url"]
+        assert avatar_url.startswith("http://testserver/api/kids/profiles/noah/avatar?v=")
+        fetched = client.get(avatar_url)
+        assert fetched.status_code == 200
+        assert fetched.headers["content-type"] == "image/jpeg"
+        assert fetched.content == jpeg
+        assert avatar_url in client.get("/kids").text
+
+        png = b"\x89PNG\r\n\x1a\n" + b"profile-photo"
+        replaced = client.put("/api/kids/profiles/noah/avatar", content=png)
+        assert replaced.status_code == 200
+        assert replaced.json()["profile"]["avatar_url"] != avatar_url
+        assert client.get(replaced.json()["profile"]["avatar_url"]).headers["content-type"] == "image/png"
+
+        rejected = client.put("/api/kids/profiles/noah/avatar", content=b"not an image")
+        assert rejected.status_code == 415
+
+        kids_api = importlib.import_module("app.kids_api")
+        monkeypatch.setattr(kids_api, "KIDS_PROFILE_AVATAR_MAX_BYTES", 8)
+        oversized = client.put(
+            "/api/kids/profiles/noah/avatar",
+            content=b"\xff\xd8\xff" + b"x" * 6,
+        )
+        assert oversized.status_code == 413
+
+        deleted = client.delete("/api/kids/profiles/noah/avatar")
+        assert deleted.status_code == 200
+        assert deleted.json()["profile"]["avatar_url"] is None
+        assert client.get("/api/kids/profiles/noah/avatar").status_code == 404
+
+        audit_events = client.get("/api/kids/audit").json()["events"]
+        assert [event["event"] for event in audit_events[:3]] == [
+            "profile_avatar_deleted",
+            "profile_avatar_updated",
+            "profile_avatar_updated",
+        ]
+
+
 def test_profile_names_are_normalized_and_playback_stays_profile_bound(tmp_path, monkeypatch):
     db_path = tmp_path / "sentinel.db"
     db = asyncio.run(seed_catalog(db_path, qualities=(1080,)))

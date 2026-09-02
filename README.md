@@ -36,6 +36,9 @@ Kids dataplane:
 - `GET /api/kids/status`
 - `GET /api/kids/readyz`
 - `GET /api/kids/profiles`
+- `GET /api/kids/profiles/{profile}/avatar`
+- `PUT /api/kids/profiles/{profile}/avatar`
+- `DELETE /api/kids/profiles/{profile}/avatar`
 - `GET /api/kids/sources`
 - `GET /api/kids/resolve`
 
@@ -67,6 +70,10 @@ The main settings are:
 - `OPENCODEX_MODEL`, the classifier model ID
 - `KIDS_BROWSER_CDP_URL`, the existing persistent Kids Chromium CDP endpoint
 - `KIDS_RESOLVER_MIN_QUALITY_HEIGHT`, `720` or `1080`; 4K is not supported
+
+Personal profile images are stored in `/data/profile-avatars`. Upload the raw
+JPEG, PNG, WebP, HEIC/HEIF, or AVIF body to the profile avatar endpoint; the
+maximum file size is 10 MB. The built-in profile symbol remains the fallback.
 
 The `/blocklist` page and its policy flags are the source of truth for Kids
 catalog filtering. The Kids ingest worker never approves a source from AI

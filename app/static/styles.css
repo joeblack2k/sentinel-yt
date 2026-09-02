@@ -594,6 +594,23 @@ button:active, .btn:active { transform: translateY(1px); }
   flex-shrink: 0;
 }
 
+.profile-avatar-wrap {
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+}
+
+.profile-avatar {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.profile-icon[hidden] {
+  display: none;
+}
+
 .profile-noah .profile-icon {
   background: #ccfbf1;
   color: #0f766e;
@@ -602,6 +619,15 @@ button:active, .btn:active { transform: translateY(1px); }
 .profile-felix .profile-icon {
   background: #ede9fe;
   color: #6d28d9;
+}
+
+.profile-meta {
+  flex: 1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .profile-meta h3 {
@@ -613,6 +639,14 @@ button:active, .btn:active { transform: translateY(1px); }
   margin: 0;
   font-size: 12.5px;
   color: #5f6d6f;
+}
+
+.avatar-upload-label {
+  cursor: pointer;
+}
+
+.avatar-upload {
+  display: none;
 }
 
 /* Tabbed sub-nav */
