@@ -38,8 +38,17 @@ def test_api_kids_guardian_surfaces(tmp_path, monkeypatch):
         root = client.get("/", follow_redirects=False)
         assert root.status_code == 307
         assert root.headers["location"] == "/kids"
+        for path in ("/kids", "/sources", "/resolve", "/history", "/blocklist", "/schedule", "/settings"):
+            assert client.get(path).status_code == 200
         for path in ("/live", "/allowlist", "/devices", "/automation", "/mqtt", "/sponsorblock", "/rules"):
             assert client.get(path).status_code == 404
+
+        profiles = client.get("/api/kids/profiles")
+        assert profiles.status_code == 200
+        assert [(row["slug"], row["age_years"]) for row in profiles.json()["profiles"]] == [
+            ("noah", 6),
+            ("felix", 2),
+        ]
 
         for path in (
             "/api/sponsorblock/state",

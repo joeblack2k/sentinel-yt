@@ -1,0 +1,498 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="panel" style="margin-bottom:14px; background:linear-gradient(to right, #ffffff, #f7fbfa); border-left:4px solid var(--accent);">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px;">
+    <div>
+      <h1 style="margin:0 0 4px 0;">Kids Sources</h1>
+      <p class="muted" style="margin:0; font-size:14px;">
+        Manage channels and playlists for the Kids app. Added sources enter as candidates for Guardian classification before publishing. Use Revoke (Unsave) to remove content.
+      </p>
+    </div>
+    <div class="inline-actions">
+      <a href="/kids" class="small-btn">← Back to Overview</a>
+      <a href="/resolve" class="small-btn">Resolve Backlog →</a>
+    </div>
+  </div>
+</div>
+
+<!-- Profile Presentation -->
+<section class="card">
+  <h2>Target Profiles</h2>
+  <div class="profile-deck">
+    {% for p in profiles if profiles is defined and profiles %}
+    <div class="profile-card profile-{{ p.slug }}">
+      <div class="profile-icon">{{ (p.display_name or p.slug)[:1]|upper }}</div>
+      <div class="profile-meta">
+        <h3>{{ p.display_name }} <span class="badge badge-profile-{{ p.slug }}">Age {{ p.age_years }}</span></h3>
+        <p>{{ p.approved_source_count }} approved / {{ p.source_count }} total sources • Profile ID: <code>{{ p.slug }}</code></p>
+      </div>
+    </div>
+    {% else %}
+    <div class="profile-card profile-noah">
+      <div class="profile-icon">N</div>
+      <div class="profile-meta">
+        <h3>Noah <span class="badge badge-profile-noah">Age 6</span></h3>
+        <p>Active profile • Curated educational channels (Profile ID: <code>noah</code>)</p>
+      </div>
+    </div>
+    <div class="profile-card profile-felix">
+      <div class="profile-icon">F</div>
+      <div class="profile-meta">
+        <h3>Felix <span class="badge badge-profile-felix">Age 2</span></h3>
+        <p>Toddler profile • Age-appropriate sensory animations (Profile ID: <code>felix</code>)</p>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<!-- Add Candidate Source Card -->
+<section class="card">
+  <h2>Add Source (Candidate)</h2>
+  <form id="kids-source-form" class="grid2">
+    <div>
+      <label for="source-kind">Source Type</label>
+      <select id="source-kind" name="kind">
+        <option value="channel">YouTube Channel</option>
+        <option value="playlist">YouTube Playlist</option>
+      </select>
+    </div>
+    <div>
+      <label for="source-ref">Channel ID or YouTube Kids URL</label>
+      <input id="source-ref" name="reference" required maxlength="256" placeholder="UC... or https://www.youtubekids.com/channel/...">
+    </div>
+    <div>
+      <label for="source-title">Parent Label / Name (Optional)</label>
+      <input id="source-title" name="title" maxlength="500" placeholder="e.g. Sesame Street, Bluey, Buurman &amp; Buurman">
+    </div>
+    <div>
+      <label>Target Profiles</label>
+      <div class="profile-checkbox-row" style="margin-top:4px;">
+        {% for p in profiles if profiles is defined and profiles %}
+          <label class="profile-check-label">
+            <input type="checkbox" name="profile_slugs" value="{{ p.slug }}" {% if p.slug == 'noah' %}checked{% endif %}>
+            {{ p.display_name }} (Age {{ p.age_years }})
+          </label>
+        {% else %}
+          <label class="profile-check-label">
+            <input type="checkbox" name="profile_slugs" value="noah" checked> Noah (Age 6)
+          </label>
+          <label class="profile-check-label">
+            <input type="checkbox" name="profile_slugs" value="felix"> Felix (Age 2)
+          </label>
+        {% endfor %}
+      </div>
+    </div>
+    <div style="grid-column:1 / -1; margin-top:4px;">
+      <button type="submit" id="add-source-btn" style="min-height:38px;">Add Candidate Source</button>
+      <span id="kids-source-status" class="muted" style="margin-left:12px; font-size:13px;"></span>
+    </div>
+  </form>
+</section>
+
+<!-- Sources List & Filters -->
+<section class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+    <h2>Configured Sources (<span id="source-count">{{ sources|length if sources is defined else 0 }}</span>)</h2>
+    <div class="muted" style="font-size:13px;">
+      Guardian check: <strong>{{ 'ACTIVE' if (status is defined and status and status.judge_ok) else 'STANDBY' }}</strong>
+    </div>
+  </div>
+
+  <!-- Filter and Sort Toolbar -->
+  <div class="toolbar">
+    <div class="toolbar-search">
+      <input type="search" id="source-search" placeholder="Search by name, channel ID, or URL..." aria-label="Search sources">
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">State:</span>
+      <select id="filter-state" aria-label="Filter by state">
+        <option value="all">All States</option>
+        <option value="candidate">Candidate</option>
+        <option value="approved">Approved</option>
+        <option value="blocked">Blocked</option>
+        <option value="revoked">Revoked</option>
+        <option value="unknown">Unknown</option>
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Verdict:</span>
+      <select id="filter-verdict" aria-label="Filter by safety verdict">
+        <option value="all">All Verdicts</option>
+        <option value="SAFE">SAFE</option>
+        <option value="BLOCK">BLOCK / UNSAFE</option>
+        <option value="UNCERTAIN">UNCERTAIN</option>
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Profile:</span>
+      <select id="filter-profile" aria-label="Filter by profile">
+        <option value="all">All Profiles</option>
+        {% for p in profiles if profiles is defined and profiles %}
+          <option value="{{ p.slug }}">{{ p.display_name }}</option>
+        {% else %}
+          <option value="noah">Noah</option>
+          <option value="felix">Felix</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Type:</span>
+      <select id="filter-kind" aria-label="Filter by source kind">
+        <option value="all">All Types</option>
+        <option value="channel">Channel</option>
+        <option value="playlist">Playlist</option>
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Sort:</span>
+      <select id="sort-sources" aria-label="Sort sources">
+        <option value="id-desc">Newest First</option>
+        <option value="id-asc">Oldest First</option>
+        <option value="name-asc">Name (A–Z)</option>
+        <option value="name-desc">Name (Z–A)</option>
+        <option value="verdict">Safety Verdict</option>
+        <option value="ready">Ready Items</option>
+        <option value="samples">Sample Count</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:48px;">Avatar</th>
+          <th style="width:75px;">Type</th>
+          <th>Source Name &amp; Safe Links</th>
+          <th style="width:170px;">Profile Assignment</th>
+          <th style="width:190px;">Guardian check</th>
+          <th style="width:120px;">Catalog Items</th>
+          <th style="width:90px;">State</th>
+          <th style="width:130px; text-align:right;">Action</th>
+        </tr>
+      </thead>
+      <tbody id="kids-sources-tbody">
+        {% for source in sources if sources is defined %}
+        <tr class="source-row"
+            data-id="{{ source.id }}"
+            data-title="{{ (source.title or '')|lower }}"
+            data-reference="{{ (source.reference or '')|lower }}"
+            data-kind="{{ source.kind|lower }}"
+            data-state="{{ source.state|lower }}"
+            data-verdict="{{ (source.safety_verdict or 'UNCERTAIN')|upper }}"
+            data-profiles="{{ (source.profile_slugs or [])|join(',')|lower }}"
+            data-samples="{{ source.safety_sample_count or 0 }}"
+            data-ready="{{ source.ready_item_count or 0 }}">
+          <td>
+            <div class="channel-avatar">
+              {% if source.avatar_url %}
+                <img src="{{ source.avatar_url }}" alt="" onerror="this.parentElement.innerHTML='{{ ((source.title or source.reference or 'S')|string)[:1]|upper }}';">
+              {% else %}
+                {{ ((source.title or source.reference or 'S')|string)[:1]|upper }}
+              {% endif %}
+            </div>
+          </td>
+          <td>
+            <span class="badge badge-quality">{{ source.kind }}</span>
+          </td>
+          <td>
+            <strong style="font-size:14.5px; color:#13232f;">{{ source.title or 'Untitled Source' }}</strong>
+            <div style="margin-top:3px;">
+              <code>{{ source.reference }}</code>
+            </div>
+            <div style="margin-top:4px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+              {% if source.source_url %}
+                <a href="{{ source.source_url }}" target="_blank" rel="noopener noreferrer" class="yt-kids-link" title="Open safely in YouTube Kids">
+                  ▶ YT Kids
+                </a>
+              {% endif %}
+              {% if source.youtube_source_url %}
+                <a href="{{ source.youtube_source_url }}" target="_blank" rel="noopener noreferrer" class="yt-channel-link" title="Open on standard YouTube">
+                  YouTube ↗
+                </a>
+              {% endif %}
+            </div>
+          </td>
+          <td>
+            {% if source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
+              <span class="muted" style="font-size:12px;">System ingest source</span>
+            {% else %}
+            <div class="profile-assignment-group" data-source-id="{{ source.id }}">
+              <div class="profile-checkbox-row">
+                {% for p in profiles if profiles is defined and profiles %}
+                  <label class="profile-check-label">
+                    <input type="checkbox"
+                           class="source-prof-cb"
+                           data-source-id="{{ source.id }}"
+                           value="{{ p.slug }}"
+                           {% if p.slug in (source.profile_slugs or []) %}checked{% endif %}>
+                    <span class="badge badge-profile-{{ p.slug }}" style="font-size:11px; padding:1px 5px;">{{ p.display_name }}</span>
+                  </label>
+                {% else %}
+                  <label class="profile-check-label">
+                    <input type="checkbox" class="source-prof-cb" data-source-id="{{ source.id }}" value="noah" {% if 'noah' in (source.profile_slugs or []) %}checked{% endif %}>
+                    <span class="badge badge-profile-noah" style="font-size:11px; padding:1px 5px;">Noah</span>
+                  </label>
+                  <label class="profile-check-label">
+                    <input type="checkbox" class="source-prof-cb" data-source-id="{{ source.id }}" value="felix" {% if 'felix' in (source.profile_slugs or []) %}checked{% endif %}>
+                    <span class="badge badge-profile-felix" style="font-size:11px; padding:1px 5px;">Felix</span>
+                  </label>
+                {% endfor %}
+              </div>
+              <div class="profile-saved-msg" id="prof-msg-{{ source.id }}"></div>
+            </div>
+            {% endif %}
+          </td>
+          <td>
+            <div>
+              {% if source.safety_verdict == 'SAFE' %}
+                <span class="badge badge-safe">SAFE</span>
+              {% elif source.safety_verdict in ['BLOCK', 'UNSAFE'] %}
+                <span class="badge badge-block">BLOCK</span>
+              {% else %}
+                <span class="badge badge-uncertain">{{ source.safety_verdict or 'UNCERTAIN' }}</span>
+              {% endif %}
+            </div>
+            {% if source.safety_reason %}
+              <div class="muted" style="font-size:12px; margin-top:3px; line-height:1.3;">{{ source.safety_reason }}</div>
+            {% endif %}
+            <div class="muted" style="font-size:11px; margin-top:2px;">
+              {{ source.safety_sample_count or 0 }} samples • v{{ source.safety_policy_version or '1' }}
+              {% if source.safety_checked_at %}• {{ source.safety_checked_at }}{% endif %}
+            </div>
+          </td>
+          <td>
+            <span class="item-counts-pill">
+              <strong>{{ source.ready_item_count or 0 }}</strong> ready
+            </span>
+            <div class="muted" style="font-size:11.5px; margin-top:2px;">
+              {{ source.approved_item_count or 0 }} approved / {{ source.item_count or 0 }} total
+            </div>
+          </td>
+          <td class="state">
+            {% if source.state == 'approved' %}
+              <span class="badge badge-approved">Approved</span>
+            {% elif source.state == 'revoked' %}
+              <span class="badge badge-revoked">Revoked</span>
+            {% elif source.state == 'blocked' %}
+              <span class="badge badge-block">Blocked</span>
+            {% else %}
+              <span class="badge badge-pending">{{ source.state }}</span>
+            {% endif %}
+          </td>
+          <td style="text-align:right;">
+            {% if source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
+              <span class="muted" style="font-size:12px;">-</span>
+            {% elif source.state != 'revoked' %}
+              <button type="button" class="btn-revoke" data-source-id="{{ source.id }}" data-state="revoked" title="Revoke and remove from Kids feed">
+                Revoke (Unsave)
+              </button>
+            {% else %}
+              <span class="muted" style="font-size:12px;">Revoked</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr id="no-sources-row"><td colspan="8" class="muted" style="text-align:center; padding:24px;">No Kids sources configured yet. Add a channel or playlist above.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+const statusNode = document.getElementById('kids-source-status');
+const correlation = () => `kids-sources-ui-${Date.now()}`;
+
+async function changeState(url, state) {
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
+    body: JSON.stringify({state, actor: 'parent-ui', reason: `Parent UI state transition to ${state}`, correlation_id: correlation()})
+  });
+  if (!response.ok) throw new Error(await response.text());
+  location.reload();
+}
+
+document.getElementById('kids-source-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const btn = document.getElementById('add-source-btn');
+  btn.disabled = true;
+  statusNode.textContent = 'Saving candidate source...';
+  statusNode.style.color = '#5f6d6f';
+
+  const profileSlugs = Array.from(event.currentTarget.querySelectorAll('input[name="profile_slugs"]:checked')).map(cb => cb.value);
+  const payload = {
+    kind: form.get('kind'),
+    reference: form.get('reference'),
+    title: form.get('title') || '',
+    profile_slugs: profileSlugs
+  };
+
+  try {
+    const response = await fetch('/api/kids/sources', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) throw new Error(await response.text());
+    statusNode.textContent = 'Candidate source added. Guardian classifier is auditing samples.';
+    statusNode.style.color = '#047857';
+    event.currentTarget.reset();
+    setTimeout(() => location.reload(), 600);
+  } catch (error) {
+    statusNode.textContent = `Could not add source: ${error.message || error}`;
+    statusNode.style.color = '#b91c1c';
+    btn.disabled = false;
+  }
+});
+
+// Profile Assignment updates via PUT /api/kids/sources/{source_id}/profiles
+document.querySelectorAll('.source-prof-cb').forEach((checkbox) => {
+  checkbox.addEventListener('change', async (e) => {
+    const sourceId = checkbox.dataset.sourceId;
+    const group = checkbox.closest('.profile-assignment-group');
+    const msgEl = document.getElementById(`prof-msg-${sourceId}`);
+    const checkedSlugs = Array.from(group.querySelectorAll('.source-prof-cb:checked')).map(cb => cb.value);
+
+    if (msgEl) {
+      msgEl.textContent = 'Saving...';
+      msgEl.style.color = '#5f6d6f';
+    }
+
+    try {
+      const response = await fetch(`/api/kids/sources/${sourceId}/profiles`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
+        body: JSON.stringify({
+          profile_slugs: checkedSlugs,
+          actor: 'parent-ui',
+          reason: 'Parent updated profile assignment',
+          correlation_id: correlation()
+        })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      if (msgEl) {
+        msgEl.textContent = 'Saved';
+        msgEl.style.color = '#047857';
+        setTimeout(() => { msgEl.textContent = ''; }, 2000);
+      }
+      const row = checkbox.closest('tr.source-row');
+      if (row) row.dataset.profiles = checkedSlugs.join(',').toLowerCase();
+    } catch (err) {
+      if (msgEl) {
+        msgEl.textContent = `Error: ${err.message || err}`;
+        msgEl.style.color = '#b91c1c';
+      }
+    }
+  });
+});
+
+document.querySelectorAll('.btn-revoke').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const sourceId = button.dataset.sourceId;
+    if (!sourceId) return;
+    if (!confirm('Are you sure you want to revoke (unsave) this source? It will immediately disappear from the Kids app.')) return;
+    button.disabled = true;
+    button.textContent = 'Revoking...';
+    try {
+      await changeState(`/api/kids/sources/${sourceId}/state`, 'revoked');
+    } catch (error) {
+      alert(`Could not revoke source: ${error.message || error}`);
+      button.disabled = false;
+      button.textContent = 'Revoke (Unsave)';
+    }
+  });
+});
+
+// Filter & Sort Logic with URL Query Params synchronization
+function applyFilters() {
+  const search = (document.getElementById('source-search').value || '').toLowerCase().trim();
+  const state = document.getElementById('filter-state').value;
+  const verdict = document.getElementById('filter-verdict').value;
+  const profile = document.getElementById('filter-profile').value;
+  const kind = document.getElementById('filter-kind').value;
+  const sort = document.getElementById('sort-sources').value;
+
+  // Sync to query params
+  const params = new URLSearchParams(window.location.search);
+  if (search) params.set('query', search); else params.delete('query');
+  if (state !== 'all') params.set('state', state); else params.delete('state');
+  if (verdict !== 'all') params.set('verdict', verdict); else params.delete('verdict');
+  if (profile !== 'all') params.set('profile', profile); else params.delete('profile');
+  if (kind !== 'all') params.set('kind', kind); else params.delete('kind');
+  if (sort !== 'id-desc') params.set('sort', sort); else params.delete('sort');
+
+  const newRelativePathQuery = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
+  window.history.replaceState(null, '', newRelativePathQuery);
+
+  const rows = Array.from(document.querySelectorAll('#kids-sources-tbody tr.source-row'));
+  let visibleCount = 0;
+
+  rows.forEach((row) => {
+    const rTitle = row.dataset.title || '';
+    const rRef = row.dataset.reference || '';
+    const rKind = row.dataset.kind || '';
+    const rState = row.dataset.state || '';
+    const rVerdict = row.dataset.verdict || '';
+    const rProfiles = (row.dataset.profiles || '').split(',');
+
+    const matchSearch = !search || rTitle.includes(search) || rRef.includes(search);
+    const matchState = (state === 'all') || (rState === state);
+    const matchVerdict = (verdict === 'all') ||
+      (verdict === 'BLOCK' ? (rVerdict === 'BLOCK' || rVerdict === 'UNSAFE') : (rVerdict === verdict));
+    const matchProfile = (profile === 'all') || rProfiles.includes(profile.toLowerCase());
+    const matchKind = (kind === 'all') || (rKind === kind);
+
+    if (matchSearch && matchState && matchVerdict && matchProfile && matchKind) {
+      row.style.display = '';
+      visibleCount++;
+    } else {
+      row.style.display = 'none';
+    }
+  });
+
+  // Sort rows
+  const tbody = document.getElementById('kids-sources-tbody');
+  rows.sort((a, b) => {
+    if (sort === 'name-asc') return (a.dataset.title || '').localeCompare(b.dataset.title || '');
+    if (sort === 'name-desc') return (b.dataset.title || '').localeCompare(a.dataset.title || '');
+    if (sort === 'id-asc') return parseInt(a.dataset.id || '0') - parseInt(b.dataset.id || '0');
+    if (sort === 'verdict') return (a.dataset.verdict || '').localeCompare(b.dataset.verdict || '');
+    if (sort === 'ready') return parseInt(b.dataset.ready || '0') - parseInt(a.dataset.ready || '0');
+    if (sort === 'samples') return parseInt(b.dataset.samples || '0') - parseInt(a.dataset.samples || '0');
+    return parseInt(b.dataset.id || '0') - parseInt(a.dataset.id || '0'); // id-desc
+  });
+  rows.forEach(r => tbody.appendChild(r));
+
+  const countEl = document.getElementById('source-count');
+  if (countEl) countEl.textContent = visibleCount;
+}
+
+// Initialize filters from URL search params
+function initFilters() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has('query')) document.getElementById('source-search').value = params.get('query');
+  if (params.has('search')) document.getElementById('source-search').value = params.get('search');
+  if (params.has('state')) document.getElementById('filter-state').value = params.get('state');
+  if (params.has('verdict')) document.getElementById('filter-verdict').value = params.get('verdict');
+  if (params.has('profile')) document.getElementById('filter-profile').value = params.get('profile');
+  if (params.has('kind')) document.getElementById('filter-kind').value = params.get('kind');
+  if (params.has('sort')) document.getElementById('sort-sources').value = params.get('sort');
+
+  document.getElementById('source-search').addEventListener('input', applyFilters);
+  document.getElementById('filter-state').addEventListener('change', applyFilters);
+  document.getElementById('filter-verdict').addEventListener('change', applyFilters);
+  document.getElementById('filter-profile').addEventListener('change', applyFilters);
+  document.getElementById('filter-kind').addEventListener('change', applyFilters);
+  document.getElementById('sort-sources').addEventListener('change', applyFilters);
+
+  applyFilters();
+}
+
+window.addEventListener('DOMContentLoaded', initFilters);
+if (document.readyState !== 'loading') initFilters();
+</script>
+{% endblock %}

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 KIDS_HOME_SOURCE_REFERENCE = "__youtube_kids_home__"
@@ -20,6 +20,32 @@ def _source_channel_id(kind: Any, reference: Any) -> str | None:
         parts = [part for part in parsed.path.split("/") if part]
         return parts[1] if len(parts) == 2 and parts[0] == "channel" else None
     return raw
+
+
+def kids_source_url(kind: Any, reference: Any) -> str:
+    """Return a public YouTube Kids URL for parent-facing links only."""
+    raw = str(reference or "").strip()
+    if raw == KIDS_HOME_SOURCE_REFERENCE:
+        return "https://www.youtubekids.com/"
+    parsed = urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme != "https" or parsed.hostname != "www.youtubekids.com":
+            return ""
+        return raw
+    if str(kind or "") == "channel" and raw:
+        return f"https://www.youtubekids.com/channel/{quote(raw, safe='')}"
+    if str(kind or "") == "playlist" and raw:
+        return f"https://www.youtubekids.com/playlist?list={quote(raw, safe='')}"
+    return ""
+
+
+def kids_video_url(video_id: Any) -> str:
+    value = str(video_id or "").strip()
+    return (
+        f"https://www.youtubekids.com/watch?v={quote(value, safe='')}"
+        if value
+        else ""
+    )
 
 
 def _catalog_identity_is_known(item: dict[str, Any], source: dict[str, Any]) -> bool:

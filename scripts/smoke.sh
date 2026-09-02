@@ -13,9 +13,12 @@ echo "[smoke] kids status"
 curl -fsS "${BASE_URL}/api/kids/status" | jq .
 
 echo "[smoke] guardian pages"
-for path in /kids /history /blocklist /schedule /settings; do
+for path in /kids /sources /resolve /history /blocklist /schedule /settings; do
   curl -fsS "${BASE_URL}${path}" >/dev/null
 done
+
+echo "[smoke] kids profiles"
+test "$(curl -fsS "${BASE_URL}/api/kids/profiles" | jq '.profiles | length')" -ge 2
 
 echo "[smoke] removed legacy pages"
 for path in /live /allowlist /devices /automation /mqtt /sponsorblock /rules; do

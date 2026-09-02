@@ -1,0 +1,321 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="panel" style="margin-bottom:14px; background:linear-gradient(to right, #ffffff, #f7fbfa); border-left:4px solid var(--accent);">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px;">
+    <div>
+      <h1 style="margin:0 0 4px 0;">Resolve Backlog</h1>
+      <p class="muted" style="margin:0; font-size:14px;">
+        Live resolver candidate status, playback stream leases, quality verification, and cache tracking.
+      </p>
+    </div>
+    <div class="inline-actions">
+      <a href="/kids" class="small-btn">← Back to Overview</a>
+      <a href="/sources" class="small-btn">Kids Sources →</a>
+    </div>
+  </div>
+</div>
+
+<!-- Resolver Health & Metrics -->
+<div class="kpi-grid">
+  <div class="kpi-card">
+    <p class="kpi-label">Fresh Ready Leases</p>
+    <p class="kpi-value" style="color:var(--success);">
+      {{ kids_status.resolve.fresh_ready if (kids_status is defined and kids_status and kids_status.resolve and kids_status.resolve.fresh_ready is defined) else 0 }}
+    </p>
+    <p class="kpi-sub">Cached stream leases (&gt;5m)</p>
+  </div>
+  <div class="kpi-card">
+    <p class="kpi-label">Total Ready</p>
+    <p class="kpi-value" style="color:#0f766e;">
+      {{ kids_status.resolve.counts.ready if (kids_status is defined and kids_status and kids_status.resolve and kids_status.resolve.counts and kids_status.resolve.counts.ready is defined) else 0 }}
+    </p>
+    <p class="kpi-sub">Stream candidates ready</p>
+  </div>
+  <div class="kpi-card">
+    <p class="kpi-label">Pending / In Progress</p>
+    <p class="kpi-value" style="color:var(--warning);">
+      {{ ((kids_status.resolve.counts.pending or 0) + (kids_status.resolve.counts.running or 0)) if (kids_status is defined and kids_status and kids_status.resolve and kids_status.resolve.counts is defined) else 0 }}
+    </p>
+    <p class="kpi-sub">{{ kids_status.resolve.counts.running or 0 if (kids_status is defined and kids_status and kids_status.resolve and kids_status.resolve.counts is defined) else 0 }} running worker jobs</p>
+  </div>
+  <div class="kpi-card">
+    <p class="kpi-label">Failed / Retry / Blocked</p>
+    <p class="kpi-value" style="color:var(--danger);">
+      {{ ((kids_status.resolve.counts.retry or 0) + (kids_status.resolve.counts.blocked or 0)) if (kids_status is defined and kids_status and kids_status.resolve and kids_status.resolve.counts is defined) else 0 }}
+    </p>
+    <p class="kpi-sub">{{ kids_status.resolve.counts.blocked or 0 if (kids_status is defined and kids_status and kids_status.resolve and kids_status.resolve.counts is defined) else 0 }} blocked by policy</p>
+  </div>
+  <div class="kpi-card">
+    <p class="kpi-label">Last Worker Success</p>
+    <p class="kpi-value" style="font-size:14.5px; font-weight:700; margin-top:6px; color:#1e293b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="{{ kids_status.resolver_last_success_at if (kids_status is defined and kids_status and kids_status.resolver_last_success_at) else '' }}">
+      {% if kids_status is defined and kids_status and kids_status.resolver_last_success_at %}
+        {{ (kids_status.resolver_last_success_at|string)[:19]|replace('T', ' ') }}
+      {% else %}
+        Worker Standby
+      {% endif %}
+    </p>
+    <p class="kpi-sub">Automatic background worker</p>
+  </div>
+</div>
+
+<!-- Backlog Table & Controls -->
+<section class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+    <h2>Backlog Queue (<span id="backlog-count">{{ resolve_rows|length if resolve_rows is defined else 0 }}</span> entries)</h2>
+    <button type="button" class="small-btn" onclick="location.reload()">Refresh Live Queue</button>
+  </div>
+
+  <!-- Filter and Sort Toolbar -->
+  <div class="toolbar">
+    <div class="toolbar-search">
+      <input type="search" id="resolve-search" placeholder="Search by video ID, title, or error code..." aria-label="Search resolve backlog">
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Status:</span>
+      <select id="filter-status" aria-label="Filter by status">
+        <option value="all">All Statuses</option>
+        <option value="ready">Ready</option>
+        <option value="running">Running</option>
+        <option value="pending">Pending</option>
+        <option value="failed">Failed / Retry</option>
+        <option value="blocked">Blocked</option>
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Profile:</span>
+      <select id="filter-profile" aria-label="Filter by profile">
+        <option value="all">All Profiles</option>
+        {% for p in profiles if profiles is defined and profiles %}
+          <option value="{{ p.slug }}">{{ p.display_name }}</option>
+        {% else %}
+          <option value="noah">Noah</option>
+          <option value="felix">Felix</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Min Quality:</span>
+      <select id="filter-quality" aria-label="Filter by quality">
+        <option value="all">All Heights</option>
+        <option value="1080">1080p+</option>
+        <option value="720">720p+</option>
+        <option value="480">480p and below</option>
+      </select>
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Sort:</span>
+      <select id="sort-resolve" aria-label="Sort resolve rows">
+        <option value="updated-desc">Recently Updated</option>
+        <option value="updated-asc">Oldest Updated</option>
+        <option value="expiry-asc">Expires Soonest</option>
+        <option value="attempts-desc">Most Attempts</option>
+        <option value="quality-desc">Highest Quality</option>
+        <option value="title-asc">Title (A–Z)</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:110px;">Thumbnail</th>
+          <th>Video Details &amp; Safe Links</th>
+          <th style="width:95px; min-width:90px;">Profiles</th>
+          <th style="width:110px; min-width:100px;">Status</th>
+          <th style="width:95px;">Quality</th>
+          <th style="width:175px; min-width:160px;">Expiry / Timing</th>
+          <th style="width:75px;">Attempts</th>
+          <th style="min-width:145px; width:160px;">Last Reason / Error</th>
+        </tr>
+      </thead>
+      <tbody id="resolve-tbody">
+        {% for row in resolve_rows if resolve_rows is defined %}
+        {% set disp_status = row.display_status if row.display_status is defined else ('failed' if row.status == 'retry' else row.status) %}
+        <tr class="resolve-row"
+            data-video="{{ row.video_id|lower }}"
+            data-title="{{ (row.title or '')|lower }}"
+            data-status="{{ row.status|lower }}"
+            data-display-status="{{ disp_status|lower }}"
+            data-profiles="{{ (row.profile_slugs or [])|join(',')|lower }}"
+            data-quality="{{ row.quality_height or 0 }}"
+            data-attempts="{{ row.attempt_count or 0 }}"
+            data-expiry="{{ row.expires_at or '' }}"
+            data-updated="{{ row.updated_at or '' }}"
+            data-reason="{{ (row.last_error_code or '')|lower }}">
+          <td>
+            <div class="video-thumb-box">
+              <img src="{{ row.thumbnail_url or ('https://i.ytimg.com/vi/' ~ row.video_id ~ '/mqdefault.jpg') }}"
+                   alt="Thumbnail for {{ row.video_id }}"
+                   loading="lazy"
+                   onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\'video-thumb-fallback\'>No Preview</div>';">
+            </div>
+          </td>
+          <td>
+            <strong style="font-size:14px; color:#13232f;">{{ row.title or 'Catalog Video' }}</strong>
+            <div style="margin-top:3px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+              <code>{{ row.video_id }}</code>
+              {% if row.video_url %}
+                <a href="{{ row.video_url }}" target="_blank" rel="noopener noreferrer" class="yt-kids-link" title="Open in YouTube Kids">
+                  ▶ YT Kids
+                </a>
+              {% endif %}
+              {% if row.youtube_video_url %}
+                <a href="{{ row.youtube_video_url }}" target="_blank" rel="noopener noreferrer" class="yt-channel-link" title="Open on standard YouTube">
+                  YouTube ↗
+                </a>
+              {% endif %}
+              {% if row.candidate_present %}
+                <span class="badge badge-safe" style="font-size:10.5px; padding:1px 5px;" title="Stream candidate lease cached">Cached</span>
+              {% endif %}
+            </div>
+          </td>
+          <td>
+            {% for pslug in (row.profile_slugs or []) %}
+              <span class="badge badge-profile-{{ pslug }}" style="font-size:10.5px; padding:1px 4px; margin-bottom:2px;">{{ pslug|capitalize }}</span>
+            {% else %}
+              <span class="muted" style="font-size:11px;">Unassigned</span>
+            {% endfor %}
+          </td>
+          <td>
+            {% if disp_status == 'ready' %}
+              <span class="badge badge-ready">Ready</span>
+            {% elif disp_status == 'running' %}
+              <span class="badge badge-running">Running</span>
+            {% elif disp_status == 'pending' %}
+              <span class="badge badge-pending">Pending</span>
+            {% elif disp_status == 'failed' %}
+              <span class="badge badge-failed">{% if row.status == 'retry' %}Retry / Failed{% else %}Failed{% endif %}</span>
+            {% elif disp_status == 'blocked' %}
+              <span class="badge badge-block">Blocked</span>
+            {% else %}
+              <span class="badge badge-quality">{{ disp_status }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if row.quality_height %}
+              <span class="badge badge-quality" style="font-weight:700;">{{ row.quality_height }}p</span>
+              {% if row.codec %}
+                <br><span class="muted" style="font-size:11px;">{{ row.codec }}</span>
+              {% endif %}
+            {% else %}
+              <span class="muted">-</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if row.expires_at %}
+              <div style="white-space:nowrap;"><strong style="font-size:11.5px;">Expires:</strong> <span style="font-size:11.5px;">{{ (row.expires_at|string)[:19]|replace('T', ' ') }}</span></div>
+            {% endif %}
+            {% if row.updated_at %}
+              <div class="muted" style="font-size:11px; margin-top:2px; white-space:nowrap;">Updated: {{ (row.updated_at|string)[:19]|replace('T', ' ') }}</div>
+            {% endif %}
+            {% if not row.expires_at and not row.updated_at %}
+              <span class="muted">-</span>
+            {% endif %}
+          </td>
+          <td>
+            <strong style="font-size:14px;">{{ row.attempt_count }}</strong>
+          </td>
+          <td style="min-width:145px;">
+            {% if row.last_error_code %}
+              <code style="color:var(--danger); background:var(--danger-bg); white-space:nowrap; display:inline-block;">{{ row.last_error_code }}</code>
+            {% else %}
+              <span class="muted" style="font-size:12.5px;">OK / None</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr id="no-resolve-row"><td colspan="8" class="muted" style="text-align:center; padding:24px;">No resolve backlog records found.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+function applyResolveFilters() {
+  const search = (document.getElementById('resolve-search').value || '').toLowerCase().trim();
+  const status = document.getElementById('filter-status').value;
+  const profile = document.getElementById('filter-profile').value;
+  const minQuality = document.getElementById('filter-quality').value;
+  const sort = document.getElementById('sort-resolve').value;
+
+  // Synchronize to URL query parameters
+  const params = new URLSearchParams(window.location.search);
+  if (search) params.set('query', search); else params.delete('query');
+  if (status !== 'all') params.set('status', status); else params.delete('status');
+  if (profile !== 'all') params.set('profile', profile); else params.delete('profile');
+  if (minQuality !== 'all') params.set('quality', minQuality); else params.delete('quality');
+  if (sort !== 'updated-desc') params.set('sort', sort); else params.delete('sort');
+
+  const newRelativePathQuery = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
+  window.history.replaceState(null, '', newRelativePathQuery);
+
+  const rows = Array.from(document.querySelectorAll('#resolve-tbody tr.resolve-row'));
+  let visibleCount = 0;
+
+  rows.forEach((row) => {
+    const rVideo = row.dataset.video || '';
+    const rTitle = row.dataset.title || '';
+    const rStatus = row.dataset.status || '';
+    const rDispStatus = row.dataset.displayStatus || '';
+    const rProfiles = (row.dataset.profiles || '').split(',');
+    const rQuality = parseInt(row.dataset.quality || '0');
+    const rReason = row.dataset.reason || '';
+
+    const matchSearch = !search || rVideo.includes(search) || rTitle.includes(search) || rReason.includes(search);
+    const matchStatus = (status === 'all') ||
+      (status === 'failed' ? (rStatus === 'failed' || rStatus === 'retry' || rDispStatus === 'failed') : (rStatus === status || rDispStatus === status));
+    const matchProfile = (profile === 'all') || rProfiles.includes(profile.toLowerCase());
+
+    let matchQuality = true;
+    if (minQuality === '1080') matchQuality = rQuality >= 1080;
+    else if (minQuality === '720') matchQuality = rQuality >= 720;
+    else if (minQuality === '480') matchQuality = rQuality > 0 && rQuality <= 480;
+
+    if (matchSearch && matchStatus && matchProfile && matchQuality) {
+      row.style.display = '';
+      visibleCount++;
+    } else {
+      row.style.display = 'none';
+    }
+  });
+
+  // Sort rows
+  const tbody = document.getElementById('resolve-tbody');
+  rows.sort((a, b) => {
+    if (sort === 'title-asc') return (a.dataset.title || '').localeCompare(b.dataset.title || '');
+    if (sort === 'attempts-desc') return parseInt(b.dataset.attempts || '0') - parseInt(a.dataset.attempts || '0');
+    if (sort === 'quality-desc') return parseInt(b.dataset.quality || '0') - parseInt(a.dataset.quality || '0');
+    if (sort === 'expiry-asc') return (a.dataset.expiry || '9999').localeCompare(b.dataset.expiry || '9999');
+    if (sort === 'updated-asc') return (a.dataset.updated || '').localeCompare(b.dataset.updated || '');
+    return (b.dataset.updated || '').localeCompare(a.dataset.updated || ''); // updated-desc
+  });
+  rows.forEach(r => tbody.appendChild(r));
+
+  const countEl = document.getElementById('backlog-count');
+  if (countEl) countEl.textContent = visibleCount;
+}
+
+function initResolveFilters() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has('query')) document.getElementById('resolve-search').value = params.get('query');
+  if (params.has('search')) document.getElementById('resolve-search').value = params.get('search');
+  if (params.has('status')) document.getElementById('filter-status').value = params.get('status');
+  if (params.has('profile')) document.getElementById('filter-profile').value = params.get('profile');
+  if (params.has('quality')) document.getElementById('filter-quality').value = params.get('quality');
+  if (params.has('sort')) document.getElementById('sort-resolve').value = params.get('sort');
+
+  document.getElementById('resolve-search').addEventListener('input', applyResolveFilters);
+  document.getElementById('filter-status').addEventListener('change', applyResolveFilters);
+  document.getElementById('filter-profile').addEventListener('change', applyResolveFilters);
+  document.getElementById('filter-quality').addEventListener('change', applyResolveFilters);
+  document.getElementById('sort-resolve').addEventListener('change', applyResolveFilters);
+
+  applyResolveFilters();
+}
+
+window.addEventListener('DOMContentLoaded', initResolveFilters);
+if (document.readyState !== 'loading') initResolveFilters();
+</script>
+{% endblock %}

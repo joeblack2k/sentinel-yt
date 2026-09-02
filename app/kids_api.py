@@ -17,6 +17,7 @@ from .models import (
     KidsDataplaneEventRequest,
     KidsKillSwitchRequest,
     KidsPlaybackSessionRequest,
+    KidsSourceProfilesRequest,
     KidsWatchEventRequest,
 )
 from .services.kids_classifier import OpenCodexKidsClassifier
@@ -84,6 +85,17 @@ def _kids_lease_failure(result: dict[str, Any]) -> HTTPException:
     )
 
 
+async def _kids_profile(request: Request, profile: str, *, require_enabled: bool = True) -> dict[str, Any]:
+    value = str(profile or "").strip().lower()
+    row = await request.app.state.runtime.db.kids_profile_get(value)
+    if row is None or (require_enabled and not row["enabled"]):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "kids_profile_not_found", "message": "Kids profile is unavailable."},
+        )
+    return row
+
+
 async def _kids_checked_lease(
     request: Request,
     lease_id: str,
@@ -142,11 +154,13 @@ async def kids_feed(
     profile: str = Query(default="noah", min_length=1, max_length=64),
 ) -> dict[str, Any]:
     runtime: Any = request.app.state.runtime
+    profile = str(profile or "").strip().lower()
     await runtime.reconcile_kids_catalog_policy()
     state = await runtime.kids_policy_state()
     if cursor:
         session_id, offset = _decode_kids_cursor(cursor)
     else:
+        profile = (await _kids_profile(request, profile))["slug"]
         session = await runtime.db.kids_feed_session_create(
             profile=profile,
             policy_version=KIDS_DATAPLANE_POLICY_VERSION,
@@ -370,8 +384,10 @@ async def kids_dataplane_event(
     request: Request,
 ) -> dict[str, Any]:
     runtime: Any = request.app.state.runtime
+    profile = (await _kids_profile(request, payload.profile))["slug"]
     asset = await runtime.db.kids_feed_asset(
         payload.asset_id,
+        profile=profile,
         require_current_authorization=payload.event == "selected",
         minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
         minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
@@ -386,7 +402,7 @@ async def kids_dataplane_event(
             lease_context is None
             or lease_context["item_id"] != asset["item_id"]
             or lease_context["feed_session_id"] != asset["feed_session_id"]
-            or lease_context["profile"] != payload.profile
+            or lease_context["profile"] != profile
         ):
             raise HTTPException(
                 status_code=409,
@@ -417,7 +433,7 @@ async def kids_dataplane_event(
     event = await runtime.db.kids_watch_event_record(
         video_id=asset["video_id"],
         event=payload.event,
-        profile=payload.profile,
+        profile=profile,
         position_seconds=payload.position_seconds,
         session_id=payload.session_id,
         startup_ms=payload.startup_ms,
@@ -429,8 +445,12 @@ async def kids_dataplane_event(
 
 
 @router.get("/api/kids/catalog/items")
-async def api_catalog_items(request: Request) -> dict[str, Any]:
+async def api_catalog_items(
+    request: Request,
+    profile: str = Query(default="noah", min_length=1, max_length=64),
+) -> dict[str, Any]:
     runtime: Any = request.app.state.runtime
+    profile = (await _kids_profile(request, profile))["slug"]
     if await runtime.db.kids_kill_switch_enabled():
         return {"state": "kill_switch", "items": []}
     if not await runtime.monitoring_enabled_now():
@@ -438,7 +458,10 @@ async def api_catalog_items(request: Request) -> dict[str, Any]:
     await runtime.reconcile_kids_catalog_policy()
     return {
         "state": "ready",
-        "items": await runtime.db.kids_eligible_feed_list(runtime.settings.kids_playback_min_remaining_seconds),
+        "items": await runtime.db.kids_eligible_feed_list(
+            runtime.settings.kids_playback_min_remaining_seconds,
+            profile=profile,
+        ),
     }
 
 
@@ -463,8 +486,30 @@ async def api_catalog_item_by_video(video_id: str, request: Request) -> dict[str
 
 
 @router.get("/api/kids/sources")
-async def api_catalog_sources(request: Request) -> dict[str, Any]:
-    return {"sources": await request.app.state.runtime.db.catalog_sources_list()}
+async def api_catalog_sources(
+    request: Request,
+    state: str | None = Query(default=None),
+    verdict: str | None = Query(default=None),
+    kind: str | None = Query(default=None),
+    profile: str | None = Query(default=None),
+    query: str | None = Query(default=None, max_length=200),
+    sort: str = Query(default="id-desc", max_length=32),
+    limit: int = Query(default=500, ge=1, le=1000),
+) -> dict[str, Any]:
+    runtime: Any = request.app.state.runtime
+    if profile:
+        profile = (await _kids_profile(request, profile))["slug"]
+    return {
+        "sources": await runtime.db.catalog_sources_list(
+            state=state,
+            verdict=verdict,
+            kind=kind,
+            profile=profile,
+            query=query,
+            sort=sort,
+            limit=limit,
+        )
+    }
 
 
 @router.post("/api/kids/sources")
@@ -474,6 +519,59 @@ async def api_catalog_source(payload: CatalogSourceRequest, request: Request) ->
         return await request.app.state.runtime.db.catalog_create("source", {**payload.model_dump(), "correlation_id": correlation_id})
     except Exception as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/api/kids/profiles")
+async def api_kids_profiles(request: Request) -> dict[str, Any]:
+    return {"profiles": await request.app.state.runtime.db.kids_profiles_list()}
+
+
+@router.put("/api/kids/sources/{source_id}/profiles")
+async def api_kids_source_profiles(
+    source_id: int,
+    payload: KidsSourceProfilesRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        result = await request.app.state.runtime.db.kids_source_profiles_set(
+            source_id,
+            payload.profile_slugs,
+            actor=payload.actor,
+            reason=payload.reason,
+            correlation_id=payload.correlation_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="catalog source not found")
+    return result
+
+
+@router.get("/api/kids/resolve")
+async def api_kids_resolve(
+    request: Request,
+    status: str | None = Query(default=None),
+    profile: str | None = Query(default=None),
+    query: str | None = Query(default=None, max_length=200),
+    sort: str = Query(default="updated-desc", max_length=32),
+    limit: int = Query(default=500, ge=1, le=500),
+) -> dict[str, Any]:
+    runtime: Any = request.app.state.runtime
+    if profile:
+        profile = (await _kids_profile(request, profile))["slug"]
+    return {
+        "summary": await runtime.db.kids_resolve_summary(
+            minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+            profile=profile,
+        ),
+        "rows": await runtime.db.kids_resolve_recent_rows(
+            limit,
+            status=status,
+            profile=profile,
+            query=query,
+            sort=sort,
+        ),
+    }
 
 
 @router.post("/api/kids/catalog/items")
@@ -546,6 +644,7 @@ async def api_kids_status(request: Request) -> dict[str, Any]:
         "resolve": await runtime.db.kids_resolve_summary(
             minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
         ),
+        "profiles": await runtime.db.kids_profiles_list(),
         "resolver_last_success_at": await runtime.db.get_setting("kids_resolver_last_success_at"),
     }
 
@@ -634,10 +733,11 @@ async def api_kids_watch_event(
     payload: KidsWatchEventRequest,
     request: Request,
 ) -> dict[str, Any]:
+    profile = (await _kids_profile(request, payload.profile))["slug"]
     event = await request.app.state.runtime.db.kids_watch_event_record(
         video_id=payload.video_id,
         event=payload.event,
-        profile=payload.profile,
+        profile=profile,
         position_seconds=payload.position_seconds,
         session_id=payload.session_id,
         startup_ms=payload.startup_ms,
@@ -649,8 +749,23 @@ async def api_kids_watch_event(
 
 
 @router.get("/api/kids/watch-events")
-async def api_kids_watch_events(request: Request, limit: int = 100) -> dict[str, Any]:
-    return {"events": await request.app.state.runtime.db.kids_watch_events_list(limit)}
+async def api_kids_watch_events(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    profile: str | None = Query(default=None),
+    query: str | None = Query(default=None, max_length=200),
+    sort: str = Query(default="id-desc", max_length=32),
+) -> dict[str, Any]:
+    if profile:
+        profile = (await _kids_profile(request, profile))["slug"]
+    return {
+        "events": await request.app.state.runtime.db.kids_watch_events_list(
+            limit,
+            profile=profile,
+            query=query,
+            sort=sort,
+        )
+    }
 
 
 @router.get("/api/kids/playback-authorizations/{video_id}")
@@ -658,18 +773,24 @@ async def api_kids_playback_authorization(
     video_id: str,
     request: Request,
     include_candidate: bool = True,
+    profile: str = Query(default="noah", min_length=1, max_length=64),
 ) -> dict[str, Any]:
     runtime: Any = request.app.state.runtime
+    profile = (await _kids_profile(request, profile))["slug"]
     if await runtime.db.kids_kill_switch_enabled() or not await runtime.monitoring_enabled_now():
         raise HTTPException(status_code=403, detail="Kids playback is unavailable")
     await runtime.reconcile_kids_catalog_policy()
     if include_candidate:
         row = await runtime.db.kids_playback_authorization(
             video_id,
+            profile=profile,
             minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
         )
     else:
-        row = await runtime.db.kids_playback_policy_authorization(video_id)
+        row = await runtime.db.kids_playback_policy_authorization(
+            video_id,
+            profile=profile,
+        )
     if row is None:
         raise HTTPException(status_code=403, detail="Kids playback is not authorized")
     response = {

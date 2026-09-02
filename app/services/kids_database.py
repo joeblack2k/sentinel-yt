@@ -4,6 +4,7 @@ import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import parse_qs, quote, urlparse
 
 import aiosqlite
 
@@ -14,11 +15,290 @@ from .kids_catalog import (
     _parse_utc,
     _quality_height_or_default,
     _stored_candidate_meets_policy,
+    kids_source_url,
+    kids_video_url,
 )
 from .time_utils import utc_now_iso
 
 
+DEFAULT_KIDS_PROFILES = (
+    ("noah", "Noah", 6, "noah", 0),
+    ("felix", "Felix", 2, "felix", 1),
+)
+DEFAULT_KIDS_PROFILE_SLUGS = frozenset(profile[0] for profile in DEFAULT_KIDS_PROFILES)
+
+
+def _profile_slugs(value: Any) -> list[str]:
+    return [part for part in str(value or "").split(",") if part]
+
+
+def _youtube_source_url(kind: Any, reference: Any) -> str:
+    raw = str(reference or "").strip()
+    parsed = urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        if parsed.hostname != "www.youtubekids.com":
+            return ""
+        parts = [part for part in parsed.path.split("/") if part]
+        if kind == "channel" and len(parts) == 2 and parts[0] == "channel":
+            return f"https://www.youtube.com/channel/{quote(parts[1], safe='')}"
+        if kind == "playlist":
+            playlist_id = parse_qs(parsed.query).get("list", [""])[0]
+            if playlist_id:
+                return f"https://www.youtube.com/playlist?list={quote(playlist_id, safe='')}"
+        return ""
+    if kind == "channel" and raw.startswith("UC"):
+        return f"https://www.youtube.com/channel/{quote(raw, safe='')}"
+    if kind == "playlist" and raw.startswith("PL"):
+        return f"https://www.youtube.com/playlist?list={quote(raw, safe='')}"
+    return ""
+
+
 class KidsDatabaseMixin:
+    async def _ensure_kids_profile_defaults(self) -> None:
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany(
+                """
+                INSERT OR IGNORE INTO kids_profiles(
+                    slug,display_name,age_years,avatar_key,enabled,sort_order,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (slug, name, age, avatar, 1, order, now, now)
+                    for slug, name, age, avatar, order in DEFAULT_KIDS_PROFILES
+                ],
+            )
+            marker = await (
+                await db.execute(
+                    "SELECT value FROM settings WHERE key='kids_profile_backfill_v1'"
+                )
+            ).fetchone()
+            if marker is None:
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO catalog_source_profiles(
+                        source_id,profile_slug,actor,reason,assigned_at
+                    )
+                    SELECT id,'noah','kids-profile-migration',
+                           'Existing source retained for Noah during profile rollout',?
+                    FROM catalog_sources
+                    WHERE reference != ?
+                    """,
+                    (now, KIDS_HOME_SOURCE_REFERENCE),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO settings(key,value) VALUES('kids_profile_backfill_v1','1')
+                    ON CONFLICT(key) DO NOTHING
+                    """
+                )
+            await db.commit()
+
+    async def kids_profile_get(self, profile: str) -> dict[str, Any] | None:
+        slug = str(profile or "").strip().lower()
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute(
+                    """
+                    SELECT slug,display_name,age_years,avatar_key,enabled,sort_order,
+                           created_at,updated_at
+                    FROM kids_profiles WHERE slug=?
+                    """,
+                    (slug,),
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            source_count = await (
+                await db.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM catalog_source_profiles ps
+                    JOIN catalog_sources s ON s.id=ps.source_id
+                    WHERE ps.profile_slug=? AND s.reference != ?
+                    """,
+                    (slug, KIDS_HOME_SOURCE_REFERENCE),
+                )
+            ).fetchone()
+            approved_count = await (
+                await db.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM catalog_source_profiles ps
+                    JOIN catalog_sources s ON s.id=ps.source_id
+                    WHERE ps.profile_slug=? AND ps.source_id != 0
+                      AND s.state='approved' AND s.safety_verdict='SAFE'
+                      AND s.reference != ?
+                    """,
+                    (slug, KIDS_HOME_SOURCE_REFERENCE),
+                )
+            ).fetchone()
+        return {
+            "slug": row[0],
+            "display_name": row[1],
+            "age_years": int(row[2]),
+            "avatar_key": row[3] or "",
+            "enabled": bool(row[4]),
+            "sort_order": int(row[5]),
+            "created_at": row[6],
+            "updated_at": row[7],
+            "source_count": int(source_count[0] if source_count else 0),
+            "approved_source_count": int(approved_count[0] if approved_count else 0),
+        }
+
+    async def kids_profiles_list(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT p.slug,p.display_name,p.age_years,p.avatar_key,p.enabled,
+                       p.sort_order,p.created_at,p.updated_at,
+                       COUNT(DISTINCT CASE
+                           WHEN s.reference != ? THEN ps.source_id END) AS source_count,
+                       COUNT(DISTINCT CASE
+                           WHEN s.state='approved' AND s.safety_verdict='SAFE'
+                                AND s.reference != ?
+                           THEN s.id END) AS approved_source_count
+                FROM kids_profiles p
+                LEFT JOIN catalog_source_profiles ps ON ps.profile_slug=p.slug
+                LEFT JOIN catalog_sources s ON s.id=ps.source_id
+                GROUP BY p.slug
+                ORDER BY p.sort_order ASC,p.slug ASC
+                """,
+                (KIDS_HOME_SOURCE_REFERENCE, KIDS_HOME_SOURCE_REFERENCE),
+            )
+            rows = await cur.fetchall()
+            columns = [description[0] for description in cur.description]
+        return [
+            {
+                **dict(zip(columns, row)),
+                "age_years": int(row[2]),
+                "enabled": bool(row[4]),
+                "sort_order": int(row[5]),
+                "source_count": int(row[8]),
+                "approved_source_count": int(row[9]),
+            }
+            for row in rows
+        ]
+
+    async def kids_source_profile_slugs(self, source_id: int) -> list[str]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT profile_slug
+                FROM catalog_source_profiles
+                WHERE source_id=?
+                ORDER BY profile_slug ASC
+                """,
+                (source_id,),
+            )
+            return [str(row[0]) for row in await cur.fetchall()]
+
+    async def kids_source_profiles_set(
+        self,
+        source_id: int,
+        profiles: list[str],
+        *,
+        actor: str,
+        reason: str,
+        correlation_id: str,
+    ) -> dict[str, Any] | None:
+        requested = list(dict.fromkeys(str(profile or "").strip().lower() for profile in profiles))
+        if any(profile not in DEFAULT_KIDS_PROFILE_SLUGS for profile in requested):
+            raise ValueError("unknown Kids profile")
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            source = await (
+                await db.execute(
+                    "SELECT id,kind,reference FROM catalog_sources WHERE id=?",
+                    (source_id,),
+                )
+            ).fetchone()
+            if source is None:
+                await db.rollback()
+                return None
+            if source[2] == KIDS_HOME_SOURCE_REFERENCE:
+                await db.rollback()
+                raise ValueError("the YouTube Kids home source cannot be assigned to a profile")
+            cur = await db.execute(
+                """
+                SELECT profile_slug
+                FROM catalog_source_profiles
+                WHERE source_id=?
+                """,
+                (source_id,),
+            )
+            current = {str(row[0]) for row in await cur.fetchall()}
+            desired = set(requested)
+            if current != desired:
+                revision = await self._catalog_revision(db)
+                if desired:
+                    placeholders = ",".join("?" for _ in desired)
+                    await db.execute(
+                        f"""
+                        DELETE FROM catalog_source_profiles
+                        WHERE source_id=? AND profile_slug NOT IN ({placeholders})
+                        """,
+                        (source_id, *sorted(desired)),
+                    )
+                else:
+                    await db.execute(
+                        "DELETE FROM catalog_source_profiles WHERE source_id=?",
+                        (source_id,),
+                    )
+                for profile in sorted(desired):
+                    await db.execute(
+                        """
+                        INSERT INTO catalog_source_profiles(
+                            source_id,profile_slug,actor,reason,assigned_at
+                        ) VALUES(?,?,?,?,?)
+                        ON CONFLICT(source_id,profile_slug) DO UPDATE SET
+                            actor=excluded.actor,
+                            reason=excluded.reason,
+                            assigned_at=excluded.assigned_at
+                        """,
+                        (source_id, profile, actor, reason[:1000], now),
+                    )
+                removed = current - desired
+                for profile in sorted(removed):
+                    await db.execute(
+                        """
+                        UPDATE relay_leases
+                        SET state='revoked',revoked_reason='profile_unassigned',heartbeat_at=?
+                        WHERE state='active'
+                          AND item_id IN (
+                              SELECT id FROM catalog_items WHERE source_id=?
+                          )
+                          AND feed_session_id IN (
+                              SELECT id FROM feed_sessions WHERE profile=?
+                          )
+                        """,
+                        (now, source_id, profile),
+                    )
+                await db.execute(
+                    """
+                    INSERT INTO kids_audit_events(
+                        event,entity_type,entity_id,actor,reason,revision,correlation_id,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "source_profiles_changed",
+                        "source",
+                        source_id,
+                        actor,
+                        f"{reason[:900]} profiles={','.join(sorted(desired)) or 'none'}",
+                        revision,
+                        correlation_id,
+                        now,
+                    ),
+                )
+            await db.commit()
+        source_row = await self.catalog_get("source", source_id)
+        if source_row is None:
+            return None
+        source_row["profile_slugs"] = sorted(desired)
+        return source_row
+
     async def _catalog_revision(self, db: aiosqlite.Connection) -> int:
         await db.execute("INSERT OR IGNORE INTO catalog_meta(key, value) VALUES ('revision', 0)")
         row = await (await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")).fetchone()
@@ -33,19 +313,36 @@ class KidsDatabaseMixin:
 
     async def catalog_create(self, entity: str, values: dict[str, Any]) -> dict[str, Any]:
         now = utc_now_iso()
+        if entity == "source":
+            requested_profiles = values.get("profile_slugs", values.get("profiles"))
+            if requested_profiles is None:
+                requested_profiles = ["noah"]
+            if not isinstance(requested_profiles, list):
+                raise ValueError("profiles must be a list")
+            requested_profiles = list(
+                dict.fromkeys(
+                    str(profile or "").strip().lower() for profile in requested_profiles
+                )
+            )
+            if any(profile not in DEFAULT_KIDS_PROFILE_SLUGS for profile in requested_profiles):
+                raise ValueError("unknown Kids profile")
+            if str(values["reference"]).strip() == KIDS_HOME_SOURCE_REFERENCE:
+                requested_profiles = []
         async with aiosqlite.connect(self.db_path) as db:
             revision = await self._catalog_revision(db)
             if entity == "source":
                 cur = await db.execute(
                     """
                     INSERT INTO catalog_sources(
-                        kind,reference,title,language,actor,changed_at,reason,revision,correlation_id
-                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                        kind,reference,title,avatar_url,language,
+                        actor,changed_at,reason,revision,correlation_id
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         values["kind"],
                         values["reference"].strip(),
                         values.get("title", "").strip(),
+                        str(values.get("avatar_url", "") or "").strip()[:2000],
                         values.get("language", "unknown"),
                         "system",
                         now,
@@ -54,6 +351,22 @@ class KidsDatabaseMixin:
                         values["correlation_id"],
                     ),
                 )
+                entity_id = cur.lastrowid
+                for profile in requested_profiles:
+                    await db.execute(
+                        """
+                        INSERT INTO catalog_source_profiles(
+                            source_id,profile_slug,actor,reason,assigned_at
+                        ) VALUES(?,?,?,?,?)
+                        """,
+                        (
+                            entity_id,
+                            profile,
+                            "system",
+                            "Default profile assignment",
+                            now,
+                        ),
+                    )
             else:
                 cur = await db.execute(
                     """
@@ -69,7 +382,7 @@ class KidsDatabaseMixin:
                      values.get("visual_category", "general").strip() or "general",
                      "system", now, "candidate created", revision, values["correlation_id"]),
                 )
-            entity_id = cur.lastrowid
+                entity_id = cur.lastrowid
             await db.execute(
                 """
                 INSERT INTO kids_audit_events(event, entity_type, entity_id, actor, reason, revision, correlation_id, created_at)
@@ -390,6 +703,7 @@ class KidsDatabaseMixin:
         self,
         minimum_remaining_seconds: int,
         minimum_quality_height: int = 720,
+        profile: str = "noah",
     ) -> list[dict[str, Any]]:
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         async with aiosqlite.connect(self.db_path) as db:
@@ -400,6 +714,8 @@ class KidsDatabaseMixin:
                        s.safety_verdict AS _source_safety_verdict,
                        b.candidate_json AS _candidate_json,b.quality_height AS _backlog_quality_height
                 FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
+                JOIN catalog_source_profiles ps
+                  ON ps.source_id=s.id AND ps.profile_slug=?
                 JOIN kids_resolve_backlog b ON b.item_id=i.id
                 WHERE i.state='approved' AND s.state='approved' AND s.safety_verdict='SAFE'
                   AND s.reference!=? AND b.status='ready' AND b.quality_height>=? AND b.expires_at>?
@@ -412,6 +728,7 @@ class KidsDatabaseMixin:
                     b.resolved_at DESC,i.id ASC
                 """,
                 (
+                    profile,
                     KIDS_HOME_SOURCE_REFERENCE,
                     minimum_quality_height,
                     (datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat(),
@@ -475,6 +792,8 @@ class KidsDatabaseMixin:
                            b.candidate_json AS _candidate_json,
                            b.quality_height AS _backlog_quality_height
                     FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
+                    JOIN catalog_source_profiles ps
+                      ON ps.source_id=s.id AND ps.profile_slug=?
                     JOIN kids_resolve_backlog b ON b.item_id=i.id
                     WHERE i.state='approved' AND s.state='approved'
                       AND s.safety_verdict='SAFE' AND s.reference!=?
@@ -487,7 +806,7 @@ class KidsDatabaseMixin:
                         MAX(b.resolved_at) OVER (PARTITION BY i.source_id) DESC,
                         b.resolved_at DESC,i.id ASC
                     """,
-                    (KIDS_HOME_SOURCE_REFERENCE, minimum_quality_height, expires_after),
+                    (profile, KIDS_HOME_SOURCE_REFERENCE, minimum_quality_height, expires_after),
                 )
                 rows = await cur.fetchall()
                 columns = [description[0] for description in cur.description]
@@ -591,6 +910,10 @@ class KidsDatabaseMixin:
                     WHERE f.feed_session_id=? AND f.ordinal>=?
                       AND i.state='approved' AND s.state='approved'
                       AND s.safety_verdict='SAFE' AND s.reference!=?
+                      AND EXISTS (
+                          SELECT 1 FROM catalog_source_profiles ps
+                          WHERE ps.source_id=i.source_id AND ps.profile_slug=?
+                      )
                       AND b.status='ready' AND b.expires_at>?
                     ORDER BY f.ordinal ASC
                     LIMIT ?
@@ -599,6 +922,7 @@ class KidsDatabaseMixin:
                         session_id,
                         scan_ordinal,
                         KIDS_HOME_SOURCE_REFERENCE,
+                        profile,
                         expires_after,
                         batch_size,
                     ),
@@ -663,15 +987,21 @@ class KidsDatabaseMixin:
         self,
         asset_id: str,
         *,
+        profile: str | None = None,
         require_current_authorization: bool = True,
         minimum_remaining_seconds: int = 0,
         minimum_quality_height: int = 720,
     ) -> dict[str, Any] | None:
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         now = datetime.now(timezone.utc)
+        profile_filter = ""
+        profile_args: tuple[Any, ...] = ()
+        if profile:
+            profile_filter = " AND fs.profile=?"
+            profile_args = (profile,)
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
-                """
+                f"""
                 SELECT f.asset_id,f.feed_session_id,fs.profile,fs.catalog_revision,
                        fs.policy_version,fs.expires_at,
                        i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
@@ -689,10 +1019,16 @@ class KidsDatabaseMixin:
                 JOIN catalog_sources s ON s.id=i.source_id
                 LEFT JOIN kids_resolve_backlog b ON b.item_id=i.id
                 WHERE f.asset_id=? AND fs.expires_at>?
+                  AND EXISTS (
+                      SELECT 1 FROM catalog_source_profiles ps
+                      WHERE ps.source_id=i.source_id AND ps.profile_slug=fs.profile
+                  )
+                  {profile_filter}
                 """,
                 (
                     asset_id,
                     (now + timedelta(seconds=max(0, int(minimum_remaining_seconds)))).isoformat(),
+                    *profile_args,
                 ),
             )
             row = await cur.fetchone()
@@ -778,6 +1114,10 @@ class KidsDatabaseMixin:
                 JOIN catalog_sources s ON s.id=i.source_id
                 LEFT JOIN kids_resolve_backlog b ON b.item_id=i.id
                 WHERE f.asset_id=?
+                  AND EXISTS (
+                      SELECT 1 FROM catalog_source_profiles ps
+                      WHERE ps.source_id=i.source_id AND ps.profile_slug=fs.profile
+                  )
                 """,
                 (asset_id,),
             )
@@ -900,14 +1240,20 @@ class KidsDatabaseMixin:
                 """
                 SELECT l.id,l.item_id,l.feed_session_id,l.state,l.candidate_json,
                        l.quality_height,l.expires_at,
+                       fs.profile,
                        i.video_id,i.title,i.channel_id,i.channel_title,i.state AS item_state,
                        s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
                        s.safety_verdict AS _source_safety_verdict
                 FROM relay_leases l
+                JOIN feed_sessions fs ON fs.id=l.feed_session_id
                 JOIN catalog_items i ON i.id=l.item_id
                 JOIN catalog_sources s ON s.id=i.source_id
                 WHERE l.id=?
+                  AND EXISTS (
+                      SELECT 1 FROM catalog_source_profiles ps
+                      WHERE ps.source_id=i.source_id AND ps.profile_slug=fs.profile
+                  )
                 """,
                 (lease_id,),
             )
@@ -1308,41 +1654,182 @@ class KidsDatabaseMixin:
             )
             await db.commit()
 
-    async def kids_resolve_summary(self, *, minimum_remaining_seconds: int = 300) -> dict[str, Any]:
+    async def kids_resolve_summary(
+        self,
+        *,
+        minimum_remaining_seconds: int = 300,
+        profile: str | None = None,
+    ) -> dict[str, Any]:
         now = (datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat()
         async with aiosqlite.connect(self.db_path) as db:
+            profile_filter = ""
+            args: list[Any] = []
+            if profile:
+                profile_filter = """
+                    AND EXISTS (
+                        SELECT 1 FROM catalog_source_profiles ps
+                        WHERE ps.source_id=i.source_id AND ps.profile_slug=?
+                    )
+                """
+                args.append(profile)
             cur = await db.execute(
-                "SELECT status,COUNT(*) FROM kids_resolve_backlog GROUP BY status"
+                f"""
+                SELECT b.status,COUNT(*)
+                FROM kids_resolve_backlog b
+                JOIN catalog_items i ON i.id=b.item_id
+                WHERE 1=1 {profile_filter}
+                GROUP BY b.status
+                """,
+                tuple(args),
             )
             counts = {str(status): int(count) for status, count in await cur.fetchall()}
             row = await (
                 await db.execute(
-                    "SELECT COUNT(*) FROM kids_resolve_backlog WHERE status='ready' AND expires_at>?",
-                    (now,),
+                    f"""
+                    SELECT COUNT(*)
+                    FROM kids_resolve_backlog b
+                    JOIN catalog_items i ON i.id=b.item_id
+                    WHERE b.status='ready' AND b.expires_at>? {profile_filter}
+                    """,
+                    tuple([now, *args]),
                 )
             ).fetchone()
+        counts.setdefault("failed", counts.get("retry", 0))
         return {"counts": counts, "fresh_ready": int(row[0] if row else 0)}
 
-    async def kids_resolve_recent_rows(self, limit: int = 20) -> list[dict[str, Any]]:
-        bounded = max(1, min(int(limit), 100))
+    async def kids_resolve_recent_rows(
+        self,
+        limit: int = 20,
+        *,
+        status: str | None = None,
+        profile: str | None = None,
+        query: str | None = None,
+        sort: str = "updated-desc",
+    ) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 500))
+        status_value = str(status or "").strip().lower()
+        if status_value == "failed":
+            status_value = "retry"
+        if status_value not in {"pending", "running", "ready", "retry", "blocked"}:
+            status_value = ""
+        sort_key = str(sort or "updated-desc").strip().lower()
+        sort_desc = sort_key.endswith("-desc") or sort_key in {"updated", "expiry", "attempts", "quality"}
+        sort_base = sort_key.rsplit("-", 1)[0] if sort_key.endswith(("-asc", "-desc")) else sort_key
+        order_by = {
+            "updated": "b.updated_at",
+            "expiry": "COALESCE(b.expires_at,'9999-12-31T23:59:59+00:00')",
+            "attempts": "b.attempt_count",
+            "quality": "COALESCE(b.quality_height,0)",
+            "title": "LOWER(COALESCE(i.title,''))",
+            "status": "b.status",
+            "id": "b.item_id",
+        }.get(sort_base, "b.updated_at")
+        order_direction = "DESC" if sort_desc else "ASC"
+        where = []
+        args: list[Any] = []
+        if status_value:
+            where.append("b.status=?")
+            args.append(status_value)
+        if profile:
+            where.append(
+                """
+                EXISTS (
+                    SELECT 1 FROM catalog_source_profiles ps
+                    WHERE ps.source_id=i.source_id AND ps.profile_slug=?
+                )
+                """
+            )
+            args.append(profile)
+        if query:
+            escaped = (
+                str(query).strip().casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            if escaped:
+                where.append(
+                    """
+                    LOWER(
+                        COALESCE(b.video_id,'') || ' ' ||
+                        COALESCE(i.title,'') || ' ' ||
+                        COALESCE(i.channel_title,'') || ' ' ||
+                        COALESCE(s.title,'') || ' ' ||
+                        COALESCE(b.last_error_code,'')
+                    ) LIKE ? ESCAPE CHAR(92)
+                    """
+                )
+                args.append(f"%{escaped}%")
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
-                """
-                SELECT b.item_id,b.video_id,i.title,b.status,b.quality_height,b.codec,b.expires_at,
-                       b.attempt_count,b.last_error_code,b.updated_at
-                FROM kids_resolve_backlog b JOIN catalog_items i ON i.id=b.item_id
-                ORDER BY b.updated_at DESC LIMIT ?
+                f"""
+                SELECT b.item_id,b.video_id,i.title,i.channel_id,i.channel_title,
+                       i.thumbnail_url,i.duration_seconds,i.visual_category,i.state AS item_state,
+                       b.status,b.quality_height,b.codec,b.resolved_at,b.expires_at,
+                       b.attempt_count,b.next_attempt_at,b.last_error_code,b.updated_at,
+                       s.id AS source_id,s.kind AS source_kind,s.title AS source_title,
+                       s.reference AS source_reference,s.state AS source_state,
+                       s.safety_verdict AS source_safety_verdict,s.language AS source_language,
+                       s.avatar_url,
+                       COALESCE((
+                           SELECT thumbnail_url
+                           FROM catalog_items icon_item
+                           WHERE icon_item.source_id=s.id AND trim(coalesce(icon_item.thumbnail_url,''))!=''
+                           ORDER BY icon_item.id DESC LIMIT 1
+                       ), '') AS fallback_avatar_url,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                           FROM catalog_source_profiles ps
+                           WHERE ps.source_id=s.id
+                       ), '') AS profile_slugs
+                FROM kids_resolve_backlog b
+                JOIN catalog_items i ON i.id=b.item_id
+                LEFT JOIN catalog_sources s ON s.id=i.source_id
+                {where_sql}
+                ORDER BY {order_by} {order_direction},b.item_id ASC
+                LIMIT ?
                 """,
-                (bounded,),
+                (*args, bounded),
             )
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in rows]
+        profile_names = {
+            profile["slug"]: profile["display_name"]
+            for profile in await self.kids_profiles_list()
+        }
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            profiles = [
+                value for value in str(item.pop("profile_slugs") or "").split(",") if value
+            ]
+            video_id = str(item.get("video_id") or "")
+            channel_id = str(item.get("channel_id") or item.get("source_reference") or "")
+            item["profile_slugs"] = profiles
+            item["display_status"] = "failed" if item["status"] == "retry" else item["status"]
+            item["video_url"] = kids_video_url(video_id)
+            item["youtube_video_url"] = (
+                f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+            )
+            item["channel_url"] = kids_source_url("channel", channel_id)
+            item["youtube_channel_url"] = (
+                f"https://www.youtube.com/channel/{channel_id}" if channel_id.startswith("UC") else ""
+            )
+            item["source_url"] = kids_source_url(item.get("source_kind"), item.get("source_reference"))
+            item["youtube_source_url"] = _youtube_source_url(
+                item.get("source_kind"), item.get("source_reference")
+            )
+            item["avatar_url"] = item.get("avatar_url") or item.pop("fallback_avatar_url", "")
+            item["profile_names"] = [
+                profile_names[profile] for profile in profiles if profile in profile_names
+            ]
+            item["candidate_present"] = item["status"] == "ready" and bool(item.get("quality_height"))
+            result.append(item)
+        return result
 
     async def kids_playback_authorization(
         self,
         video_id: str,
         *,
+        profile: str = "noah",
         minimum_remaining_seconds: int,
         minimum_quality_height: int = 720,
     ) -> dict[str, Any] | None:
@@ -1360,9 +1847,19 @@ class KidsDatabaseMixin:
                 JOIN kids_resolve_backlog b ON b.item_id=i.id
                 WHERE i.video_id=? AND i.state='approved' AND s.state='approved'
                   AND s.safety_verdict='SAFE' AND s.reference!=?
+                  AND EXISTS (
+                      SELECT 1 FROM catalog_source_profiles ps
+                      WHERE ps.source_id=s.id AND ps.profile_slug=?
+                  )
                   AND b.status='ready' AND b.quality_height>=? AND b.expires_at>?
                 """,
-                (video_id, KIDS_HOME_SOURCE_REFERENCE, minimum_quality_height, expires_after),
+                (
+                    video_id,
+                    KIDS_HOME_SOURCE_REFERENCE,
+                    profile,
+                    minimum_quality_height,
+                    expires_after,
+                ),
             )
             row = await cur.fetchone()
             cols = [d[0] for d in cur.description] if row else []
@@ -1401,7 +1898,12 @@ class KidsDatabaseMixin:
         result["candidate"] = candidate
         return result
 
-    async def kids_playback_policy_authorization(self, video_id: str) -> dict[str, Any] | None:
+    async def kids_playback_policy_authorization(
+        self,
+        video_id: str,
+        *,
+        profile: str = "noah",
+    ) -> dict[str, Any] | None:
         """Revalidate an active relay without coupling it to the next resolve candidate."""
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
@@ -1413,8 +1915,12 @@ class KidsDatabaseMixin:
                 FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
                 WHERE i.video_id=? AND i.state='approved' AND s.state='approved'
                   AND s.safety_verdict='SAFE' AND s.reference!=?
+                  AND EXISTS (
+                      SELECT 1 FROM catalog_source_profiles ps
+                      WHERE ps.source_id=s.id AND ps.profile_slug=?
+                  )
                 """,
-                (video_id, KIDS_HOME_SOURCE_REFERENCE),
+                (video_id, KIDS_HOME_SOURCE_REFERENCE, profile),
             )
             row = await cur.fetchone()
             cols = [d[0] for d in cur.description] if row else []
@@ -1439,12 +1945,109 @@ class KidsDatabaseMixin:
             return None
         return {"item_id": result["item_id"], "video_id": result["video_id"]}
 
-    async def catalog_item_list_all(self) -> list[dict[str, Any]]:
+    async def catalog_item_list_all(
+        self,
+        *,
+        profile: str | None = None,
+        state: str | None = None,
+        query: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 1000))
+        where: list[str] = []
+        args: list[Any] = []
+        if profile:
+            where.append(
+                """
+                EXISTS (
+                    SELECT 1 FROM catalog_source_profiles ps
+                    WHERE ps.source_id=i.source_id AND ps.profile_slug=?
+                )
+                """
+            )
+            args.append(profile)
+        if state in {"candidate", "approved", "blocked", "revoked", "unknown"}:
+            where.append("i.state=?")
+            args.append(state)
+        if query:
+            escaped = (
+                str(query).strip().casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            if escaped:
+                where.append(
+                    """
+                    LOWER(
+                        COALESCE(i.video_id,'') || ' ' ||
+                        COALESCE(i.title,'') || ' ' ||
+                        COALESCE(i.channel_title,'') || ' ' ||
+                        COALESCE(s.title,'')
+                    ) LIKE ? ESCAPE CHAR(92)
+                    """
+                )
+                args.append(f"%{escaped}%")
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT * FROM catalog_items ORDER BY id ASC")
+            cur = await db.execute(
+                f"""
+                SELECT i.id,i.video_id,i.title,i.source_id,i.channel_id,i.channel_title,
+                       i.thumbnail_url,i.duration_seconds,i.visual_category,i.state,
+                       i.actor,i.changed_at,i.reason,i.revision,i.correlation_id,
+                       s.kind AS source_kind,s.reference AS source_reference,
+                       s.title AS source_title,s.state AS source_state,
+                       s.safety_verdict AS source_safety_verdict,s.language AS source_language,
+                       s.avatar_url,
+                       b.status AS resolver_status,b.quality_height,b.codec,
+                       b.resolved_at,b.expires_at,b.attempt_count,
+                       b.next_attempt_at,b.last_error_code,b.updated_at AS resolver_updated_at,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                           FROM catalog_source_profiles ps
+                           WHERE ps.source_id=i.source_id
+                       ), '') AS profile_slugs
+                FROM catalog_items i
+                LEFT JOIN catalog_sources s ON s.id=i.source_id
+                LEFT JOIN kids_resolve_backlog b ON b.item_id=i.id
+                {where_sql}
+                ORDER BY i.id ASC
+                LIMIT ?
+                """,
+                (*args, bounded),
+            )
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in rows]
+        profile_names = {
+            profile["slug"]: profile["display_name"]
+            for profile in await self.kids_profiles_list()
+        }
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            profiles = _profile_slugs(item.pop("profile_slugs"))
+            video_id = str(item.get("video_id") or "")
+            source_reference = str(item.get("source_reference") or "")
+            source_kind = item.get("source_kind")
+            item["profile_slugs"] = profiles
+            item["profile_names"] = [
+                profile_names[profile] for profile in profiles if profile in profile_names
+            ]
+            item["video_url"] = kids_video_url(video_id)
+            item["youtube_video_url"] = (
+                f"https://www.youtube.com/watch?v={quote(video_id, safe='')}" if video_id else ""
+            )
+            item["source_url"] = kids_source_url(source_kind, source_reference)
+            item["youtube_source_url"] = _youtube_source_url(source_kind, source_reference)
+            item["channel_url"] = kids_source_url("channel", item.get("channel_id"))
+            item["youtube_channel_url"] = (
+                f"https://www.youtube.com/channel/{quote(str(item['channel_id']), safe='')}"
+                if str(item.get("channel_id") or "").startswith("UC")
+                else ""
+            )
+            item["display_resolver_status"] = (
+                "failed" if item.get("resolver_status") == "retry"
+                else item.get("resolver_status") or "not_queued"
+            )
+            result.append(item)
+        return result
 
     async def catalog_item_by_video(self, video_id: str) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.db_path) as db:
@@ -1453,12 +2056,122 @@ class KidsDatabaseMixin:
             cols = [d[0] for d in cur.description] if row else []
         return dict(zip(cols, row)) if row else None
 
-    async def catalog_sources_list(self) -> list[dict[str, Any]]:
+    async def catalog_sources_list(
+        self,
+        *,
+        state: str | None = None,
+        verdict: str | None = None,
+        kind: str | None = None,
+        profile: str | None = None,
+        query: str | None = None,
+        sort: str = "id-asc",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 1000))
+        where: list[str] = []
+        args: list[Any] = []
+        if state in {"candidate", "approved", "blocked", "revoked", "unknown"}:
+            where.append("s.state=?")
+            args.append(state)
+        if verdict:
+            verdict_value = str(verdict).strip().upper()
+            if verdict_value == "BLOCK":
+                verdict_value = "UNSAFE"
+            if verdict_value in {"SAFE", "UNSAFE", "UNCERTAIN"}:
+                where.append("s.safety_verdict=?")
+                args.append(verdict_value)
+        if kind in {"channel", "playlist"}:
+            where.append("s.kind=?")
+            args.append(kind)
+        if profile:
+            where.append(
+                """
+                EXISTS (
+                    SELECT 1 FROM catalog_source_profiles ps
+                    WHERE ps.source_id=s.id AND ps.profile_slug=?
+                )
+                """
+            )
+            args.append(profile)
+        if query:
+            escaped = (
+                str(query).strip().casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            if escaped:
+                where.append(
+                    """
+                    LOWER(
+                        COALESCE(s.title,'') || ' ' ||
+                        COALESCE(s.reference,'') || ' ' ||
+                        COALESCE(s.safety_reason,'')
+                    ) LIKE ? ESCAPE CHAR(92)
+                    """
+                )
+                args.append(f"%{escaped}%")
+        order_key = str(sort or "id-asc").strip().lower()
+        descending = order_key.endswith("-desc")
+        order_base = order_key.rsplit("-", 1)[0] if order_key.endswith(("-asc", "-desc")) else order_key
+        order_by = {
+            "id": "s.id",
+            "name": "LOWER(COALESCE(s.title,''))",
+            "verdict": "s.safety_verdict",
+            "samples": "s.safety_sample_count",
+            "items": "item_count",
+            "ready": "ready_item_count",
+            "state": "s.state",
+            "updated": "s.changed_at",
+        }.get(order_base, "s.id")
+        order_direction = "DESC" if descending else "ASC"
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         async with aiosqlite.connect(self.db_path) as db:
-            cur = await db.execute("SELECT * FROM catalog_sources ORDER BY id ASC")
+            cur = await db.execute(
+                f"""
+                SELECT s.*,
+                       COUNT(DISTINCT i.id) AS item_count,
+                       COUNT(DISTINCT CASE WHEN i.state='approved' THEN i.id END) AS approved_item_count,
+                       COUNT(DISTINCT CASE WHEN b.status='ready' THEN i.id END) AS ready_item_count,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                           FROM catalog_source_profiles ps
+                           WHERE ps.source_id=s.id
+                       ), '') AS profile_slugs,
+                       COALESCE((
+                           SELECT thumbnail_url
+                           FROM catalog_items icon_item
+                           WHERE icon_item.source_id=s.id AND trim(coalesce(icon_item.thumbnail_url,''))!=''
+                           ORDER BY icon_item.id DESC LIMIT 1
+                       ), '') AS fallback_avatar_url
+                FROM catalog_sources s
+                LEFT JOIN catalog_items i ON i.source_id=s.id
+                LEFT JOIN kids_resolve_backlog b ON b.item_id=i.id
+                {where_sql}
+                GROUP BY s.id
+                ORDER BY {order_by} {order_direction},s.id ASC
+                LIMIT ?
+                """,
+                (*args, bounded),
+            )
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in rows]
+        profile_names = {
+            profile["slug"]: profile["display_name"]
+            for profile in await self.kids_profiles_list()
+        }
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            source = dict(zip(cols, row))
+            profiles = _profile_slugs(source.pop("profile_slugs"))
+            source["profile_slugs"] = profiles
+            source["profile_names"] = [
+                profile_names[profile] for profile in profiles if profile in profile_names
+            ]
+            source["source_url"] = kids_source_url(source.get("kind"), source.get("reference"))
+            source["youtube_source_url"] = _youtube_source_url(
+                source.get("kind"), source.get("reference")
+            )
+            source["avatar_url"] = source.get("avatar_url") or source.pop("fallback_avatar_url", "")
+            result.append(source)
+        return result
 
     async def kids_kill_switch_enabled(self) -> bool:
         value = await self.get_setting("kids_kill_switch")
@@ -1611,20 +2324,80 @@ class KidsDatabaseMixin:
             "created_at": now,
         }
 
-    async def kids_watch_events_list(self, limit: int = 100) -> list[dict[str, Any]]:
+    async def kids_watch_events_list(
+        self,
+        limit: int = 100,
+        *,
+        profile: str | None = None,
+        query: str | None = None,
+        sort: str = "id-desc",
+    ) -> list[dict[str, Any]]:
         bounded = max(1, min(int(limit), 500))
+        where: list[str] = []
+        args: list[Any] = []
+        if profile:
+            where.append("w.profile=?")
+            args.append(profile)
+        if query:
+            escaped = (
+                str(query).strip().casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            if escaped:
+                where.append(
+                    """
+                    LOWER(
+                        COALESCE(w.video_id,'') || ' ' ||
+                        COALESCE(i.title,'') || ' ' ||
+                        COALESCE(s.title,'') || ' ' ||
+                        COALESCE(w.event,'')
+                    ) LIKE ? ESCAPE CHAR(92)
+                    """
+                )
+                args.append(f"%{escaped}%")
+        order_key = str(sort or "id-desc").strip().lower()
+        descending = order_key.endswith("-desc") or order_key in {"id", "time"}
+        order_base = order_key.rsplit("-", 1)[0] if order_key.endswith(("-asc", "-desc")) else order_key
+        order_by = {
+            "id": "w.id",
+            "time": "w.created_at",
+            "profile": "w.profile",
+            "event": "w.event",
+            "video": "LOWER(w.video_id)",
+            "title": "LOWER(COALESCE(i.title,''))",
+        }.get(order_base, "w.id")
+        order_direction = "DESC" if descending else "ASC"
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
-                """
-                SELECT w.*, i.title, i.source_id, s.title AS source_title
+                f"""
+                SELECT w.*,i.title,i.source_id,i.thumbnail_url,i.channel_id,i.channel_title,
+                       s.kind AS source_kind,s.reference AS source_reference,
+                       s.title AS source_title,s.avatar_url
                 FROM kids_watch_events w
-                LEFT JOIN catalog_items i ON i.video_id = w.video_id
-                LEFT JOIN catalog_sources s ON s.id = i.source_id
-                ORDER BY w.id DESC
+                LEFT JOIN catalog_items i ON i.video_id=w.video_id
+                LEFT JOIN catalog_sources s ON s.id=i.source_id
+                {where_sql}
+                ORDER BY {order_by} {order_direction},w.id DESC
                 LIMIT ?
                 """,
-                (bounded,),
+                (*args, bounded),
             )
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in rows]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            event = dict(zip(cols, row))
+            video_id = str(event.get("video_id") or "")
+            event["video_url"] = kids_video_url(video_id)
+            event["youtube_video_url"] = (
+                f"https://www.youtube.com/watch?v={quote(video_id, safe='')}" if video_id else ""
+            )
+            event["source_url"] = kids_source_url(
+                event.get("source_kind"), event.get("source_reference")
+            )
+            event["youtube_source_url"] = _youtube_source_url(
+                event.get("source_kind"), event.get("source_reference")
+            )
+            event["channel_url"] = kids_source_url("channel", event.get("channel_id"))
+            result.append(event)
+        return result

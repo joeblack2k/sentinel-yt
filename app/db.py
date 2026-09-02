@@ -59,6 +59,7 @@ class Database(KidsDatabaseMixin):
                     kind TEXT NOT NULL CHECK(kind IN ('channel', 'playlist')),
                     reference TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL DEFAULT '',
+                    avatar_url TEXT NOT NULL DEFAULT '',
                     language TEXT NOT NULL DEFAULT 'unknown'
                         CHECK(language IN ('nl', 'en', 'mixed', 'unknown')),
                     safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN',
@@ -75,6 +76,26 @@ class Database(KidsDatabaseMixin):
                     revision INTEGER NOT NULL,
                     correlation_id TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS kids_profiles (
+                    slug TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    age_years INTEGER NOT NULL CHECK(age_years BETWEEN 0 AND 18),
+                    avatar_key TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS catalog_source_profiles (
+                    source_id INTEGER NOT NULL REFERENCES catalog_sources(id) ON DELETE CASCADE,
+                    profile_slug TEXT NOT NULL REFERENCES kids_profiles(slug) ON DELETE CASCADE,
+                    actor TEXT NOT NULL DEFAULT 'system',
+                    reason TEXT NOT NULL DEFAULT '',
+                    assigned_at TEXT NOT NULL,
+                    PRIMARY KEY(source_id, profile_slug)
+                );
+                CREATE INDEX IF NOT EXISTS idx_catalog_source_profiles_profile
+                    ON catalog_source_profiles(profile_slug, source_id);
                 CREATE TABLE IF NOT EXISTS catalog_items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     video_id TEXT NOT NULL UNIQUE,
@@ -202,6 +223,7 @@ class Database(KidsDatabaseMixin):
             )
             await db.commit()
         await self._migrate_schema()
+        await self._ensure_kids_profile_defaults()
 
         await self._ensure_defaults()
         await self._ensure_default_schedule_entry()
@@ -235,6 +257,10 @@ class Database(KidsDatabaseMixin):
                     ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'
                         CHECK(language IN ('nl', 'en', 'mixed', 'unknown'))
                     """
+                )
+            if "avatar_url" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''"
                 )
             cur = await db.execute("PRAGMA table_info(catalog_items)")
             item_cols = {row[1] for row in await cur.fetchall()}

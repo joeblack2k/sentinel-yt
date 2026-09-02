@@ -10,7 +10,7 @@ from time import monotonic
 from typing import Any, AsyncGenerator
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -243,8 +243,79 @@ async def page_history(request: Request) -> HTMLResponse:
         "history.html",
         {
             "kids_watch_events": kids_watch_events,
+            "profiles": await runtime.db.kids_profiles_list(),
             "status": status,
             "page": "history",
+        },
+    )
+
+
+@app.get("/sources", response_class=HTMLResponse)
+async def page_sources(
+    request: Request,
+    state: str | None = Query(default=None),
+    verdict: str | None = Query(default=None),
+    kind: str | None = Query(default=None),
+    profile: str | None = Query(default=None),
+    query: str | None = Query(default=None, max_length=200),
+    sort: str = Query(default="id-desc", max_length=32),
+) -> HTMLResponse:
+    runtime: RuntimeState = request.app.state.runtime
+    if profile and await runtime.db.kids_profile_get(profile) is None:
+        raise HTTPException(status_code=404, detail="Kids profile not found")
+    return templates.TemplateResponse(
+        request,
+        "sources.html",
+        {
+            "sources": await runtime.db.catalog_sources_list(
+                state=state,
+                verdict=verdict,
+                kind=kind,
+                profile=profile,
+                query=query,
+                sort=sort,
+            ),
+            "profiles": await runtime.db.kids_profiles_list(),
+            "status": await runtime.get_status(),
+            "page": "sources",
+        },
+    )
+
+
+@app.get("/resolve", response_class=HTMLResponse)
+async def page_resolve(
+    request: Request,
+    status_filter: str | None = Query(default=None, alias="status"),
+    profile: str | None = Query(default=None),
+    query: str | None = Query(default=None, max_length=200),
+    sort: str = Query(default="updated-desc", max_length=32),
+) -> HTMLResponse:
+    runtime: RuntimeState = request.app.state.runtime
+    if profile and await runtime.db.kids_profile_get(profile) is None:
+        raise HTTPException(status_code=404, detail="Kids profile not found")
+    resolve_summary = await runtime.db.kids_resolve_summary(
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        profile=profile,
+    )
+    return templates.TemplateResponse(
+        request,
+        "resolve.html",
+        {
+            "kids_status": {
+                "resolve": resolve_summary,
+                "resolver_last_success_at": await runtime.db.get_setting("kids_resolver_last_success_at"),
+                "catalog_revision": await runtime.db.catalog_revision(),
+            },
+            "resolve_rows": await runtime.db.kids_resolve_recent_rows(
+                limit=500,
+                status=status_filter,
+                profile=profile,
+                query=query,
+                sort=sort,
+            ),
+            "profiles": await runtime.db.kids_profiles_list(),
+            "status": await runtime.get_status(),
+            "page": "resolve",
         },
     )
 
@@ -333,6 +404,7 @@ async def page_kids(request: Request) -> HTMLResponse:
             "items": await runtime.db.catalog_item_list_all(),
             "watch_events": await runtime.db.kids_watch_events_list(),
             "resolve_rows": await runtime.db.kids_resolve_recent_rows(),
+            "profiles": await runtime.db.kids_profiles_list(),
             "page": "kids",
         },
     )

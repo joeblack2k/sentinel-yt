@@ -31,6 +31,8 @@ CORE_TABLES = (
     "kids_resolve_backlog",
 )
 TARGET_TABLES = CORE_TABLES + (
+    "kids_profiles",
+    "catalog_source_profiles",
     "feed_sessions",
     "feed_session_items",
     "relay_leases",
@@ -279,6 +281,7 @@ def merge_kids_database(source_path: str | Path, destination_path: str | Path) -
                 "transitions_imported": 0,
                 "audit_events_imported": 0,
                 "watch_events_imported": 0,
+                "source_profile_assignments": 0,
                 "profile_setting_imported": 0,
                 "skipped_home_rows": 0,
             }
@@ -338,6 +341,21 @@ def merge_kids_database(source_path: str | Path, destination_path: str | Path) -
                 )
                 source_map[int(row["id"])] = int(cursor.lastrowid)
                 counts["sources_inserted"] += 1
+                destination.execute(
+                    """
+                    INSERT OR IGNORE INTO catalog_source_profiles(
+                        source_id,profile_slug,actor,reason,assigned_at
+                    ) VALUES(?,?,?,?,?)
+                    """,
+                    (
+                        int(cursor.lastrowid),
+                        "noah",
+                        "kids-migration",
+                        "Imported source retained for Noah",
+                        now.isoformat(),
+                    ),
+                )
+                counts["source_profile_assignments"] += 1
 
             item_map: dict[int, int] = {}
             for row in _rows(source, "SELECT * FROM catalog_items ORDER BY id"):

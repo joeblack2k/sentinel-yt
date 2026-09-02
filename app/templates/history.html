@@ -1,26 +1,126 @@
 {% extends "base.html" %}
 {% block content %}
+<div class="panel" style="margin-bottom:14px; background:linear-gradient(to right, #ffffff, #f7fbfa); border-left:4px solid var(--accent);">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px;">
+    <div>
+      <h1 style="margin:0 0 4px 0;">Kids Watch History</h1>
+      <p class="muted" style="margin:0; font-size:14px;">
+        Playback events from the Kids app are stored here for parent review and preference tuning.
+      </p>
+    </div>
+    <div class="inline-actions">
+      <button type="button" class="small-btn" onclick="location.reload()">Refresh Events</button>
+    </div>
+  </div>
+</div>
+
 <section class="card">
-  <h2>Kids watch history</h2>
-  <p class="muted">Playback events from the Kids app are stored here for review and preference tuning.</p>
-  <table>
-    <thead><tr><th>Time</th><th>Event</th><th>Video</th><th>Title</th><th>Source</th><th>Profile</th><th>Position</th><th>Startup</th></tr></thead>
-    <tbody>
-      {% for event in kids_watch_events %}
-      <tr>
-        <td>{{ event.created_at }}</td>
-        <td>{{ event.event }}</td>
-        <td><code>{{ event.video_id }}</code></td>
-        <td>{{ event.title or '-' }}</td>
-        <td>{{ event.source_title or '-' }}</td>
-        <td>{{ event.profile }}</td>
-        <td>{{ event.position_seconds if event.position_seconds is not none else '-' }}</td>
-        <td>{{ event.startup_ms if event.startup_ms is not none else '-' }}</td>
-      </tr>
-      {% else %}
-      <tr><td colspan="8" class="muted">No Kids watch events yet.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+    <h2>Kids watch history</h2>
+    <div class="toolbar" style="margin:0; padding:6px 10px;">
+      <div class="toolbar-search">
+        <input type="search" id="history-search" placeholder="Search events by video, title, or source..." style="height:30px; font-size:12.5px;" aria-label="Search watch history">
+      </div>
+      <div class="toolbar-group">
+        <span class="toolbar-label" style="font-size:11.5px;">Profile:</span>
+        <select id="history-profile-filter" style="height:30px; font-size:12.5px;">
+          <option value="all">All Profiles</option>
+          <option value="noah">Noah</option>
+          <option value="felix">Felix</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:96px; min-width:90px;">Thumbnail</th>
+          <th style="width:145px; min-width:135px; white-space:nowrap;">Time</th>
+          <th style="width:105px; min-width:95px; white-space:nowrap;">Event</th>
+          <th style="min-width:110px;">Video &amp; Safe Links</th>
+          <th style="min-width:160px;">Title</th>
+          <th style="min-width:120px;">Source</th>
+          <th style="width:100px; min-width:90px; white-space:nowrap;">Profile</th>
+          <th style="width:85px; min-width:75px; white-space:nowrap;">Position</th>
+          <th style="width:85px; min-width:75px; white-space:nowrap;">Startup</th>
+        </tr>
+      </thead>
+      <tbody id="history-tbody">
+        {% for event in kids_watch_events if kids_watch_events is defined %}
+        <tr class="history-row" data-video="{{ event.video_id|lower }}" data-title="{{ (event.title or '')|lower }}" data-source="{{ (event.source_title or '')|lower }}" data-profile="{{ event.profile|lower }}">
+          <td>
+            <div class="video-thumb-box">
+              <img src="{{ event.thumbnail_url or ('https://i.ytimg.com/vi/' ~ event.video_id ~ '/mqdefault.jpg') }}"
+                   alt="Thumbnail"
+                   loading="lazy"
+                   onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\'video-thumb-fallback\'>No Preview</div>';">
+            </div>
+          </td>
+          <td style="white-space:nowrap;"><span style="font-size:12px;">{{ (event.created_at|string)[:19]|replace('T', ' ') }}</span></td>
+          <td style="white-space:nowrap;">
+            {% if event.event == 'completed' %}
+              <span class="badge badge-safe" style="white-space:nowrap;">Completed</span>
+            {% elif event.event == 'started' %}
+              <span class="badge badge-running" style="white-space:nowrap;">Started</span>
+            {% else %}
+              <span class="badge badge-quality" style="white-space:nowrap;">{{ event.event }}</span>
+            {% endif %}
+          </td>
+          <td>
+            <code>{{ event.video_id }}</code>
+            <div style="margin-top:3px; display:flex; gap:4px; flex-wrap:wrap;">
+              {% if event.video_url %}
+                <a href="{{ event.video_url }}" target="_blank" rel="noopener noreferrer" class="yt-kids-link" style="font-size:11px; padding:1px 6px;">▶ YT Kids</a>
+              {% endif %}
+              {% if event.youtube_video_url %}
+                <a href="{{ event.youtube_video_url }}" target="_blank" rel="noopener noreferrer" class="yt-channel-link" style="font-size:11px; padding:1px 6px;">YouTube ↗</a>
+              {% endif %}
+            </div>
+          </td>
+          <td><strong style="font-size:13.5px; color:#13232f;">{{ event.title or '-' }}</strong></td>
+          <td>
+            {% if event.source_url %}
+              <a href="{{ event.source_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--accent); text-decoration:none; font-weight:600;">{{ event.source_title or 'Source' }}</a>
+            {% else %}
+              <span class="muted">{{ event.source_title or '-' }}</span>
+            {% endif %}
+          </td>
+          <td style="white-space:nowrap;">
+            {% if event.profile == 'noah' %}
+              <span class="badge badge-profile-noah" style="white-space:nowrap;">Noah</span>
+            {% elif event.profile == 'felix' %}
+              <span class="badge badge-profile-felix" style="white-space:nowrap;">Felix</span>
+            {% elif event.profile %}
+              <span class="badge badge-quality" style="white-space:nowrap;">{{ event.profile }}</span>
+            {% else %}
+              <span class="muted" style="font-size:11px;">Unassigned</span>
+            {% endif %}
+          </td>
+          <td style="white-space:nowrap;">{{ (event.position_seconds ~ 's') if event.position_seconds is not none else '-' }}</td>
+          <td style="white-space:nowrap;">{{ (event.startup_ms ~ 'ms') if event.startup_ms is not none else '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="muted" style="text-align:center; padding:24px;">No Kids watch events yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
+
+<script>
+document.getElementById('history-search')?.addEventListener('input', filterHistory);
+document.getElementById('history-profile-filter')?.addEventListener('change', filterHistory);
+
+function filterHistory() {
+  const q = (document.getElementById('history-search')?.value || '').toLowerCase().trim();
+  const prof = document.getElementById('history-profile-filter')?.value || 'all';
+  document.querySelectorAll('#history-tbody tr.history-row').forEach(row => {
+    const matchQ = !q || (row.dataset.video || '').includes(q) || (row.dataset.title || '').includes(q) || (row.dataset.source || '').includes(q);
+    const matchP = prof === 'all' || (row.dataset.profile || '') === prof;
+    row.style.display = (matchQ && matchP) ? '' : 'none';
+  });
+}
+</script>
 {% endblock %}

@@ -35,10 +35,15 @@ Kids dataplane:
 - `POST /v1/kids/events`
 - `GET /api/kids/status`
 - `GET /api/kids/readyz`
+- `GET /api/kids/profiles`
+- `GET /api/kids/sources`
+- `GET /api/kids/resolve`
 
 Guardian control:
 
 - `GET /kids`
+- `GET /sources`
+- `GET /resolve`
 - `GET /history`
 - `GET /blocklist`
 - `GET /schedule`

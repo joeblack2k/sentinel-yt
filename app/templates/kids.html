@@ -1,115 +1,527 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>SubTube Kids</h1>
-<p class="muted">Approved channels and playlists publish automatically. Use Revoke to remove a source or item.</p>
+<div class="panel" style="margin-bottom:14px; background:linear-gradient(to right, #ffffff, #f7fbfa); border-left:4px solid var(--accent);">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:10px;">
+    <div>
+      <h1 style="margin:0 0 4px 0;">SubTube Kids</h1>
+      <p class="muted" style="margin:0; font-size:14px;">
+        Approved channels and playlists publish automatically. Use Revoke (Unsave) to remove a source or item.
+      </p>
+    </div>
+    <div class="inline-actions">
+      <a href="/sources" class="small-btn">Open Dedicated Sources Tab →</a>
+      <a href="/resolve" class="small-btn">Open Resolve Backlog Tab →</a>
+    </div>
+  </div>
+</div>
 
-<section class="panel">
-  <h2>Resolve backlog</h2>
-  <p class="muted">Fresh ready {{ kids_status.resolve.fresh_ready }}. Last worker success {{ kids_status.resolver_last_success_at or '-' }}.</p>
-  <table>
-    <thead><tr><th>Video</th><th>Title</th><th>Status</th><th>Quality</th><th>Expiry</th><th>Attempts</th><th>Reason</th></tr></thead>
-    <tbody>
-      {% for row in resolve_rows %}
-      <tr><td><code>{{ row.video_id }}</code></td><td>{{ row.title or '-' }}</td><td>{{ row.status }}</td><td>{{ row.quality_height or '-' }}</td><td>{{ row.expires_at or '-' }}</td><td>{{ row.attempt_count }}</td><td>{{ row.last_error_code or '-' }}</td></tr>
+<!-- Top Health & KPI Metrics -->
+<div class="kpi-grid">
+  <div class="kpi-card">
+    <p class="kpi-label">Fresh Ready Streams</p>
+    <p class="kpi-value" style="color:var(--success);">
+      {{ kids_status.resolve.fresh_ready if (kids_status is defined and kids_status and kids_status.resolve and kids_status.resolve.fresh_ready is defined) else 0 }}
+    </p>
+    <p class="kpi-sub">Cached stream leases (&gt;5m)</p>
+  </div>
+  <div class="kpi-card">
+    <p class="kpi-label">Kids Sources</p>
+    <p class="kpi-value" style="color:#0f766e;">
+      {{ sources|length if sources is defined else 0 }}
+    </p>
+    <p class="kpi-sub">Curated channels &amp; playlists</p>
+  </div>
+  <div class="kpi-card">
+    <p class="kpi-label">Catalog Items</p>
+    <p class="kpi-value" style="color:#1e40af;">
+      {{ items|length if items is defined else 0 }}
+    </p>
+    <p class="kpi-sub">Rev {{ kids_status.catalog_revision if (kids_status is defined and kids_status and kids_status.catalog_revision is defined) else '1' }}</p>
+  </div>
+  <div class="kpi-card">
+    <p class="kpi-label">Resolver Last Success</p>
+    <p class="kpi-value" style="font-size:14px; font-weight:700; margin-top:6px; color:#334155; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="{{ kids_status.resolver_last_success_at if (kids_status is defined and kids_status and kids_status.resolver_last_success_at) else '' }}">
+      {% if kids_status is defined and kids_status and kids_status.resolver_last_success_at %}
+        {{ (kids_status.resolver_last_success_at|string)[:19]|replace('T', ' ') }}
       {% else %}
-      <tr><td colspan="7" class="muted">No resolve records yet.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+        -
+      {% endif %}
+    </p>
+    <p class="kpi-sub">Background worker status</p>
+  </div>
+</div>
+
+<!-- Profile Presentation Deck -->
+<section class="card">
+  <h2>Child Profiles</h2>
+  <div class="profile-deck">
+    {% for p in profiles if profiles is defined and profiles %}
+    <div class="profile-card profile-{{ p.slug }}">
+      <div class="profile-icon">{{ (p.display_name or p.slug)[:1]|upper }}</div>
+      <div class="profile-meta">
+        <h3>{{ p.display_name }} <span class="badge badge-profile-{{ p.slug }}">Age {{ p.age_years }}</span></h3>
+        <p>{{ p.approved_source_count }} approved / {{ p.source_count }} total sources • Profile ID: <code>{{ p.slug }}</code></p>
+      </div>
+    </div>
+    {% else %}
+    <div class="profile-card profile-noah">
+      <div class="profile-icon">N</div>
+      <div class="profile-meta">
+        <h3>Noah <span class="badge badge-profile-noah">Age 6</span></h3>
+        <p>Active profile • Curated educational &amp; kids entertainment (Profile ID: <code>noah</code>)</p>
+      </div>
+    </div>
+    <div class="profile-card profile-felix">
+      <div class="profile-icon">F</div>
+      <div class="profile-meta">
+        <h3>Felix <span class="badge badge-profile-felix">Age 2</span></h3>
+        <p>Toddler profile • Age-appropriate sensory and early learning (Profile ID: <code>felix</code>)</p>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
 </section>
 
-<section class="panel">
-  <h2>Kids sources</h2>
-  <form id="kids-source-form">
-    <label>Type
-      <select name="kind">
-        <option value="channel">Channel</option>
-        <option value="playlist">Playlist</option>
+<!-- Resolve Backlog Section -->
+<section class="panel" id="section-resolve">
+  <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:6px;">
+    <h2>Resolve backlog</h2>
+    <div class="inline-actions">
+      <span class="muted" style="font-size:13px;">
+        Fresh ready {{ kids_status.resolve.fresh_ready if (kids_status is defined and kids_status and kids_status.resolve and kids_status.resolve.fresh_ready is defined) else 0 }}. Last worker success {{ kids_status.resolver_last_success_at if (kids_status is defined and kids_status and kids_status.resolver_last_success_at) else '-' }}.
+      </span>
+      <a href="/resolve" class="small-btn" style="margin-left:6px;">Open Full Backlog Page ↗</a>
+    </div>
+  </div>
+
+  <!-- Resolve Filter / Search toolbar -->
+  <div class="toolbar">
+    <div class="toolbar-search">
+      <input type="search" id="quick-resolve-search" placeholder="Search backlog by video ID, title, or error..." aria-label="Search backlog">
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Status:</span>
+      <select id="quick-resolve-status">
+        <option value="all">All</option>
+        <option value="ready">Ready</option>
+        <option value="running">Running</option>
+        <option value="pending">Pending</option>
+        <option value="failed">Failed / Blocked</option>
       </select>
-    </label>
-    <label>Channel ID or Kids URL
-      <input name="reference" required maxlength="256" placeholder="UC... or https://www.youtubekids.com/channel/...">
-    </label>
-    <label>Parent label
-      <input name="title" maxlength="500" placeholder="Optional">
-    </label>
-    <button type="submit">Add source</button>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:100px;">Thumbnail</th>
+          <th style="width:85px;">Profiles</th>
+          <th>Video Details &amp; Safe Links</th>
+          <th style="width:90px;">Status</th>
+          <th style="width:90px;">Quality</th>
+          <th style="width:170px; min-width:150px;">Expiry</th>
+          <th style="width:80px;">Attempts</th>
+          <th style="min-width:130px; width:140px;">Reason</th>
+        </tr>
+      </thead>
+      <tbody id="quick-resolve-tbody">
+        {% for row in resolve_rows if resolve_rows is defined %}
+        {% set disp_status = row.display_status if row.display_status is defined else ('failed' if row.status == 'retry' else row.status) %}
+        <tr class="resolve-item-row" data-video="{{ row.video_id|lower }}" data-title="{{ (row.title or '')|lower }}" data-status="{{ row.status|lower }}" data-display-status="{{ disp_status|lower }}" data-reason="{{ (row.last_error_code or '')|lower }}">
+          <td>
+            <div class="video-thumb-box">
+              <img src="{{ row.thumbnail_url or ('https://i.ytimg.com/vi/' ~ row.video_id ~ '/mqdefault.jpg') }}"
+                   alt="Thumbnail"
+                   loading="lazy"
+                   onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\'video-thumb-fallback\'>No Preview</div>';">
+            </div>
+          </td>
+          <td>
+            {% for pslug in (row.profile_slugs or []) %}
+              <span class="badge badge-profile-{{ pslug }}" style="font-size:10.5px; padding:1px 4px;">{{ pslug|capitalize }}</span>
+            {% else %}
+              <span class="muted" style="font-size:11px;">Unassigned</span>
+            {% endfor %}
+          </td>
+          <td>
+            <strong style="font-size:13.5px; color:#13232f;">{{ row.title or 'Catalog Video' }}</strong>
+            <div style="margin-top:3px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+              <code>{{ row.video_id }}</code>
+              {% if row.video_url %}
+                <a href="{{ row.video_url }}" target="_blank" rel="noopener noreferrer" class="yt-kids-link" title="Open in YouTube Kids">
+                  ▶ YT Kids
+                </a>
+              {% endif %}
+              {% if row.youtube_video_url %}
+                <a href="{{ row.youtube_video_url }}" target="_blank" rel="noopener noreferrer" class="yt-channel-link" title="Open in YouTube">
+                  YouTube ↗
+                </a>
+              {% endif %}
+              {% if row.candidate_present %}
+                <span class="badge badge-safe" style="font-size:10.5px; padding:1px 5px;" title="Stream candidate lease cached">Cached</span>
+              {% endif %}
+            </div>
+          </td>
+          <td>
+            {% if disp_status == 'ready' %}
+              <span class="badge badge-ready">Ready</span>
+            {% elif disp_status == 'running' %}
+              <span class="badge badge-running">Running</span>
+            {% elif disp_status == 'pending' %}
+              <span class="badge badge-pending">Pending</span>
+            {% elif disp_status == 'failed' %}
+              <span class="badge badge-failed">{% if row.status == 'retry' %}Retry / Failed{% else %}Failed{% endif %}</span>
+            {% elif disp_status == 'blocked' %}
+              <span class="badge badge-block">Blocked</span>
+            {% else %}
+              <span class="badge badge-quality">{{ disp_status }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if row.quality_height %}
+              <span class="badge badge-quality">{{ row.quality_height }}p</span>
+            {% else %}
+              <span class="muted">-</span>
+            {% endif %}
+          </td>
+          <td style="white-space:nowrap;"><span style="font-size:12px;">{{ ((row.expires_at|string)[:19]|replace('T', ' ')) if row.expires_at else '-' }}</span></td>
+          <td><strong>{{ row.attempt_count }}</strong></td>
+          <td style="min-width:130px;">
+            {% if row.last_error_code %}
+              <code style="color:var(--danger); background:var(--danger-bg); white-space:nowrap; display:inline-block;">{{ row.last_error_code }}</code>
+            {% else %}
+              <span class="muted" style="font-size:12px;">OK</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="muted" style="text-align:center; padding:20px;">No resolve records yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- Kids Sources Section -->
+<section class="panel" id="section-sources">
+  <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+    <h2>Kids sources</h2>
+    <a href="/sources" class="small-btn">Open Dedicated Sources Page ↗</a>
+  </div>
+
+  <form id="kids-source-form" class="grid2" style="margin-bottom:14px; background:#faf7f0; padding:12px; border-radius:8px; border:1px solid var(--line);">
+    <div>
+      <label for="kids-source-kind">Type</label>
+      <select id="kids-source-kind" name="kind">
+        <option value="channel">YouTube Channel</option>
+        <option value="playlist">YouTube Playlist</option>
+      </select>
+    </div>
+    <div>
+      <label for="kids-source-ref">Channel ID or Kids URL</label>
+      <input id="kids-source-ref" name="reference" required maxlength="256" placeholder="UC... or https://www.youtubekids.com/channel/...">
+    </div>
+    <div>
+      <label for="kids-source-title">Parent label</label>
+      <input id="kids-source-title" name="title" maxlength="500" placeholder="Optional human label">
+    </div>
+    <div>
+      <label>Target Profiles</label>
+      <div class="profile-checkbox-row" style="margin-top:4px;">
+        {% for p in profiles if profiles is defined and profiles %}
+          <label class="profile-check-label">
+            <input type="checkbox" name="profile_slugs" value="{{ p.slug }}" {% if p.slug == 'noah' %}checked{% endif %}>
+            {{ p.display_name }} (Age {{ p.age_years }})
+          </label>
+        {% else %}
+          <label class="profile-check-label">
+            <input type="checkbox" name="profile_slugs" value="noah" checked> Noah (Age 6)
+          </label>
+          <label class="profile-check-label">
+            <input type="checkbox" name="profile_slugs" value="felix"> Felix (Age 2)
+          </label>
+        {% endfor %}
+      </div>
+    </div>
+    <div style="grid-column:1 / -1; margin-top:4px;">
+      <button type="submit" id="kids-source-submit" style="min-height:38px;">Add Candidate Source</button>
+      <span id="kids-source-status" class="muted" style="margin-left:12px; font-size:13px;"></span>
+    </div>
   </form>
-  <p id="kids-source-status" class="muted"></p>
-  <table>
-    <thead><tr><th>Type</th><th>Name</th><th>Reference</th><th>Guardian check</th><th>Samples</th><th>State</th><th>Action</th></tr></thead>
-    <tbody id="kids-sources">
-      {% for source in sources %}
-      <tr data-id="{{ source.id }}">
-        <td>{{ source.kind }}</td>
-        <td>{{ source.title or '-' }}</td>
-        <td><code>{{ source.reference }}</code></td>
-        <td>
-          <strong>{{ source.safety_verdict }}</strong>
-          {% if source.safety_reason %}
-          <br><span class="muted">{{ source.safety_reason }}</span>
-          {% endif %}
-        </td>
-        <td>{{ source.safety_sample_count or 0 }}<br><span class="muted">{{ source.safety_policy_version or '-' }}</span></td>
-        <td class="state">{{ source.state }}</td>
-        <td>
-          {% if source.state != 'revoked' %}
-          <button data-state="revoked">Revoke</button>
-          {% endif %}
-        </td>
-      </tr>
-      {% else %}
-      <tr><td colspan="7" class="muted">No Kids sources configured.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+
+  <!-- Sources Filter Toolbar -->
+  <div class="toolbar">
+    <div class="toolbar-search">
+      <input type="search" id="quick-sources-search" placeholder="Search sources by name or reference..." aria-label="Search sources">
+    </div>
+    <div class="toolbar-group">
+      <span class="toolbar-label">State:</span>
+      <select id="quick-sources-state">
+        <option value="all">All States</option>
+        <option value="candidate">Candidate</option>
+        <option value="approved">Approved</option>
+        <option value="blocked">Blocked</option>
+        <option value="revoked">Revoked</option>
+        <option value="unknown">Unknown</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:48px;">Avatar</th>
+          <th style="width:75px;">Type</th>
+          <th>Name &amp; Safe Links</th>
+          <th style="width:160px;">Profile Assignment</th>
+          <th style="width:190px;">Guardian check</th>
+          <th style="width:110px;">Catalog Items</th>
+          <th style="width:90px;">State</th>
+          <th style="width:130px; text-align:right;">Action</th>
+        </tr>
+      </thead>
+      <tbody id="kids-sources">
+        {% for source in sources if sources is defined %}
+        <tr class="source-item-row" data-id="{{ source.id }}" data-title="{{ (source.title or '')|lower }}" data-ref="{{ (source.reference or '')|lower }}" data-state="{{ source.state|lower }}">
+          <td>
+            <div class="channel-avatar">
+              {% if source.avatar_url %}
+                <img src="{{ source.avatar_url }}" alt="" onerror="this.parentElement.innerHTML='{{ ((source.title or source.reference or 'S')|string)[:1]|upper }}';">
+              {% else %}
+                {{ ((source.title or source.reference or 'S')|string)[:1]|upper }}
+              {% endif %}
+            </div>
+          </td>
+          <td><span class="badge badge-quality">{{ source.kind }}</span></td>
+          <td>
+            <strong style="font-size:14px; color:#13232f;">{{ source.title or '-' }}</strong>
+            <div style="margin-top:2px;">
+              <code>{{ source.reference }}</code>
+            </div>
+            <div style="margin-top:3px; display:flex; gap:6px; flex-wrap:wrap;">
+              {% if source.source_url %}
+                <a href="{{ source.source_url }}" target="_blank" rel="noopener noreferrer" class="yt-kids-link">▶ YT Kids</a>
+              {% endif %}
+              {% if source.youtube_source_url %}
+                <a href="{{ source.youtube_source_url }}" target="_blank" rel="noopener noreferrer" class="yt-channel-link">YouTube ↗</a>
+              {% endif %}
+            </div>
+          </td>
+          <td>
+            {% if source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
+              <span class="muted" style="font-size:12px;">System ingest source</span>
+            {% else %}
+            <div class="profile-assignment-group" data-source-id="{{ source.id }}">
+              <div class="profile-checkbox-row">
+                {% for p in profiles if profiles is defined and profiles %}
+                  <label class="profile-check-label">
+                    <input type="checkbox"
+                           class="source-prof-cb"
+                           data-source-id="{{ source.id }}"
+                           value="{{ p.slug }}"
+                           {% if p.slug in (source.profile_slugs or []) %}checked{% endif %}>
+                    <span class="badge badge-profile-{{ p.slug }}" style="font-size:11px; padding:1px 4px;">{{ p.display_name }}</span>
+                  </label>
+                {% else %}
+                  <label class="profile-check-label">
+                    <input type="checkbox" class="source-prof-cb" data-source-id="{{ source.id }}" value="noah" {% if 'noah' in (source.profile_slugs or []) %}checked{% endif %}>
+                    <span class="badge badge-profile-noah" style="font-size:11px; padding:1px 4px;">Noah</span>
+                  </label>
+                  <label class="profile-check-label">
+                    <input type="checkbox" class="source-prof-cb" data-source-id="{{ source.id }}" value="felix" {% if 'felix' in (source.profile_slugs or []) %}checked{% endif %}>
+                    <span class="badge badge-profile-felix" style="font-size:11px; padding:1px 4px;">Felix</span>
+                  </label>
+                {% endfor %}
+              </div>
+              <div class="profile-saved-msg" id="prof-msg-{{ source.id }}"></div>
+            </div>
+            {% endif %}
+          </td>
+          <td>
+            {% if source.safety_verdict == 'SAFE' %}
+              <span class="badge badge-safe">SAFE</span>
+            {% elif source.safety_verdict in ['BLOCK', 'UNSAFE'] %}
+              <span class="badge badge-block">BLOCK</span>
+            {% else %}
+              <span class="badge badge-uncertain">{{ source.safety_verdict or 'UNCERTAIN' }}</span>
+            {% endif %}
+            {% if source.safety_reason %}
+              <div class="muted" style="font-size:12px; margin-top:2px;">{{ source.safety_reason }}</div>
+            {% endif %}
+            <div class="muted" style="font-size:11px; margin-top:2px;">
+              {{ source.safety_sample_count or 0 }} samples • v{{ source.safety_policy_version or '1' }}
+            </div>
+          </td>
+          <td>
+            <span class="item-counts-pill">
+              <strong>{{ source.ready_item_count or 0 }}</strong> ready
+            </span>
+            <div class="muted" style="font-size:11.5px; margin-top:2px;">
+              {{ source.approved_item_count or 0 }} / {{ source.item_count or 0 }}
+            </div>
+          </td>
+          <td class="state">
+            {% if source.state == 'approved' %}
+              <span class="badge badge-approved">Approved</span>
+            {% elif source.state == 'revoked' %}
+              <span class="badge badge-revoked">Revoked</span>
+            {% elif source.state == 'blocked' %}
+              <span class="badge badge-block">Blocked</span>
+            {% else %}
+              <span class="badge badge-pending">{{ source.state }}</span>
+            {% endif %}
+          </td>
+          <td style="text-align:right;">
+            {% if source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
+              <span class="muted" style="font-size:12px;">-</span>
+            {% elif source.state != 'revoked' %}
+              <button type="button" class="btn-revoke" data-source-id="{{ source.id }}" data-state="revoked" title="Revoke access (removes from Kids app)">Revoke (Unsave)</button>
+            {% else %}
+              <span class="muted" style="font-size:12px;">Revoked</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="muted" style="text-align:center; padding:20px;">No Kids sources configured.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
 
-<section class="panel">
+<!-- Catalog Items Section -->
+<section class="panel" id="section-catalog">
   <h2>Catalog</h2>
-  <p class="muted">Feed revision {{ kids_status.catalog_revision }}. Only approved items from approved sources are visible to the Kids app.</p>
-  <table>
-    <thead><tr><th>Video</th><th>Source</th><th>State</th><th>Action</th></tr></thead>
-    <tbody>
-      {% for item in items %}
-      <tr>
-        <td><code>{{ item.video_id }}</code></td>
-        <td>{{ item.source_id or '-' }}</td>
-        <td>{{ item.state }}</td>
-        <td>
-          {% if item.state != 'revoked' %}
-          <button data-item-id="{{ item.id }}" data-state="revoked">Revoke</button>
-          {% endif %}
-        </td>
-      </tr>
-      {% else %}
-      <tr><td colspan="4" class="muted">No catalog items yet.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <p class="muted">Feed revision {{ kids_status.catalog_revision if (kids_status is defined and kids_status and kids_status.catalog_revision is defined) else '1' }}. Only approved items from approved sources are visible to the Kids app.</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:100px;">Thumbnail</th>
+          <th>Video Title &amp; Details</th>
+          <th>Safe Links</th>
+          <th>Source ID</th>
+          <th>State</th>
+          <th style="width:130px; text-align:right;">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in items if items is defined %}
+        <tr>
+          <td>
+            <div class="video-thumb-box">
+              <img src="{{ item.thumbnail_url or 'https://i.ytimg.com/vi/' ~ item.video_id ~ '/mqdefault.jpg' }}"
+                   alt="Thumbnail"
+                   loading="lazy"
+                   onerror="this.onerror=null; this.parentElement.innerHTML='<div class=\'video-thumb-fallback\'>No Preview</div>';">
+            </div>
+          </td>
+          <td>
+            <strong style="font-size:13.5px; color:#13232f;">{{ item.title or 'Catalog Item' }}</strong>
+            <br><code>{{ item.video_id }}</code>
+          </td>
+          <td>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              {% if item.video_url %}
+                <a href="{{ item.video_url }}" target="_blank" rel="noopener noreferrer" class="yt-kids-link" title="Open in YouTube Kids">▶ YT Kids</a>
+              {% endif %}
+              {% if item.youtube_video_url %}
+                <a href="{{ item.youtube_video_url }}" target="_blank" rel="noopener noreferrer" class="yt-channel-link" title="Open in standard YouTube">YouTube ↗</a>
+              {% endif %}
+            </div>
+          </td>
+          <td>{{ item.source_id or '-' }}</td>
+          <td>
+            {% if item.state == 'approved' %}
+              <span class="badge badge-approved">Approved</span>
+            {% elif item.state == 'revoked' %}
+              <span class="badge badge-revoked">Revoked</span>
+            {% elif item.state == 'blocked' %}
+              <span class="badge badge-block">Blocked</span>
+            {% else %}
+              <span class="badge badge-pending">{{ item.state }}</span>
+            {% endif %}
+          </td>
+          <td style="text-align:right;">
+            {% if item.state != 'revoked' %}
+              <button type="button" class="btn-revoke" data-item-id="{{ item.id }}" data-state="revoked" title="Revoke item">Revoke (Unsave)</button>
+            {% else %}
+              <span class="muted" style="font-size:12px;">Revoked</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="muted" style="text-align:center; padding:20px;">No catalog items yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
 
-<section class="panel">
+<!-- Watch Log Section -->
+<section class="panel" id="section-watchlog">
   <h2>Watch log</h2>
   <p class="muted">Events from the Kids app are stored here for parent review and preference tuning.</p>
-  <table>
-    <thead><tr><th>Time</th><th>Event</th><th>Video</th><th>Title</th><th>Profile</th><th>Position</th><th>Startup</th></tr></thead>
-    <tbody>
-      {% for event in watch_events %}
-      <tr>
-        <td>{{ event.created_at }}</td>
-        <td>{{ event.event }}</td>
-        <td><code>{{ event.video_id }}</code></td>
-        <td>{{ event.title or '-' }}</td>
-        <td>{{ event.profile }}</td>
-        <td>{{ event.position_seconds if event.position_seconds is not none else '-' }}</td>
-        <td>{{ event.startup_ms if event.startup_ms is not none else '-' }}</td>
-      </tr>
-      {% else %}
-      <tr><td colspan="7" class="muted">No Kids watch events yet.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:145px; min-width:135px; white-space:nowrap;">Time</th>
+          <th style="width:105px; min-width:95px; white-space:nowrap;">Event</th>
+          <th style="min-width:110px;">Video &amp; Safe Links</th>
+          <th style="min-width:160px;">Title</th>
+          <th style="width:100px; min-width:90px; white-space:nowrap;">Profile</th>
+          <th style="width:85px; min-width:75px; white-space:nowrap;">Position</th>
+          <th style="width:85px; min-width:75px; white-space:nowrap;">Startup</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for event in watch_events if watch_events is defined %}
+        <tr>
+          <td style="white-space:nowrap;"><span style="font-size:12px;">{{ (event.created_at|string)[:19]|replace('T', ' ') }}</span></td>
+          <td style="white-space:nowrap;">
+            {% if event.event == 'completed' %}
+              <span class="badge badge-safe" style="white-space:nowrap;">Completed</span>
+            {% elif event.event == 'started' %}
+              <span class="badge badge-running" style="white-space:nowrap;">Started</span>
+            {% else %}
+              <span class="badge badge-quality" style="white-space:nowrap;">{{ event.event }}</span>
+            {% endif %}
+          </td>
+          <td>
+            <code>{{ event.video_id }}</code>
+            <div style="margin-top:2px; display:flex; gap:4px; flex-wrap:wrap;">
+              {% if event.video_url %}
+                <a href="{{ event.video_url }}" target="_blank" rel="noopener noreferrer" class="yt-kids-link" style="font-size:11px; padding:1px 5px;">▶ Watch</a>
+              {% endif %}
+              {% if event.youtube_video_url %}
+                <a href="{{ event.youtube_video_url }}" target="_blank" rel="noopener noreferrer" class="yt-channel-link" style="font-size:11px; padding:1px 5px;">YouTube ↗</a>
+              {% endif %}
+            </div>
+          </td>
+          <td><strong>{{ event.title or '-' }}</strong></td>
+          <td style="white-space:nowrap;">
+            {% if event.profile == 'noah' %}
+              <span class="badge badge-profile-noah" style="white-space:nowrap;">Noah</span>
+            {% elif event.profile == 'felix' %}
+              <span class="badge badge-profile-felix" style="white-space:nowrap;">Felix</span>
+            {% elif event.profile %}
+              <span class="badge badge-quality" style="white-space:nowrap;">{{ event.profile }}</span>
+            {% else %}
+              <span class="muted" style="font-size:11px;">Unassigned</span>
+            {% endif %}
+          </td>
+          <td style="white-space:nowrap;">{{ (event.position_seconds ~ 's') if event.position_seconds is not none else '-' }}</td>
+          <td style="white-space:nowrap;">{{ (event.startup_ms ~ 'ms') if event.startup_ms is not none else '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="muted" style="text-align:center; padding:20px;">No Kids watch events yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
 
 <script>
@@ -129,34 +541,131 @@ async function changeState(url, state) {
 document.getElementById('kids-source-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
+  const btn = document.getElementById('kids-source-submit');
+  btn.disabled = true;
+
+  const profileSlugs = Array.from(event.currentTarget.querySelectorAll('input[name="profile_slugs"]:checked')).map(cb => cb.value);
+  const payload = {
+    kind: form.get('kind'),
+    reference: form.get('reference'),
+    title: form.get('title') || '',
+    profile_slugs: profileSlugs
+  };
+
   try {
     const response = await fetch('/api/kids/sources', {
       method: 'POST',
       headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
-      body: JSON.stringify(Object.fromEntries(form.entries()))
+      body: JSON.stringify(payload)
     });
     if (!response.ok) throw new Error(await response.text());
     statusNode.textContent = 'Source added. Guardian will check it before publishing.';
+    statusNode.style.color = '#047857';
     event.currentTarget.reset();
     setTimeout(() => location.reload(), 500);
   } catch (error) {
-    statusNode.textContent = `Could not add source: ${error}`;
+    statusNode.textContent = `Could not add source: ${error.message || error}`;
+    statusNode.style.color = '#b91c1c';
+    btn.disabled = false;
   }
+});
+
+// Profile Assignment updates via PUT /api/kids/sources/{source_id}/profiles
+document.querySelectorAll('.source-prof-cb').forEach((checkbox) => {
+  checkbox.addEventListener('change', async (e) => {
+    const sourceId = checkbox.dataset.sourceId;
+    const group = checkbox.closest('.profile-assignment-group');
+    const msgEl = document.getElementById(`prof-msg-${sourceId}`);
+    const checkedSlugs = Array.from(group.querySelectorAll('.source-prof-cb:checked')).map(cb => cb.value);
+
+    if (msgEl) {
+      msgEl.textContent = 'Saving...';
+      msgEl.style.color = '#5f6d6f';
+    }
+
+    try {
+      const response = await fetch(`/api/kids/sources/${sourceId}/profiles`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
+        body: JSON.stringify({
+          profile_slugs: checkedSlugs,
+          actor: 'parent-ui',
+          reason: 'Parent updated profile assignment',
+          correlation_id: correlation()
+        })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      if (msgEl) {
+        msgEl.textContent = 'Saved';
+        msgEl.style.color = '#047857';
+        setTimeout(() => { msgEl.textContent = ''; }, 2000);
+      }
+    } catch (err) {
+      if (msgEl) {
+        msgEl.textContent = `Error: ${err.message || err}`;
+        msgEl.style.color = '#b91c1c';
+      }
+    }
+  });
 });
 
 document.querySelectorAll('[data-state]').forEach((button) => {
   button.addEventListener('click', async () => {
     const row = button.closest('tr');
-    const sourceId = row?.dataset.id;
+    const sourceId = button.dataset.sourceId || row?.dataset.id;
     const itemId = button.dataset.itemId;
     const url = sourceId
       ? `/api/kids/sources/${sourceId}/state`
       : `/api/kids/catalog/items/${itemId}/state`;
     try {
+      button.disabled = true;
       await changeState(url, button.dataset.state);
     } catch (error) {
       statusNode.textContent = `Could not change state: ${error}`;
+      button.disabled = false;
     }
+  });
+});
+
+// Client-side filtering for Quick Resolve Table
+document.getElementById('quick-resolve-search')?.addEventListener('input', (e) => {
+  const q = e.target.value.toLowerCase().trim();
+  const status = document.getElementById('quick-resolve-status')?.value || 'all';
+  document.querySelectorAll('#quick-resolve-tbody tr.resolve-item-row').forEach(row => {
+    const matchQ = !q || (row.dataset.video || '').includes(q) || (row.dataset.title || '').includes(q) || (row.dataset.reason || '').includes(q);
+    const matchS = status === 'all' || (status === 'failed' ? (row.dataset.status === 'failed' || row.dataset.status === 'retry' || row.dataset.displayStatus === 'failed') : (row.dataset.status === status || row.dataset.displayStatus === status));
+    row.style.display = (matchQ && matchS) ? '' : 'none';
+  });
+});
+
+document.getElementById('quick-resolve-status')?.addEventListener('change', (e) => {
+  const status = e.target.value;
+  const q = (document.getElementById('quick-resolve-search')?.value || '').toLowerCase().trim();
+  document.querySelectorAll('#quick-resolve-tbody tr.resolve-item-row').forEach(row => {
+    const matchQ = !q || (row.dataset.video || '').includes(q) || (row.dataset.title || '').includes(q) || (row.dataset.reason || '').includes(q);
+    const matchS = status === 'all' || (status === 'failed' ? (row.dataset.status === 'failed' || row.dataset.status === 'retry' || row.dataset.displayStatus === 'failed') : (row.dataset.status === status || row.dataset.displayStatus === status));
+    row.style.display = (matchQ && matchS) ? '' : 'none';
+  });
+});
+
+// Client-side filtering for Quick Sources Table
+document.getElementById('quick-sources-search')?.addEventListener('input', (e) => {
+  const q = e.target.value.toLowerCase().trim();
+  const state = document.getElementById('quick-sources-state')?.value || 'all';
+  document.querySelectorAll('#kids-sources tr.source-item-row').forEach(row => {
+    const matchQ = !q || (row.dataset.title || '').includes(q) || (row.dataset.ref || '').includes(q);
+    const matchS = state === 'all' || (state === 'candidate' ? (row.dataset.state === 'candidate' || row.dataset.state === 'pending') : row.dataset.state === state);
+    row.style.display = (matchQ && matchS) ? '' : 'none';
+  });
+});
+
+document.getElementById('quick-sources-state')?.addEventListener('change', (e) => {
+  const state = e.target.value;
+  const q = (document.getElementById('quick-sources-search')?.value || '').toLowerCase().trim();
+  document.querySelectorAll('#kids-sources tr.source-item-row').forEach(row => {
+    const matchQ = !q || (row.dataset.title || '').includes(q) || (row.dataset.ref || '').includes(q);
+    const matchS = state === 'all' || (state === 'candidate' ? (row.dataset.state === 'candidate' || row.dataset.state === 'pending') : row.dataset.state === state);
+    row.style.display = (matchQ && matchS) ? '' : 'none';
   });
 });
 </script>

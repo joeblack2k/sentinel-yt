@@ -807,13 +807,15 @@ def test_playback_revalidation_can_omit_candidate(tmp_path, monkeypatch):
     async def disabled() -> bool:
         return False
 
-    async def authorize(video_id: str, *, minimum_remaining_seconds: int):
+    async def authorize(video_id: str, *, profile: str, minimum_remaining_seconds: int):
         assert video_id == "video-ready"
+        assert profile == "noah"
         assert minimum_remaining_seconds > 0
         return row
 
-    async def policy_authorize(video_id: str):
+    async def policy_authorize(video_id: str, *, profile: str):
         assert video_id == "video-ready"
+        assert profile == "noah"
         return {"item_id": 7, "video_id": "video-ready"}
 
     async def revision() -> int:
