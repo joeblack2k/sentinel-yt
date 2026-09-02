@@ -103,6 +103,9 @@ class RuntimeState:
     device_event_locks: dict[int, asyncio.Lock] = field(default_factory=dict)
     intervention_cooldown_until: dict[int, float] = field(default_factory=dict)
     mqtt_publish_due_at: float = 0.0
+    kids_reconcile_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    kids_reconciled_at: float = 0.0
+    kids_reconciled_blocklist_loaded_at: str = ""
 
     async def emit_live(self, payload: dict[str, Any]) -> None:
         dead: list[asyncio.Queue[dict[str, Any]]] = []
@@ -113,6 +116,29 @@ class RuntimeState:
                 dead.append(q)
         for q in dead:
             self.live_subscribers.discard(q)
+
+    async def reconcile_kids_catalog_policy(self, *, force: bool = False) -> int:
+        now = monotonic()
+        blocklist_loaded_at = self.blocklists.summary().get("loaded_at", "")
+        if (
+            not force
+            and now - self.kids_reconciled_at < 30
+            and blocklist_loaded_at == self.kids_reconciled_blocklist_loaded_at
+        ):
+            return 0
+        async with self.kids_reconcile_lock:
+            now = monotonic()
+            blocklist_loaded_at = self.blocklists.summary().get("loaded_at", "")
+            if (
+                not force
+                and now - self.kids_reconciled_at < 30
+                and blocklist_loaded_at == self.kids_reconciled_blocklist_loaded_at
+            ):
+                return 0
+            blocked = await self.judge.reconcile_catalog_policy()
+            self.kids_reconciled_at = monotonic()
+            self.kids_reconciled_blocklist_loaded_at = self.blocklists.summary().get("loaded_at", "")
+            return blocked
 
     async def get_status(self) -> dict[str, Any]:
         settings = await self.db.all_settings()
@@ -1065,6 +1091,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.runtime = runtime
     try:
+        await runtime.reconcile_kids_catalog_policy(force=True)
         await runtime.publish_mqtt_snapshot(force_discovery=True)
         runtime.supervisor_task = asyncio.create_task(runtime.supervisor(), name="sentinel-supervisor")
         yield
@@ -1421,7 +1448,7 @@ async def _kids_checked_lease(
 ) -> tuple[RuntimeState, dict[str, Any]]:
     runtime: RuntimeState = request.app.state.runtime
     if reconcile:
-        await runtime.judge.reconcile_catalog_policy()
+        await runtime.reconcile_kids_catalog_policy()
     state = await runtime.kids_policy_state()
     if state != "ready":
         raise _kids_unavailable(state)
@@ -1471,7 +1498,7 @@ async def kids_feed(
     profile: str = Query(default="noah", min_length=1, max_length=64),
 ) -> dict[str, Any]:
     runtime: RuntimeState = request.app.state.runtime
-    await runtime.judge.reconcile_catalog_policy()
+    await runtime.reconcile_kids_catalog_policy()
     state = await runtime.kids_policy_state()
     if cursor:
         session_id, offset = _decode_kids_cursor(cursor)
@@ -1526,7 +1553,7 @@ async def kids_feed(
 @app.get("/v1/kids/thumbnails/{asset_id}")
 async def kids_thumbnail(asset_id: str, request: Request) -> Response:
     runtime: RuntimeState = request.app.state.runtime
-    await runtime.judge.reconcile_catalog_policy()
+    await runtime.reconcile_kids_catalog_policy()
     state = await runtime.kids_policy_state()
     if state != "ready":
         raise _kids_unavailable(state)
@@ -1565,7 +1592,7 @@ async def kids_playback_session(
     request: Request,
 ) -> dict[str, Any]:
     runtime: RuntimeState = request.app.state.runtime
-    await runtime.judge.reconcile_catalog_policy()
+    await runtime.reconcile_kids_catalog_policy()
     state = await runtime.kids_policy_state()
     if state != "ready":
         raise _kids_unavailable(state)
@@ -1764,7 +1791,7 @@ async def api_catalog_items(request: Request) -> dict[str, Any]:
         return {"state": "kill_switch", "items": []}
     if not await runtime.monitoring_enabled_now():
         return {"state": "schedule_closed", "items": []}
-    await runtime.judge.reconcile_catalog_policy()
+    await runtime.reconcile_kids_catalog_policy()
     return {
         "state": "ready",
         "items": await runtime.db.kids_eligible_feed_list(runtime.settings.kids_playback_min_remaining_seconds),
@@ -1990,7 +2017,7 @@ async def api_kids_playback_authorization(
     runtime: RuntimeState = request.app.state.runtime
     if await runtime.db.kids_kill_switch_enabled() or not await runtime.monitoring_enabled_now():
         raise HTTPException(status_code=403, detail="Kids playback is unavailable")
-    await runtime.judge.reconcile_catalog_policy()
+    await runtime.reconcile_kids_catalog_policy()
     if include_candidate:
         row = await runtime.db.kids_playback_authorization(
             video_id,
@@ -2319,6 +2346,7 @@ async def api_whitelist(payload: RuleRequest, request: Request) -> dict[str, Any
         source_list="manual",
     )
     await runtime.allowlists.reload(runtime.db)
+    await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True}
 
 
@@ -2351,7 +2379,7 @@ async def api_blacklist(payload: RuleRequest, request: Request) -> dict[str, Any
         url=url,
         source_list="manual",
     )
-    blocked = await runtime.judge.reconcile_catalog_policy()
+    blocked = await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True, "blocked": blocked}
 
 
@@ -2361,14 +2389,16 @@ async def api_rules_policies(payload: PolicyFlagsRequest, request: Request) -> d
     flags = normalize_policy_flags(payload.flags)
     runtime: RuntimeState = request.app.state.runtime
     await runtime.db.set_setting("policy_flags_json", json.dumps(flags))
-    await runtime.judge.reconcile_catalog_policy()
+    await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True, "flags": flags}
 
 
 @app.post("/api/allowlist/policies")
 async def api_allowlist_policies(payload: AllowPolicyFlagsRequest, request: Request) -> dict[str, Any]:
     flags = normalize_allow_policy_flags(payload.flags)
-    await request.app.state.runtime.db.set_setting("allow_policy_flags_json", json.dumps(flags))
+    runtime: RuntimeState = request.app.state.runtime
+    await runtime.db.set_setting("allow_policy_flags_json", json.dumps(flags))
+    await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True, "flags": flags}
 
 
@@ -2378,7 +2408,7 @@ async def api_rules_blocklists_sources(payload: RulesImportSourcesRequest, reque
     runtime: RuntimeState = request.app.state.runtime
     await runtime.blocklists.set_sources(runtime.db, payload.urls)
     summary = await runtime.blocklists.reload(runtime.db)
-    blocked = await runtime.judge.reconcile_catalog_policy()
+    blocked = await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True, "summary": summary, "blocked": blocked, "sources": payload.urls}
 
 
@@ -2387,7 +2417,7 @@ async def api_rules_blocklists_sources(payload: RulesImportSourcesRequest, reque
 async def api_rules_blocklists_reload(request: Request) -> dict[str, Any]:
     runtime: RuntimeState = request.app.state.runtime
     summary = await runtime.blocklists.reload(runtime.db)
-    blocked = await runtime.judge.reconcile_catalog_policy()
+    blocked = await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True, "summary": summary, "blocked": blocked}
 
 
@@ -2397,7 +2427,7 @@ async def api_rules_blocklists_local(payload: LocalBlocklistContentRequest, requ
     runtime: RuntimeState = request.app.state.runtime
     await runtime.blocklists.save_local_content(payload.content)
     summary = await runtime.blocklists.reload(runtime.db)
-    blocked = await runtime.judge.reconcile_catalog_policy()
+    blocked = await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True, "summary": summary, "blocked": blocked}
 
 
@@ -2406,6 +2436,7 @@ async def api_allowlist_sources(payload: RulesImportSourcesRequest, request: Req
     runtime: RuntimeState = request.app.state.runtime
     await runtime.allowlists.set_sources(runtime.db, payload.urls)
     summary = await runtime.allowlists.reload(runtime.db)
+    await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True, "summary": summary, "sources": payload.urls}
 
 
@@ -2413,6 +2444,7 @@ async def api_allowlist_sources(payload: RulesImportSourcesRequest, request: Req
 async def api_allowlist_reload(request: Request) -> dict[str, Any]:
     runtime: RuntimeState = request.app.state.runtime
     summary = await runtime.allowlists.reload(runtime.db)
+    await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True, "summary": summary}
 
 
@@ -2421,6 +2453,7 @@ async def api_allowlist_local(payload: LocalBlocklistContentRequest, request: Re
     runtime: RuntimeState = request.app.state.runtime
     await runtime.allowlists.save_local_content(payload.content)
     summary = await runtime.allowlists.reload(runtime.db)
+    await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True, "summary": summary}
 
 
@@ -2433,9 +2466,11 @@ async def api_rule_delete(rule_id: int, request: Request) -> dict[str, Any]:
         if row.get("rule_type") == "blacklist":
             await runtime.blocklists.remove_entry(scope=row.get("scope", ""), value=row.get("value", ""))
             await runtime.blocklists.reload(runtime.db)
+            await runtime.reconcile_kids_catalog_policy(force=True)
         elif row.get("rule_type") == "whitelist":
             await runtime.allowlists.remove_entry(scope=row.get("scope", ""), value=row.get("value", ""))
             await runtime.allowlists.reload(runtime.db)
+            await runtime.reconcile_kids_catalog_policy(force=True)
     return {"ok": True}
 
 

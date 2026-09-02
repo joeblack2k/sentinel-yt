@@ -176,6 +176,27 @@ def test_feed_is_opaque_sanitary_and_profile_bound(tmp_path, monkeypatch):
         assert client.get("/v1/kids/feed", params={"cursor": "bad.cursor"}).status_code == 400
 
 
+def test_feed_reuses_recent_policy_reconcile_until_forced(tmp_path, monkeypatch):
+    asyncio.run(seed_catalog(tmp_path / "sentinel.db"))
+    module = load_app(tmp_path, monkeypatch)
+    mock_upstream(monkeypatch, module, [])
+    calls = []
+
+    async def fake_reconcile():
+        calls.append(True)
+        return 0
+
+    with TestClient(module.app) as client:
+        module.judge.reconcile_catalog_policy = fake_reconcile
+        assert client.get("/v1/kids/feed", params={"limit": 1}).status_code == 200
+        assert client.get("/v1/kids/feed", params={"limit": 1}).status_code == 200
+        assert calls == []
+
+        module.app.state.runtime.kids_reconciled_at = 0
+        assert client.get("/v1/kids/feed", params={"limit": 1}).status_code == 200
+        assert calls == [True]
+
+
 def test_playback_relay_manifest_range_head_event_and_delete(tmp_path, monkeypatch):
     asyncio.run(seed_catalog(tmp_path / "sentinel.db", qualities=(1080,)))
     module = load_app(tmp_path, monkeypatch)
