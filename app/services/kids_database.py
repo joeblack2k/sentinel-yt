@@ -22,8 +22,8 @@ from .time_utils import utc_now_iso
 
 
 DEFAULT_KIDS_PROFILES = (
-    ("noah", "Noah", 6, "noah", 0),
-    ("felix", "Felix", 2, "felix", 1),
+    ("noah", "Noah", 6, "hare.fill", 0),
+    ("felix", "Felix", 2, "tortoise.fill", 1),
 )
 DEFAULT_KIDS_PROFILE_SLUGS = frozenset(profile[0] for profile in DEFAULT_KIDS_PROFILES)
 
@@ -66,6 +66,17 @@ class KidsDatabaseMixin:
                 [
                     (slug, name, age, avatar, 1, order, now, now)
                     for slug, name, age, avatar, order in DEFAULT_KIDS_PROFILES
+                ],
+            )
+            await db.executemany(
+                """
+                UPDATE kids_profiles
+                SET avatar_key=?,updated_at=?
+                WHERE slug=? AND avatar_key IN ('',?)
+                """,
+                [
+                    (avatar, now, slug, slug)
+                    for slug, _name, _age, avatar, _order in DEFAULT_KIDS_PROFILES
                 ],
             )
             marker = await (

@@ -18,6 +18,7 @@ def test_default_profiles_and_assignment_changes_survive_reinit(tmp_path):
         ("noah", 6),
         ("felix", 2),
     ]
+    assert [row["avatar_key"] for row in profiles] == ["hare.fill", "tortoise.fill"]
 
     source = asyncio.run(
         db.catalog_create(
