@@ -261,7 +261,7 @@ See:
 - `ops/synology/compose.yaml`
 - `ops/synology/.env.template`
 - `ops/synology/README_DEPLOY_SYNOLOGY.md`
-- `ops/synology/deploy_bundle.tar.gz`
+Build the deployment bundle from these source files during deployment; generated archives are not committed.
 
 ## Testing
 ```bash

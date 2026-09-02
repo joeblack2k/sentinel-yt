@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
+from app import kids_api
 from app.db import Database
 
 
@@ -29,7 +30,7 @@ def test_kids_readyz_requires_fresh_ingest_and_opencodex(tmp_path, monkeypatch):
     monkeypatch.setenv("KIDS_INGEST_FRESHNESS_SECONDS", "1800")
     monkeypatch.setenv("KIDS_READY_MINIMUM", "0")
     module = importlib.reload(importlib.import_module("app.main"))
-    monkeypatch.setattr(module, "OpenCodexKidsClassifier", FakeClassifier)
+    monkeypatch.setattr(kids_api, "OpenCodexKidsClassifier", FakeClassifier)
 
     with TestClient(module.app) as client:
         assert client.get("/api/kids/readyz").status_code == 503
