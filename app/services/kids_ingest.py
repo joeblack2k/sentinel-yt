@@ -224,6 +224,7 @@ class YouTubeKidsCDP:
         self.cdp_url = cdp_url.rstrip("/")
         self.wait_seconds = wait_seconds
         self._target_id: str | None = None
+        self._setup_required = False
 
     async def _json(self, path: str) -> dict[str, Any] | list[dict[str, Any]]:
         def load() -> dict[str, Any] | list[dict[str, Any]]:
@@ -428,6 +429,7 @@ class YouTubeKidsCDP:
                 break
             payload = json.loads(result["result"].get("value", "{}"))
             if payload.get("setup_required"):
+                self._setup_required = True
                 raise KidsBrowserSetupRequired(
                     "YouTube Kids parent setup is required in the persistent browser"
                 )
@@ -492,6 +494,7 @@ class YouTubeKidsCDP:
         )
 
     async def cards_for_source(self, kind: str, reference: str) -> list[dict[str, Any]]:
+        self._setup_required = False
         target_url = source_url(kind, reference)
         target = await self._reusable_target()
         async with websockets.connect(target["webSocketDebuggerUrl"]) as page:
@@ -546,10 +549,11 @@ class YouTubeKidsCDP:
                         collected.setdefault(key, card)
                 return list(collected.values())[:_MAX_COLLECTED_CARDS]
             finally:
-                try:
-                    await self._restore_home_on_page(page)
-                except Exception:
-                    logger.warning("Could not restore the persistent YouTube Kids page")
+                if not self._setup_required:
+                    try:
+                        await self._restore_home_on_page(page)
+                    except Exception:
+                        logger.warning("Could not restore the persistent YouTube Kids page")
 
     async def youtube_cookies(self) -> list[dict[str, Any]]:
         target = await self._reusable_target()
@@ -583,6 +587,9 @@ class YouTubeKidsCDP:
     async def restore_home(self) -> None:
         """Leave the persistent user page on Kids home without creating a target."""
         if self._target_id is None:
+            return
+        if self._setup_required:
+            self._setup_required = False
             return
         try:
             target = await self._target(self._target_id)

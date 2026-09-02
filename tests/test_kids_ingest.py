@@ -411,6 +411,85 @@ async def test_cdp_reports_parent_setup_before_scrolling():
 
 
 @pytest.mark.asyncio
+async def test_cdp_does_not_restore_home_after_parent_setup_abort(monkeypatch):
+    import app.services.kids_ingest as kids_ingest
+
+    commands: list[dict] = []
+    home_url = "https://www.youtubekids.com/"
+
+    class FakeWebSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def send(self, message):
+            commands.append(json.loads(message))
+
+        async def recv(self):
+            command = commands[-1]
+            if command["method"] == "Runtime.evaluate":
+                return json.dumps(
+                    {
+                        "id": command["id"],
+                        "result": {
+                            "result": {
+                                "value": json.dumps(
+                                    {
+                                        "url": home_url,
+                                        "ready": "complete",
+                                        "setup_required": True,
+                                        "cards": [],
+                                    }
+                                )
+                            }
+                        },
+                    }
+                )
+            return json.dumps({"id": command["id"], "result": {}})
+
+    monkeypatch.setattr(
+        kids_ingest.websockets,
+        "connect",
+        lambda url, **kwargs: FakeWebSocket(),
+    )
+    adapter = kids_ingest.YouTubeKidsCDP(wait_seconds=0.5)
+
+    async def fake_json(path):
+        assert path == "/json/list"
+        return [
+            {
+                "id": "target-1",
+                "type": "page",
+                "url": home_url,
+                "webSocketDebuggerUrl": "ws://page",
+            }
+        ]
+
+    adapter._json = fake_json
+
+    with pytest.raises(kids_ingest.KidsBrowserSetupRequired):
+        await adapter.cards_for_source("channel", HOME_SOURCE_REFERENCE)
+
+    navigate_urls = [
+        command["params"]["url"]
+        for command in commands
+        if command["method"] == "Page.navigate"
+    ]
+    assert navigate_urls == [home_url]
+    assert adapter._setup_required
+    await adapter.restore_home()
+    assert not adapter._setup_required
+    navigate_urls = [
+        command["params"]["url"]
+        for command in commands
+        if command["method"] == "Page.navigate"
+    ]
+    assert navigate_urls == [home_url]
+
+
+@pytest.mark.asyncio
 async def test_cdp_allows_transient_external_redirect_only_until_kids_returns(monkeypatch):
     import app.services.kids_ingest as kids_ingest
 
