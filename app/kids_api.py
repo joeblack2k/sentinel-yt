@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import secrets
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncGenerator
 from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from .models import (
     CatalogItemRequest,
@@ -24,6 +27,7 @@ from .services.kids_classifier import OpenCodexKidsClassifier
 
 
 KIDS_DATAPLANE_POLICY_VERSION = "sentinel-kids-v1"
+KIDS_PROFILE_AVATAR_MAX_BYTES = 10 * 1024 * 1024
 router = APIRouter()
 
 
@@ -100,6 +104,46 @@ async def _kids_profile(request: Request, profile: str, *, require_enabled: bool
             detail={"code": "kids_profile_not_found", "message": "Kids profile is unavailable."},
         )
     return row
+
+
+def _kids_profile_avatar_path(request: Request, profile: str) -> Path:
+    return Path(request.app.state.runtime.settings.data_dir) / "profile-avatars" / profile
+
+
+def _kids_profile_avatar_media_type(data: bytes) -> str | None:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in {b"avif", b"avis"}:
+            return "image/avif"
+        if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+            return "image/heic"
+    return None
+
+
+async def _kids_profile_avatar_body(request: Request) -> bytes:
+    data = bytearray()
+    async for chunk in request.stream():
+        data.extend(chunk)
+        if len(data) > KIDS_PROFILE_AVATAR_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Profile image exceeds 10 MB")
+    return bytes(data)
+
+
+def kids_profile_payload(request: Request, profile: dict[str, Any]) -> dict[str, Any]:
+    avatar_path = _kids_profile_avatar_path(request, profile["slug"])
+    avatar_url = None
+    if avatar_path.is_file():
+        avatar_url = (
+            f"{str(request.base_url).rstrip('/')}/api/kids/profiles/"
+            f"{profile['slug']}/avatar?v={avatar_path.stat().st_mtime_ns}"
+        )
+    return {**profile, "avatar_url": avatar_url}
 
 
 async def _kids_checked_lease(
@@ -538,7 +582,76 @@ async def api_catalog_source(payload: CatalogSourceRequest, request: Request) ->
 
 @router.get("/api/kids/profiles")
 async def api_kids_profiles(request: Request) -> dict[str, Any]:
-    return {"profiles": await request.app.state.runtime.db.kids_profiles_list()}
+    profiles = await request.app.state.runtime.db.kids_profiles_list()
+    return {"profiles": [kids_profile_payload(request, profile) for profile in profiles]}
+
+
+@router.get("/api/kids/profiles/{profile}/avatar")
+async def api_kids_profile_avatar(profile: str, request: Request) -> FileResponse:
+    profile = (await _kids_profile(request, profile, require_enabled=False))["slug"]
+    avatar_path = _kids_profile_avatar_path(request, profile)
+    if not avatar_path.is_file():
+        raise HTTPException(status_code=404, detail="Profile image not found")
+    media_type = _kids_profile_avatar_media_type(avatar_path.read_bytes()[:32])
+    if media_type is None:
+        raise HTTPException(status_code=404, detail="Profile image is invalid")
+    return FileResponse(
+        avatar_path,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@router.put("/api/kids/profiles/{profile}/avatar")
+async def api_kids_profile_avatar_update(profile: str, request: Request) -> dict[str, Any]:
+    profile_row = await _kids_profile(request, profile, require_enabled=False)
+    data = await _kids_profile_avatar_body(request)
+    media_type = _kids_profile_avatar_media_type(data)
+    if media_type is None:
+        raise HTTPException(status_code=415, detail="Use a JPEG, PNG, WebP, HEIC, HEIF, or AVIF image")
+
+    avatar_path = _kids_profile_avatar_path(request, profile_row["slug"])
+    avatar_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = avatar_path.with_name(
+        f".{profile_row['slug']}.{secrets.token_hex(8)}.tmp"
+    )
+    try:
+        temporary_path.write_bytes(data)
+        os.replace(temporary_path, avatar_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    await request.app.state.runtime.db.audit_kids_event(
+        event="profile_avatar_updated",
+        entity_type="profile",
+        actor="parent-ui",
+        reason=f"profile={profile_row['slug']} media_type={media_type} bytes={len(data)}",
+        correlation_id=request.headers.get(
+            "X-Correlation-ID",
+            f"profile-avatar-{profile_row['slug']}",
+        ),
+    )
+    return {"profile": kids_profile_payload(request, profile_row)}
+
+
+@router.delete("/api/kids/profiles/{profile}/avatar")
+async def api_kids_profile_avatar_delete(profile: str, request: Request) -> dict[str, Any]:
+    profile_row = await _kids_profile(request, profile, require_enabled=False)
+    avatar_path = _kids_profile_avatar_path(request, profile_row["slug"])
+    existed = avatar_path.is_file()
+    avatar_path.unlink(missing_ok=True)
+    if existed:
+        await request.app.state.runtime.db.audit_kids_event(
+            event="profile_avatar_deleted",
+            entity_type="profile",
+            actor="parent-ui",
+            reason=f"profile={profile_row['slug']}",
+            correlation_id=request.headers.get(
+                "X-Correlation-ID",
+                f"profile-avatar-{profile_row['slug']}",
+            ),
+        )
+    return {"profile": kids_profile_payload(request, profile_row)}
 
 
 @router.put("/api/kids/sources/{source_id}/profiles")

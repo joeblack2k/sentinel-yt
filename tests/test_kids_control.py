@@ -82,6 +82,8 @@ def test_parent_kids_page_is_available(tmp_path, monkeypatch):
         assert "SubTube Kids" in response.text
         assert "Kids sources" in response.text
         assert "Guardian check" in response.text
+        assert 'avatar-upload' in response.text
+        assert 'avatar-delete' in response.text
 
         source = client.post(
             "/api/kids/sources",

@@ -54,28 +54,45 @@
 <!-- Profile Presentation Deck -->
 <section class="card">
   <h2>Child Profiles</h2>
+  {% set has_profiles = profiles is defined and profiles %}
+  {% set profile_rows = profiles if has_profiles else [
+    {'slug': 'noah', 'display_name': 'Noah', 'age_years': 6, 'summary': 'Active profile • Curated educational & kids entertainment'},
+    {'slug': 'felix', 'display_name': 'Felix', 'age_years': 2, 'summary': 'Toddler profile • Age-appropriate sensory and early learning'}
+  ] %}
   <div class="profile-deck">
-    {% for p in profiles if profiles is defined and profiles %}
+    {% for p in profile_rows %}
     <div class="profile-card profile-{{ p.slug }}">
-      <div class="profile-icon">{{ (p.display_name or p.slug)[:1]|upper }}</div>
-      <div class="profile-meta">
-        <h3>{{ p.display_name }} <span class="badge badge-profile-{{ p.slug }}">Age {{ p.age_years }}</span></h3>
-        <p>{{ p.approved_source_count }} approved / {{ p.source_count }} total sources • Profile ID: <code>{{ p.slug }}</code></p>
+      <div class="profile-avatar-wrap">
+        {% if p.avatar_url %}
+          <img class="profile-avatar" src="{{ p.avatar_url }}" alt="{{ p.display_name }}" onerror="this.hidden=true; this.nextElementSibling.hidden=false;">
+          <div class="profile-icon" hidden>{{ (p.display_name or p.slug)[:1]|upper }}</div>
+        {% else %}
+          <div class="profile-icon">{{ (p.display_name or p.slug)[:1]|upper }}</div>
+        {% endif %}
       </div>
-    </div>
-    {% else %}
-    <div class="profile-card profile-noah">
-      <div class="profile-icon">N</div>
       <div class="profile-meta">
-        <h3>Noah <span class="badge badge-profile-noah">Age 6</span></h3>
-        <p>Active profile • Curated educational &amp; kids entertainment (Profile ID: <code>noah</code>)</p>
-      </div>
-    </div>
-    <div class="profile-card profile-felix">
-      <div class="profile-icon">F</div>
-      <div class="profile-meta">
-        <h3>Felix <span class="badge badge-profile-felix">Age 2</span></h3>
-        <p>Toddler profile • Age-appropriate sensory and early learning (Profile ID: <code>felix</code>)</p>
+        <div>
+          <h3>{{ p.display_name }} <span class="badge badge-profile-{{ p.slug }}">Age {{ p.age_years }}</span></h3>
+          <p>
+            {% if has_profiles %}
+              {{ p.approved_source_count }} approved / {{ p.source_count }} total sources
+            {% else %}
+              {{ p.summary }}
+            {% endif %}
+            • Profile ID: <code>{{ p.slug }}</code>
+          </p>
+        </div>
+        {% if has_profiles %}
+        <div class="inline-actions">
+          <label class="small-btn avatar-upload-label" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){this.querySelector('input').click(); event.preventDefault();}">
+            <input type="file" class="avatar-upload" data-slug="{{ p.slug }}" accept="image/jpeg, image/png, image/webp, image/heic, image/heif, image/avif">
+            <span class="upload-text">{% if p.avatar_url %}Replace Photo{% else %}Upload Photo{% endif %}</span>
+          </label>
+          {% if p.avatar_url %}
+          <button type="button" class="small-btn btn-revoke avatar-delete" data-slug="{{ p.slug }}">Remove</button>
+          {% endif %}
+        </div>
+        {% endif %}
       </div>
     </div>
     {% endfor %}
@@ -623,6 +640,57 @@ document.querySelectorAll('[data-state]').forEach((button) => {
     } catch (error) {
       statusNode.textContent = `Could not change state: ${error}`;
       button.disabled = false;
+    }
+  });
+});
+
+document.querySelectorAll('.avatar-upload').forEach(input => {
+  input.addEventListener('change', async (e) => {
+    if (!e.target.files || e.target.files.length === 0) return;
+    const file = e.target.files[0];
+    const slug = e.target.dataset.slug;
+    const label = e.target.closest('label');
+    const textSpan = label.querySelector('.upload-text');
+    const originalText = textSpan.textContent;
+    textSpan.textContent = 'Uploading...';
+    label.style.pointerEvents = 'none';
+
+    try {
+      const response = await fetch(`/api/kids/profiles/${slug}/avatar`, {
+        method: 'PUT',
+        headers: {'X-Correlation-ID': correlation()},
+        body: file
+      });
+      if (!response.ok) throw new Error(await response.text());
+      location.reload();
+    } catch (err) {
+      alert(`Could not upload avatar: ${err.message}`);
+      textSpan.textContent = originalText;
+      label.style.pointerEvents = 'auto';
+      e.target.value = ''; // Reset input to allow retrying the same file
+    }
+  });
+});
+
+document.querySelectorAll('.avatar-delete').forEach(btn => {
+  btn.addEventListener('click', async (e) => {
+    if (!confirm('Remove profile photo?')) return;
+    const slug = e.target.dataset.slug;
+    const originalText = e.target.textContent;
+    e.target.textContent = 'Removing...';
+    e.target.disabled = true;
+
+    try {
+      const response = await fetch(`/api/kids/profiles/${slug}/avatar`, {
+        method: 'DELETE',
+        headers: {'X-Correlation-ID': correlation()}
+      });
+      if (!response.ok) throw new Error(await response.text());
+      location.reload();
+    } catch (err) {
+      alert(`Could not remove avatar: ${err.message}`);
+      e.target.textContent = originalText;
+      e.target.disabled = false;
     }
   });
 });
