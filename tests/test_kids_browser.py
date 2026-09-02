@@ -121,6 +121,8 @@ def test_sentinel_units_own_the_persistent_browser_runtime() -> None:
     root = Path(__file__).resolve().parents[1]
     browser_unit = (root / "deploy/sentinel-yt-kids-browser.service").read_text()
     novnc_unit = (root / "deploy/sentinel-yt-kids-novnc.service").read_text()
+    ingest_unit = (root / "deploy/sentinel-yt-kids-ingest.service").read_text()
+    resolver_unit = (root / "deploy/sentinel-yt-kids-resolver.service").read_text()
 
     assert "app.services.kids_browser" in browser_unit
     assert "/opt/sentinel-yt/current" in browser_unit
@@ -130,3 +132,7 @@ def test_sentinel_units_own_the_persistent_browser_runtime() -> None:
     )
     assert "subtube-kids-guardian" not in browser_unit
     assert "Requires=sentinel-yt-kids-browser.service" in novnc_unit
+    assert "sentinel-yt-kids-browser.service" in ingest_unit
+    assert "sentinel-yt-kids-browser.service" in resolver_unit
+    assert "youtube-sub-browser" not in ingest_unit
+    assert "youtube-sub-browser" not in resolver_unit
