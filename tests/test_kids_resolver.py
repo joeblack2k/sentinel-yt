@@ -185,6 +185,30 @@ def test_unknown_candidate_transport_is_denied():
     ) is None
 
 
+async def approved_item_for_source(
+    db: Database,
+    source_id: int,
+    channel_id: str,
+    video_id: str,
+) -> dict:
+    item = await db.catalog_create(
+        "item",
+        {
+            "video_id": video_id,
+            "source_id": source_id,
+            "channel_id": channel_id,
+            "channel_title": "Approved channel",
+            "correlation_id": "item",
+        },
+    )
+    await db.catalog_transition(
+        "item",
+        item["id"],
+        {"state": "approved", "actor": "parent", "reason": "approved", "correlation_id": "item-state"},
+    )
+    return item
+
+
 async def eligible_item(db: Database, video_id: str = "video-ready") -> dict:
     channel_id = f"UC-{video_id}"
     source = await db.catalog_create(
@@ -202,20 +226,7 @@ async def eligible_item(db: Database, video_id: str = "video-ready") -> dict:
     await db.catalog_transition(
         "source", source["id"], {"state": "approved", "actor": "parent", "reason": "approved", "correlation_id": "source-state"}
     )
-    item = await db.catalog_create(
-        "item",
-        {
-            "video_id": video_id,
-            "source_id": source["id"],
-            "channel_id": channel_id,
-            "channel_title": "Approved channel",
-            "correlation_id": "item",
-        },
-    )
-    await db.catalog_transition(
-        "item", item["id"], {"state": "approved", "actor": "parent", "reason": "approved", "correlation_id": "item-state"}
-    )
-    return item
+    return await approved_item_for_source(db, source["id"], channel_id, video_id)
 
 
 async def persist_ready_candidate(db: Database, item_id: int, quality_height: int = 1080) -> None:
@@ -721,6 +732,30 @@ async def test_feed_orders_newly_probed_candidates_first(tmp_path):
 
     feed = await db.kids_eligible_feed_list(300)
     assert [item["video_id"] for item in feed] == ["video-newer", "video-older"]
+
+
+@pytest.mark.asyncio
+async def test_feed_interleaves_sources_without_losing_freshness(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    first_source_item = await eligible_item(db, "video-source-a-1")
+    second_source_item = await eligible_item(db, "video-source-b-1")
+    extra_item = await approved_item_for_source(
+        db,
+        first_source_item["source_id"],
+        first_source_item["channel_id"],
+        "video-source-a-2",
+    )
+    for item in (first_source_item, second_source_item, extra_item):
+        await persist_ready_candidate(db, item["id"])
+
+    feed = await db.kids_eligible_feed_list(300)
+    source_ids = [item["source_id"] for item in feed]
+    assert source_ids == [
+        first_source_item["source_id"],
+        second_source_item["source_id"],
+        first_source_item["source_id"],
+    ]
 
 
 @pytest.mark.asyncio

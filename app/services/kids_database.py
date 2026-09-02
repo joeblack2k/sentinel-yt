@@ -403,7 +403,13 @@ class KidsDatabaseMixin:
                 JOIN kids_resolve_backlog b ON b.item_id=i.id
                 WHERE i.state='approved' AND s.state='approved' AND s.safety_verdict='SAFE'
                   AND s.reference!=? AND b.status='ready' AND b.quality_height>=? AND b.expires_at>?
-                ORDER BY b.resolved_at DESC,i.id ASC
+                ORDER BY
+                    ROW_NUMBER() OVER (
+                        PARTITION BY i.source_id
+                        ORDER BY b.resolved_at DESC,i.id ASC
+                    ),
+                    MAX(b.resolved_at) OVER (PARTITION BY i.source_id) DESC,
+                    b.resolved_at DESC,i.id ASC
                 """,
                 (
                     KIDS_HOME_SOURCE_REFERENCE,
@@ -473,7 +479,13 @@ class KidsDatabaseMixin:
                     WHERE i.state='approved' AND s.state='approved'
                       AND s.safety_verdict='SAFE' AND s.reference!=?
                       AND b.status='ready' AND b.quality_height>=? AND b.expires_at>?
-                    ORDER BY b.resolved_at DESC,i.id ASC
+                    ORDER BY
+                        ROW_NUMBER() OVER (
+                            PARTITION BY i.source_id
+                            ORDER BY b.resolved_at DESC,i.id ASC
+                        ),
+                        MAX(b.resolved_at) OVER (PARTITION BY i.source_id) DESC,
+                        b.resolved_at DESC,i.id ASC
                     """,
                     (KIDS_HOME_SOURCE_REFERENCE, minimum_quality_height, expires_after),
                 )
