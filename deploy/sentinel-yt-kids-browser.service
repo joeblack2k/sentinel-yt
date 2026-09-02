@@ -1,0 +1,32 @@
+[Unit]
+Description=Sentinel Kids persistent YouTube Kids browser
+After=network-online.target
+Wants=network-online.target
+Conflicts=youtube-sub-browser-auth-browser.service subtube-kids-browser.service
+
+[Service]
+Type=simple
+User=homelab
+Group=homelab
+WorkingDirectory=/opt/sentinel-yt/current
+EnvironmentFile=-/opt/sentinel-yt/.env
+Environment=PATH=/opt/sentinel-yt/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONPATH=/opt/sentinel-yt/current
+Environment=PYTHONUNBUFFERED=1
+Environment=KIDS_BROWSER_PROFILE_PATH=/opt/youtube-sub-browser/data/youtube-web-profile
+Environment=KIDS_BROWSER_CDP_PORT=9223
+Environment=KIDS_BROWSER_VNC_PORT=5901
+Environment=KIDS_BROWSER_DISPLAY=:99
+ExecStart=/opt/sentinel-yt/.venv/bin/python -m app.services.kids_browser
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/youtube-sub-browser/data/youtube-web-profile
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

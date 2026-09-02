@@ -85,6 +85,12 @@ For the integrated LAN service, deploy Sentinel on port `8090` and run the
 Kids ingest and resolver timers from `deploy/`. Every deployment should record
 the exact Git SHA in `SENTINEL_BUILD_VERSION`.
 
+The persistent YouTube Kids Chromium and noVNC services are also owned by this
+repository through `deploy/sentinel-yt-kids-browser.service` and
+`deploy/sentinel-yt-kids-novnc.service`. The browser reuses the existing
+`/opt/youtube-sub-browser/data/youtube-web-profile`; deployments must never
+replace that profile directory.
+
 The Home Assistant add-on files are in `addon/sentinel-yt`. Synology deployment
 uses the source files under `ops/synology`; generated archives are built during
 deployment and are not committed.

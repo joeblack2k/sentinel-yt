@@ -1,0 +1,17 @@
+[Unit]
+Description=Sentinel Kids browser noVNC
+After=sentinel-yt-kids-browser.service
+Requires=sentinel-yt-kids-browser.service
+
+[Service]
+Type=simple
+User=homelab
+Group=homelab
+ExecStart=/usr/bin/websockify --web=/usr/share/novnc 0.0.0.0:6080 127.0.0.1:5901
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
