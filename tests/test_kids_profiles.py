@@ -47,7 +47,7 @@ def test_default_profiles_and_assignment_changes_survive_reinit(tmp_path):
 
 def test_feed_is_separated_by_profile(tmp_path, monkeypatch):
     db_path = tmp_path / "sentinel.db"
-    db = asyncio.run(seed_catalog(db_path, qualities=(1080,)))
+    db = asyncio.run(seed_catalog(db_path, qualities=(1080, 1080)))
     source = asyncio.run(db.catalog_sources_list())[0]
     asyncio.run(
         db.kids_source_profiles_set(
@@ -65,11 +65,19 @@ def test_feed_is_separated_by_profile(tmp_path, monkeypatch):
 
     with TestClient(module.app) as client:
         noah = client.get("/v1/kids/feed", params={"profile": "noah", "limit": 10})
-        felix = client.get("/v1/kids/feed", params={"profile": "felix", "limit": 10})
+        felix = client.get("/v1/kids/feed", params={"profile": "felix", "limit": 1})
         assert noah.status_code == 200
         assert felix.status_code == 200
         assert noah.json()["items"] == []
         assert len(felix.json()["items"]) == 1
+        assert felix.json()["next_cursor"]
+
+        next_page = client.get(
+            "/v1/kids/feed",
+            params={"cursor": felix.json()["next_cursor"], "limit": 1},
+        )
+        assert next_page.status_code == 200
+        assert len(next_page.json()["items"]) == 1
 
 
 def test_source_api_exposes_profiles_and_assignment_endpoint(tmp_path, monkeypatch):

@@ -32,12 +32,15 @@ async def api_catalog_revision(request: Request) -> dict[str, Any]:
     return {"revision": await request.app.state.runtime.db.catalog_revision()}
 
 
-def _encode_kids_cursor(session_id: str, offset: int) -> str:
-    payload = json.dumps([session_id, int(offset)], separators=(",", ":")).encode()
+def _encode_kids_cursor(session_id: str, offset: int, profile: str) -> str:
+    payload = json.dumps(
+        [session_id, int(offset), profile],
+        separators=(",", ":"),
+    ).encode()
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
-def _decode_kids_cursor(value: str) -> tuple[str, int]:
+def _decode_kids_cursor(value: str) -> tuple[str, int, str]:
     try:
         if not value or len(value) > 512 or any(
             character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -48,15 +51,18 @@ def _decode_kids_cursor(value: str) -> tuple[str, int]:
         payload = json.loads(decoded)
         if (
             not isinstance(payload, list)
-            or len(payload) != 2
+            or len(payload) != 3
             or not isinstance(payload[0], str)
             or not payload[0]
             or len(payload[0]) > 128
             or type(payload[1]) is not int
             or payload[1] < 0
+            or not isinstance(payload[2], str)
+            or not payload[2]
+            or len(payload[2]) > 64
         ):
             raise ValueError
-        return payload[0], payload[1]
+        return payload[0], payload[1], payload[2]
     except (ValueError, TypeError, json.JSONDecodeError):
         raise HTTPException(
             status_code=400,
@@ -151,16 +157,25 @@ async def kids_feed(
     request: Request,
     cursor: str | None = Query(default=None),
     limit: int = Query(default=36, ge=1, le=60),
-    profile: str = Query(default="noah", min_length=1, max_length=64),
+    profile: str | None = Query(default=None, min_length=1, max_length=64),
 ) -> dict[str, Any]:
     runtime: Any = request.app.state.runtime
-    profile = str(profile or "").strip().lower()
+    requested_profile = str(profile or "").strip().lower()
     await runtime.reconcile_kids_catalog_policy()
     state = await runtime.kids_policy_state()
     if cursor:
-        session_id, offset = _decode_kids_cursor(cursor)
+        session_id, offset, cursor_profile = _decode_kids_cursor(cursor)
+        if requested_profile and requested_profile != cursor_profile:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "kids_feed_profile_mismatch",
+                    "message": "Kids feed cursor is no longer valid.",
+                },
+            )
+        profile = (await _kids_profile(request, cursor_profile))["slug"]
     else:
-        profile = (await _kids_profile(request, profile))["slug"]
+        profile = (await _kids_profile(request, requested_profile or "noah"))["slug"]
         session = await runtime.db.kids_feed_session_create(
             profile=profile,
             policy_version=KIDS_DATAPLANE_POLICY_VERSION,
@@ -200,7 +215,7 @@ async def kids_feed(
         "catalog_revision": str(await runtime.db.catalog_revision()),
         "items": response_items,
         "next_cursor": (
-            _encode_kids_cursor(session_id, next_offset)
+            _encode_kids_cursor(session_id, next_offset, profile)
             if next_offset is not None
             else None
         ),
