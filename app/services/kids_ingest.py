@@ -692,6 +692,7 @@ async def ingest_once(
         1 if home_source.get("state") == "approved" else 0
     )
     sources = eligible_sources
+    next_source_offset: int | None = None
     if source_batch_size is not None and source_batch_size > 0 and len(sources) > source_batch_size:
         try:
             source_offset = max(0, int((await db.get_setting("kids_ingest_source_offset")) or "0"))
@@ -700,8 +701,7 @@ async def ingest_once(
         source_offset %= len(sources)
         ordered_sources = sources[source_offset:] + sources[:source_offset]
         sources = ordered_sources[:source_batch_size]
-        next_offset = (source_offset + len(sources)) % len(eligible_sources)
-        await db.set_setting("kids_ingest_source_offset", str(next_offset))
+        next_source_offset = (source_offset + len(sources)) % len(eligible_sources)
     home_cards_by_channel: dict[str, list[dict[str, Any]]] = {}
     for card in raw_cards[:max_cards_per_source]:
         channel_id = str(card.get("channel_id", "")).strip()
@@ -842,6 +842,8 @@ async def ingest_once(
             report.uncertain += 1
 
     if home_source.get("state") != "approved" or not safe_source_by_channel:
+        if next_source_offset is not None:
+            await db.set_setting("kids_ingest_source_offset", str(next_source_offset))
         return report
     candidates: list[KidsVideoCandidate] = []
     for channel_id, source in safe_source_by_channel.items():
@@ -955,6 +957,8 @@ async def ingest_once(
         )
         report.approved += 1
     await db.kids_resolve_sync_backlog()
+    if next_source_offset is not None:
+        await db.set_setting("kids_ingest_source_offset", str(next_source_offset))
     return report
 
 

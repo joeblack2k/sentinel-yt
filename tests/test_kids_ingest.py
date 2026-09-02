@@ -709,6 +709,45 @@ async def test_ingest_rotates_source_batches_between_runs(tmp_path):
     assert second.approved == 1
 
 
+@pytest.mark.asyncio
+async def test_ingest_keeps_source_offset_when_batch_aborts(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    channel_ids = [f"UC{index:022d}" for index in range(1, 4)]
+    for channel_id in channel_ids:
+        await db.catalog_create(
+            "source",
+            {
+                "kind": "channel",
+                "reference": channel_id,
+                "title": f"Channel {channel_id[-1]}",
+                "correlation_id": f"source-{channel_id}",
+            },
+        )
+    await db.set_setting("kids_ingest_source_offset", "1")
+
+    class FailingBrowser:
+        references: list[str] = []
+
+        async def cards_for_source(self, kind, reference):
+            self.references.append(reference)
+            if reference == HOME_SOURCE_REFERENCE:
+                return []
+            raise KidsBrowserSetupRequired("setup")
+
+    browser = FailingBrowser()
+    report = await ingest_once(
+        db,
+        browser,
+        FakeClassifier("SAFE"),
+        source_batch_size=2,
+    )
+
+    assert report.errors == 1
+    assert browser.references == [HOME_SOURCE_REFERENCE, channel_ids[1]]
+    assert await db.get_setting("kids_ingest_source_offset") == "1"
+
+
 @dataclass
 class ChannelHomeBrowser:
     async def cards_for_source(self, kind, reference):
