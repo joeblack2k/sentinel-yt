@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Docker and Docker Compose, or the local Python environment.
+- Python 3.11 or newer.
 - LAN access to the Sentinel host.
 - A persistent Chromium profile already signed in to YouTube Kids for ingest.
 - A reachable OpenCodex endpoint for classification.
@@ -30,7 +30,12 @@ TZ=Europe/Amsterdam
 ## 2) Start Sentinel
 
 ```bash
-docker compose --env-file .env up -d --build
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+set -a
+. ./.env
+set +a
+.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port "${SENTINEL_PORT:-8090}"
 ```
 
 Open the Guardian at `http://<host-ip>:8090/kids`.

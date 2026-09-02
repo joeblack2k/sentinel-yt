@@ -8,13 +8,17 @@ playback relay, schedules, and watch history in one service and SQLite database.
 
 ```bash
 cp .env.example .env
-docker compose --env-file .env up -d --build
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+set -a
+. ./.env
+set +a
+.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port "${SENTINEL_PORT:-8090}"
 ```
 
 Open `http://localhost:8090/kids`, or replace `localhost` with the host LAN
 address.
-The data directory is mounted at `/data` and the database is
-`/data/sentinel.db`.
+The default data directory is `/data` and the database is `/data/sentinel.db`.
 
 ## Endpoints
 
@@ -91,9 +95,9 @@ repository through `deploy/sentinel-yt-kids-browser.service` and
 `/opt/youtube-sub-browser/data/youtube-web-profile`; deployments must never
 replace that profile directory.
 
-The Home Assistant add-on files are in `addon/sentinel-yt`. Synology deployment
-uses the source files under `ops/synology`; generated archives are built during
-deployment and are not committed.
+This Kids variant is deployed directly on the dedicated Incus backend. Docker,
+Synology, and Home Assistant add-on packaging are intentionally out of scope
+because they cannot own the required persistent Chromium session.
 
 ## Development
 
