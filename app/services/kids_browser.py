@@ -94,16 +94,8 @@ def port_in_use(host: str, port: int, *, timeout: float = 0.5) -> bool:
         return False
 
 
-def cdp_port_live(
-    debug_port: int = DEFAULT_CDP_PORT,
-    *,
-    host: str = DEFAULT_CDP_HOST,
-) -> bool:
-    return port_in_use(host, debug_port)
-
-
 def _ensure_runtime_ports_free(vnc_port: int, debug_port: int) -> None:
-    if cdp_port_live(debug_port):
+    if port_in_use(DEFAULT_CDP_HOST, debug_port):
         raise BrowserStartupError(
             f"CDP port {DEFAULT_CDP_HOST}:{debug_port} is already in use"
         )
@@ -203,8 +195,7 @@ def is_parent_auth_target(target: object) -> bool:
     return parsed.scheme == "https" and parsed.hostname == "accounts.google.com"
 
 
-def browser_target_status(targets: Iterable[object]) -> dict[str, Any]:
-    pages = page_targets(targets)
+def _page_target_status(pages: list[dict[str, Any]]) -> dict[str, Any]:
     kids_pages = [target for target in pages if is_kids_page_target(target)]
     auth_pages = [target for target in pages if is_parent_auth_target(target)]
     return {
@@ -216,9 +207,13 @@ def browser_target_status(targets: Iterable[object]) -> dict[str, Any]:
     }
 
 
+def browser_target_status(targets: Iterable[object]) -> dict[str, Any]:
+    return _page_target_status(page_targets(targets))
+
+
 def validate_kids_targets(targets: Iterable[object]) -> dict[str, Any]:
     pages = page_targets(targets)
-    status = browser_target_status(pages)
+    status = _page_target_status(pages)
     if not status["ready"]:
         raise BrowserStartupError(
             "Chromium must expose one YouTube Kids page and only parent-auth pages"

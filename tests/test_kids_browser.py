@@ -31,7 +31,11 @@ def test_browser_reuses_only_an_existing_nonempty_profile(tmp_path: Path) -> Non
 
 def test_browser_is_ready_only_with_one_youtube_kids_page() -> None:
     kids = {"type": "page", "url": "https://www.youtubekids.com/"}
-    assert browser_target_status([kids]) == {
+    service_worker = {
+        "type": "service_worker",
+        "url": "https://www.youtubekids.com/sw.js",
+    }
+    assert browser_target_status([kids, service_worker]) == {
         "page_count": 1,
         "kids_page_count": 1,
         "parent_auth_page_count": 0,
