@@ -3,6 +3,7 @@ set -eu
 
 mode=${1:?usage: run-ponytail-review commit|push}
 shift
+remote_name=${1:-origin}
 root=$(git rev-parse --show-toplevel)
 output=$(mktemp "${TMPDIR:-/tmp}/ponytail-review.XXXXXX")
 patch=
@@ -25,7 +26,17 @@ case "$mode" in
       if [ "$local_sha" = "$zero" ]; then
         git diff --binary "$remote_sha" "$empty"
       elif [ "$remote_sha" = "$zero" ]; then
-        git diff --binary "$empty" "$local_sha"
+        upstream_ref=$(git for-each-ref --format='%(upstream)' "$local_ref")
+        base_sha=$(git rev-parse --verify "$upstream_ref" 2>/dev/null || true)
+        if [ -z "$base_sha" ]; then
+          base_sha=$(git rev-parse --verify "refs/remotes/$remote_name/HEAD" 2>/dev/null || true)
+        fi
+        if [ -n "$base_sha" ]; then
+          base_sha=$(git merge-base "$base_sha" "$local_sha")
+        else
+          base_sha=$empty
+        fi
+        git diff --binary "$base_sha" "$local_sha"
       else
         git diff --binary "$remote_sha" "$local_sha"
       fi
