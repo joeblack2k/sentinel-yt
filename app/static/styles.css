@@ -118,11 +118,13 @@ body {
   margin-bottom: 2px;
 }
 
-.status-strip .status-timezone {
+.status-strip .status-timezone,
+.status-strip .status-build {
   font-size: 12px;
 }
 
-.status-strip .status-timezone span {
+.status-strip .status-timezone span,
+.status-strip .status-build span {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;

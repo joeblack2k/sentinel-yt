@@ -28,7 +28,7 @@
       <div><strong>Schedule now:</strong> {{ 'Active' if (status is defined and status and status.schedule_active_now) else 'Inactive' }}</div>
       <div><strong>Judge:</strong> {{ 'OK' if (status is defined and status and status.judge_ok) else 'FAIL' }}</div>
       <div class="status-timezone"><strong>TZ:</strong> <span title="{{ status.timezone if (status is defined and status and status.timezone) else 'UTC' }}">{{ status.timezone if (status is defined and status and status.timezone) else 'UTC' }}</span></div>
-      <div><strong>Build:</strong> {{ status.build_version if (status is defined and status and status.build_version) else 'v1' }}</div>
+      <div class="status-build"><strong>Build:</strong> <span title="{{ status.build_version if (status is defined and status and status.build_version) else 'v1' }}" style="font-family:ui-monospace, monospace;">{{ (status.build_version|string)[:8] if (status is defined and status and status.build_version) else 'v1' }}</span></div>
     </section>
     {% block content %}{% endblock %}
   </main>
