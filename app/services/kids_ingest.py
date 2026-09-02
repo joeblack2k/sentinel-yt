@@ -90,6 +90,10 @@ class IngestReport:
     errors: int = 0
 
 
+class KidsBrowserSetupRequired(RuntimeError):
+    """The persistent Kids page still needs one-time parent setup."""
+
+
 def _duration_seconds(value: str) -> int:
     match = _DURATION.fullmatch((value or "").strip())
     if not match:
@@ -346,6 +350,10 @@ class YouTubeKidsCDP:
           const payload = {
             url: window.location.href,
             ready: document.readyState,
+            setup_required: document.title.trim() === "Set up YouTube Kids"
+              || (document.body?.innerText || "").toLowerCase().includes(
+                "get a parent to set up youtube kids"
+              ),
             scroll_y: window.scrollY || 0,
             scroll_height: document.documentElement.scrollHeight || 0,
             cards: Array.from(document.querySelectorAll("ytk-compact-video-renderer")).map(x => {
@@ -419,6 +427,10 @@ class YouTubeKidsCDP:
             except asyncio.TimeoutError:
                 break
             payload = json.loads(result["result"].get("value", "{}"))
+            if payload.get("setup_required"):
+                raise KidsBrowserSetupRequired(
+                    "YouTube Kids parent setup is required in the persistent browser"
+                )
             actual_url = urllib.parse.urlparse(str(payload.get("url", "")))
             if not self._is_requested_kids_url(actual_url, target_url):
                 if payload.get("url") != "about:blank":
@@ -589,6 +601,7 @@ async def ingest_once(
     channel_policy_version: str = "sampled-channel-v1",
     channel_recheck_seconds: int = 604800,
     channel_sample_size: int = 8,
+    source_batch_size: int | None = None,
     judge: JudgeService | None = None,
 ) -> IngestReport:
     report = IngestReport()
@@ -621,9 +634,14 @@ async def ingest_once(
         try:
             raw_cards = await browser.cards_for_source("channel", HOME_SOURCE_REFERENCE)
             report.cards_seen = len(raw_cards)
+        except KidsBrowserSetupRequired:
+            report.errors += 1
+            logger.warning("Kids ingest paused: complete parent setup in the persistent browser")
+            return report
         except Exception:
             report.errors += 1
             logger.exception("Kids home ingest failed")
+            return report
 
     # Discover channel identities from Home; SAFE sources are auto-approved and remain parent-revocable.
     known_references = {
@@ -663,14 +681,27 @@ async def ingest_once(
         known_references.add(channel_id)
         all_sources.append(source)
 
-    sources = [
+    eligible_sources = [
         source
         for source in await db.catalog_sources_list()
         if source.get("kind") == "channel"
         and source.get("reference") != HOME_SOURCE_REFERENCE
         and source.get("state") in {"approved", "candidate"}
     ]
-    report.sources_seen = len(sources) + (1 if home_source.get("state") == "approved" else 0)
+    report.sources_seen = len(eligible_sources) + (
+        1 if home_source.get("state") == "approved" else 0
+    )
+    sources = eligible_sources
+    if source_batch_size is not None and source_batch_size > 0 and len(sources) > source_batch_size:
+        try:
+            source_offset = max(0, int((await db.get_setting("kids_ingest_source_offset")) or "0"))
+        except (TypeError, ValueError):
+            source_offset = 0
+        source_offset %= len(sources)
+        ordered_sources = sources[source_offset:] + sources[:source_offset]
+        sources = ordered_sources[:source_batch_size]
+        next_offset = (source_offset + len(sources)) % len(eligible_sources)
+        await db.set_setting("kids_ingest_source_offset", str(next_offset))
     home_cards_by_channel: dict[str, list[dict[str, Any]]] = {}
     for card in raw_cards[:max_cards_per_source]:
         channel_id = str(card.get("channel_id", "")).strip()
@@ -706,6 +737,10 @@ async def ingest_once(
         try:
             channel_cards = await browser.cards_for_source("channel", channel_id)
             report.cards_seen += len(channel_cards)
+        except KidsBrowserSetupRequired:
+            report.errors += 1
+            logger.warning("Kids ingest paused: complete parent setup in the persistent browser")
+            return report
         except Exception:
             channel_cards = []
             if channel_id not in home_cards_by_channel:
@@ -949,6 +984,7 @@ async def _main() -> None:
             channel_policy_version=settings.kids_channel_policy_version,
             channel_recheck_seconds=settings.kids_channel_recheck_seconds,
             channel_sample_size=settings.kids_channel_sample_size,
+            source_batch_size=max(1, int(os.getenv("KIDS_INGEST_SOURCE_BATCH_SIZE", "12"))),
             judge=judge,
         )
         if report.errors == 0:

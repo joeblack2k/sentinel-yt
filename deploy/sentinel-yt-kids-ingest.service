@@ -13,6 +13,7 @@ Environment=PATH=/opt/sentinel-yt/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/
 Environment=PYTHONUNBUFFERED=1
 Environment=KIDS_BROWSER_CDP_URL=http://127.0.0.1:9223
 Environment=KIDS_INGEST_MAX_CARDS=96
+Environment=KIDS_INGEST_SOURCE_BATCH_SIZE=12
 ExecStart=/opt/sentinel-yt/.venv/bin/python -m app.services.kids_ingest
 NoNewPrivileges=true
 PrivateTmp=true

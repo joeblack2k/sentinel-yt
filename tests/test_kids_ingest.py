@@ -11,6 +11,7 @@ from app.services.blocklists import BlocklistService
 from app.services.judge import JudgeService
 from app.services.kids_ingest import (
     HOME_SOURCE_REFERENCE,
+    KidsBrowserSetupRequired,
     YouTubeKidsCDP,
     ingest_once,
     parse_cards,
@@ -374,6 +375,42 @@ async def test_cdp_rejects_navigation_away_without_closing_existing_target(monke
 
 
 @pytest.mark.asyncio
+async def test_cdp_reports_parent_setup_before_scrolling():
+    import app.services.kids_ingest as kids_ingest
+
+    adapter = YouTubeKidsCDP(wait_seconds=1)
+    calls: list[str] = []
+
+    async def fake_command(websocket, request_id, method, params=None, *, timeout=None):
+        calls.append(method)
+        if method == "Runtime.evaluate":
+            return {
+                "result": {
+                    "value": json.dumps(
+                        {
+                            "url": "https://www.youtubekids.com/",
+                            "ready": "complete",
+                            "setup_required": True,
+                            "cards": [],
+                        }
+                    )
+                }
+            }
+        return {}
+
+    adapter._command = fake_command
+
+    with pytest.raises(kids_ingest.KidsBrowserSetupRequired):
+        await adapter._collect_route(
+            object(),
+            "https://www.youtubekids.com/",
+            {},
+        )
+
+    assert calls == ["Page.navigate", "Runtime.evaluate"]
+
+
+@pytest.mark.asyncio
 async def test_cdp_allows_transient_external_redirect_only_until_kids_returns(monkeypatch):
     import app.services.kids_ingest as kids_ingest
 
@@ -569,6 +606,107 @@ class FakeBrowser:
                 }
             ]
         return []
+
+
+@pytest.mark.asyncio
+async def test_ingest_does_not_scan_channels_when_parent_setup_is_required(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+
+    class SetupBrowser:
+        references: list[str] = []
+
+        async def cards_for_source(self, kind, reference):
+            self.references.append(reference)
+            if reference == HOME_SOURCE_REFERENCE:
+                raise KidsBrowserSetupRequired("setup")
+            raise AssertionError("channel scan must wait for parent setup")
+
+    browser = SetupBrowser()
+    report = await ingest_once(db, browser, FakeClassifier("SAFE"))
+
+    assert report.errors == 1
+    assert browser.references == [HOME_SOURCE_REFERENCE]
+
+
+@pytest.mark.asyncio
+async def test_ingest_rotates_source_batches_between_runs(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    channel_ids = [f"UC{index:022d}" for index in range(1, 4)]
+    for channel_id in channel_ids:
+        source = await db.catalog_create(
+            "source",
+            {
+                "kind": "channel",
+                "reference": channel_id,
+                "title": f"Channel {channel_id[-1]}",
+                "correlation_id": f"source-{channel_id}",
+            },
+        )
+        await db.catalog_source_safety_update(
+            source["id"],
+            verdict="SAFE",
+            reason="test",
+            actor="kids-channel-guardian",
+            correlation_id=f"classify-{channel_id}",
+        )
+        await db.catalog_transition(
+            "source",
+            source["id"],
+            {
+                "state": "approved",
+                "actor": "parent",
+                "reason": "test",
+                "correlation_id": f"approve-{channel_id}",
+            },
+        )
+
+    class RotatingBrowser:
+        references: list[str] = []
+
+        async def cards_for_source(self, kind, reference):
+            self.references.append(reference)
+            if reference == HOME_SOURCE_REFERENCE:
+                return []
+            return [
+                {
+                    "href": f"/watch?v={reference[-11:]}",
+                    "title": f"Video {reference[-1]}",
+                    "label": f"Video by Channel {reference[-1]} 10 views",
+                    "duration": "5:00",
+                    "thumbnail_url": f"https://i.ytimg.com/vi/{reference[-11:]}/hqdefault.jpg",
+                    "channel_id": reference,
+                }
+            ]
+
+    browser = RotatingBrowser()
+    first = await ingest_once(
+        db,
+        browser,
+        FakeClassifier("SAFE"),
+        source_batch_size=2,
+    )
+    second = await ingest_once(
+        db,
+        browser,
+        FakeClassifier("SAFE"),
+        source_batch_size=2,
+    )
+
+    assert first.sources_seen == 4
+    assert second.sources_seen == 4
+    assert browser.references == [
+        HOME_SOURCE_REFERENCE,
+        channel_ids[0],
+        channel_ids[1],
+        HOME_SOURCE_REFERENCE,
+        channel_ids[2],
+        channel_ids[0],
+    ]
+    assert await db.get_setting("kids_ingest_source_offset") == "1"
+    assert first.approved == 2
+    assert second.approved == 1
 
 
 @dataclass
