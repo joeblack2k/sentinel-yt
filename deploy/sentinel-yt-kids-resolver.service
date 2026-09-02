@@ -1,7 +1,7 @@
 [Unit]
 Description=Sentinel Kids adaptive resolve backlog worker
-After=network-online.target youtube-sub-browser.service
-Wants=network-online.target
+After=network-online.target sentinel-yt-kids-browser.service
+Wants=network-online.target sentinel-yt-kids-browser.service
 
 [Service]
 Type=oneshot

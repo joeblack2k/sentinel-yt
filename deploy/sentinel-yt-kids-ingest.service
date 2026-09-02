@@ -1,7 +1,7 @@
 [Unit]
 Description=Sentinel Kids YouTube Kids ingest
-After=network-online.target youtube-sub-browser-auth-browser.service
-Wants=network-online.target
+After=network-online.target sentinel-yt-kids-browser.service
+Wants=network-online.target sentinel-yt-kids-browser.service
 
 [Service]
 Type=oneshot
