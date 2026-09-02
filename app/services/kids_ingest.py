@@ -308,12 +308,23 @@ class YouTubeKidsCDP:
         )
 
     async def _reusable_target(self) -> dict[str, Any]:
-        targets = await self._json("/json/list")
-        target = self._validate_target_set(targets, target_id=self._target_id)
-        if self._target_id is None:
-            self._target_id = str(target["id"])
-            logger.info("Kids ingest reusing existing YouTube Kids browser page")
-        return target
+        deadline = asyncio.get_running_loop().time() + max(0.5, self.wait_seconds)
+        while True:
+            targets = await self._json("/json/list")
+            try:
+                target = self._validate_target_set(targets, target_id=self._target_id)
+            except RuntimeError as exc:
+                if str(exc) != "No existing YouTube Kids CDP target":
+                    raise
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(0.2, remaining))
+                continue
+            if self._target_id is None:
+                self._target_id = str(target["id"])
+                logger.info("Kids ingest reusing existing YouTube Kids browser page")
+            return target
 
     @staticmethod
     def _search_url(term: str) -> str:

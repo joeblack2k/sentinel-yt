@@ -53,6 +53,30 @@
 </section>
 
 <section class="card">
+  <h2>Kids watch history</h2>
+  <p class="muted">Playback events from SubTube Kids are included here for review.</p>
+  <table>
+    <thead><tr><th>Time</th><th>Event</th><th>Video</th><th>Title</th><th>Source</th><th>Profile</th><th>Position</th><th>Startup</th></tr></thead>
+    <tbody>
+      {% for event in kids_watch_events %}
+      <tr>
+        <td>{{ event.created_at }}</td>
+        <td>{{ event.event }}</td>
+        <td><code>{{ event.video_id }}</code></td>
+        <td>{{ event.title or '-' }}</td>
+        <td>{{ event.source_title or '-' }}</td>
+        <td>{{ event.profile }}</td>
+        <td>{{ event.position_seconds if event.position_seconds is not none else '-' }}</td>
+        <td>{{ event.startup_ms if event.startup_ms is not none else '-' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="muted">No Kids watch events yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
   <div class="inline-actions">
     {% if pager.has_prev %}
       <a class="small-btn" href="/history?page={{ pager.page - 1 }}">Previous</a>

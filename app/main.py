@@ -1163,12 +1163,20 @@ async def page_live(request: Request) -> HTMLResponse:
 
 @app.get("/history", response_class=HTMLResponse)
 async def page_history(request: Request, page: int = 1) -> HTMLResponse:
-    paged = await request.app.state.runtime.db.paged_video_decisions(page=page, page_size=50, max_total=500)
-    status = await request.app.state.runtime.get_status()
+    runtime: RuntimeState = request.app.state.runtime
+    paged = await runtime.db.paged_video_decisions(page=page, page_size=50, max_total=500)
+    kids_watch_events = await runtime.db.kids_watch_events_list(limit=100)
+    status = await runtime.get_status()
     return templates.TemplateResponse(
         request,
         "history.html",
-        {"rows": paged["rows"], "pager": paged, "status": status, "page": "history"},
+        {
+            "rows": paged["rows"],
+            "pager": paged,
+            "kids_watch_events": kids_watch_events,
+            "status": status,
+            "page": "history",
+        },
     )
 
 
@@ -1907,6 +1915,7 @@ async def api_kids_status(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/kids/readyz")
+@app.get("/readyz")
 async def api_kids_readyz(request: Request) -> dict[str, Any]:
     runtime: RuntimeState = request.app.state.runtime
     last_success = await runtime.db.get_setting("kids_ingest_last_success_at")
@@ -2602,7 +2611,10 @@ async def api_settings_gemini(payload: GeminiSettingsRequest, request: Request) 
 
 @app.get("/api/history")
 async def api_history(request: Request, page: int = 1) -> dict[str, Any]:
-    return await request.app.state.runtime.db.paged_video_decisions(page=page, page_size=50, max_total=500)
+    runtime: RuntimeState = request.app.state.runtime
+    history = await runtime.db.paged_video_decisions(page=page, page_size=50, max_total=500)
+    history["kids_watch_events"] = await runtime.db.kids_watch_events_list(limit=100)
+    return history
 
 
 @app.get("/api/db/stats")

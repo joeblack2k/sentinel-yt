@@ -33,6 +33,7 @@ def test_kids_readyz_requires_fresh_ingest_and_opencodex(tmp_path, monkeypatch):
 
     with TestClient(module.app) as client:
         assert client.get("/api/kids/readyz").status_code == 503
+        assert client.get("/readyz").status_code == 503
 
     asyncio.run(
         Database(db_path).set_setting(
@@ -45,6 +46,7 @@ def test_kids_readyz_requires_fresh_ingest_and_opencodex(tmp_path, monkeypatch):
         assert ready.status_code == 200
         assert ready.json()["opencodex"] == "ready"
         assert ready.json()["ingest"] == "fresh"
+        assert client.get("/readyz").status_code == 200
 
     FakeClassifier.available = False
     with TestClient(module.app) as client:
