@@ -692,21 +692,26 @@ class Database(KidsDatabaseMixin):
             "created_at": row[7],
         }
 
-    async def list_rules(self, *, limit: int = 200, rule_type: str | None = None) -> list[dict[str, Any]]:
+    async def list_rules(
+        self,
+        *,
+        limit: int | None = 200,
+        rule_type: str | None = None,
+    ) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
+            query = (
+                "SELECT id, rule_type, scope, value, label, url, source_list, created_at "
+                "FROM rules"
+            )
+            args: tuple[Any, ...] = ()
             if rule_type in {"whitelist", "blacklist"}:
-                cur = await db.execute(
-                    (
-                        "SELECT id, rule_type, scope, value, label, url, source_list, created_at "
-                        "FROM rules WHERE rule_type = ? ORDER BY id DESC LIMIT ?"
-                    ),
-                    (rule_type, limit),
-                )
-            else:
-                cur = await db.execute(
-                    "SELECT id, rule_type, scope, value, label, url, source_list, created_at FROM rules ORDER BY id DESC LIMIT ?",
-                    (limit,),
-                )
+                query += " WHERE rule_type = ?"
+                args = (rule_type,)
+            query += " ORDER BY id DESC"
+            if limit is not None:
+                query += " LIMIT ?"
+                args += (limit,)
+            cur = await db.execute(query, args)
             rows = await cur.fetchall()
         return [
             {

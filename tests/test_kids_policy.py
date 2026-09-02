@@ -172,6 +172,53 @@ async def test_reconcile_blocks_existing_item_idempotently_without_touching_sour
 
 
 @pytest.mark.asyncio
+async def test_reconcile_catalog_policy_snapshots_rules_and_flags(tmp_path, monkeypatch):
+    db_path = tmp_path / "sentinel.db"
+    settings = Settings(db_path=str(db_path), data_dir=str(tmp_path / "data"))
+    db = Database(str(db_path))
+    await db.init()
+    _, item = await approved_source_and_item(
+        db,
+        video_id="bulkdeny00001",
+        title="Bulk blocked item",
+    )
+    await db.add_rule(
+        "blacklist",
+        "video",
+        "bulkdeny00001",
+        label="bulk test",
+        source_list="manual",
+    )
+    blocklists = BlocklistService(settings)
+    await blocklists.reload(db)
+    judge = JudgeService(
+        db,
+        settings=settings,
+        webhook_client=WebhookClient(),
+        blocklists=blocklists,
+    )
+
+    async def unexpected_rule_lookup(*args, **kwargs):
+        raise AssertionError("bulk reconcile must not query rules per catalog row")
+
+    original_get_setting = db.get_setting
+    policy_reads = 0
+
+    async def counted_get_setting(key):
+        nonlocal policy_reads
+        if key == "policy_flags_json":
+            policy_reads += 1
+        return await original_get_setting(key)
+
+    monkeypatch.setattr(db, "find_rule_match", unexpected_rule_lookup)
+    monkeypatch.setattr(db, "get_setting", counted_get_setting)
+
+    assert await judge.reconcile_catalog_policy() == 1
+    assert policy_reads == 1
+    assert (await db.catalog_item_by_video("bulkdeny00001"))["state"] == "blocked"
+
+
+@pytest.mark.asyncio
 async def test_channel_entry_from_blocklist_blocks_source_and_catalog_item(tmp_path):
     db_path = tmp_path / "sentinel.db"
     settings = Settings(db_path=str(db_path), data_dir=str(tmp_path / "data"))
