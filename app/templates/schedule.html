@@ -3,8 +3,8 @@
 <section class="card">
   <h2>Schedule Windows</h2>
   <p class="muted">
-    Add one or more schedule windows. Each window controls enforcement mode:
-    <strong>Block blocklist</strong> or <strong>Allow allowlist</strong>.
+    Add one or more schedule windows for the Kids Guardian. The blocklist is
+    always the source of truth when content is checked.
   </p>
 </section>
 
@@ -27,12 +27,7 @@
         {% endfor %}
       </select>
     </label>
-    <label>Mode
-      <select name="mode">
-        <option value="blocklist">Block blocklist</option>
-        <option value="whitelist">Allow allowlist</option>
-      </select>
-    </label>
+    <input type="hidden" name="mode" value="blocklist">
     <button type="submit">Add Schedule</button>
   </form>
   <p id="schedule-add-status" class="muted"></p>
@@ -49,7 +44,6 @@
         <th>Start</th>
         <th>End</th>
         <th>Timezone</th>
-        <th>Mode</th>
         <th>Actions</th>
       </tr>
     </thead>
@@ -71,12 +65,6 @@
             {% for tz in timezones %}
               <option value="{{ tz }}" {% if row.timezone == tz %}selected{% endif %}>{{ tz }}</option>
             {% endfor %}
-          </select>
-        </td>
-        <td>
-          <select id="mode-{{ row.id }}">
-            <option value="blocklist" {% if row.mode == 'blocklist' %}selected{% endif %}>Block blocklist</option>
-            <option value="whitelist" {% if row.mode == 'whitelist' %}selected{% endif %}>Allow allowlist</option>
           </select>
         </td>
         <td class="inline-actions">
@@ -101,7 +89,7 @@ document.getElementById('add-schedule-form').addEventListener('submit', async (e
     start: fd.get('start'),
     end: fd.get('end'),
     timezone: fd.get('timezone'),
-    mode: fd.get('mode'),
+    mode: 'blocklist',
   };
   status.textContent = 'Adding schedule...';
   status.style.color = '#5f6d6f';
@@ -126,7 +114,7 @@ async function saveSchedule(id) {
     start: document.getElementById(`start-${id}`).value,
     end: document.getElementById(`end-${id}`).value,
     timezone: document.getElementById(`timezone-${id}`).value,
-    mode: document.getElementById(`mode-${id}`).value,
+    mode: 'blocklist',
   };
   status.textContent = `Saving schedule #${id}...`;
   status.style.color = '#5f6d6f';

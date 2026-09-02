@@ -12,7 +12,6 @@ from app.db import Database
 from app.services.blocklists import BlocklistService
 from app.services.judge import JudgeService
 from app.services.kids_ingest import HOME_SOURCE_REFERENCE, ingest_once
-from app.services.webhook import WebhookClient
 
 
 CHANNEL_ID = f"UC{'a' * 22}"
@@ -124,7 +123,7 @@ async def test_reconcile_blocks_existing_item_idempotently_without_touching_sour
     blocklists = BlocklistService(settings)
     await blocklists.save_local_content("video:deny0000001 | configured block\n")
     await blocklists.reload(db)
-    judge = JudgeService(db, settings=settings, webhook_client=WebhookClient(), blocklists=blocklists)
+    judge = JudgeService(db, blocklists=blocklists)
 
     assert await judge.reconcile_catalog_policy() == 1
     assert await judge.reconcile_catalog_policy() == 0
@@ -193,8 +192,6 @@ async def test_reconcile_catalog_policy_snapshots_rules_and_flags(tmp_path, monk
     await blocklists.reload(db)
     judge = JudgeService(
         db,
-        settings=settings,
-        webhook_client=WebhookClient(),
         blocklists=blocklists,
     )
 
@@ -232,7 +229,7 @@ async def test_channel_entry_from_blocklist_blocks_source_and_catalog_item(tmp_p
     blocklists = BlocklistService(settings)
     await blocklists.save_local_content(f"channel:{CHANNEL_ID} | configured channel block\n")
     await blocklists.reload(db)
-    judge = JudgeService(db, settings, WebhookClient(), blocklists=blocklists)
+    judge = JudgeService(db, blocklists=blocklists)
 
     assert await judge.reconcile_catalog_policy() == 2
     assert (await db.catalog_get("source", source["id"]))["state"] == "blocked"
@@ -287,7 +284,7 @@ async def test_ingest_honors_local_blocklist_before_channel_inheritance(tmp_path
     blocklists = BlocklistService(settings)
     await blocklists.save_local_content("video:deny0000002 | configured block\n")
     await blocklists.reload(db)
-    judge = JudgeService(db, settings, WebhookClient(), blocklists=blocklists)
+    judge = JudgeService(db, blocklists=blocklists)
     report = await ingest_once(
         db,
         BlocklistedBrowser(),

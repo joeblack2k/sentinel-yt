@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>SubTube Kids</h1>
-<p class="muted">Only approved channels and playlists can publish items to the Kids gateway.</p>
+<p class="muted">Approved channels and playlists publish automatically. Use Revoke to remove a source or item.</p>
 
 <section class="panel">
   <h2>Resolve backlog</h2>
@@ -33,7 +33,7 @@
     <label>Parent label
       <input name="title" maxlength="500" placeholder="Optional">
     </label>
-    <button type="submit">Add candidate</button>
+    <button type="submit">Add source</button>
   </form>
   <p id="kids-source-status" class="muted"></p>
   <table>
@@ -53,9 +53,6 @@
         <td>{{ source.safety_sample_count or 0 }}<br><span class="muted">{{ source.safety_policy_version or '-' }}</span></td>
         <td class="state">{{ source.state }}</td>
         <td>
-          {% if source.state != 'approved' %}
-          <button data-state="approved">Approve</button>
-          {% endif %}
           {% if source.state != 'revoked' %}
           <button data-state="revoked">Revoke</button>
           {% endif %}
@@ -80,9 +77,6 @@
         <td>{{ item.source_id or '-' }}</td>
         <td>{{ item.state }}</td>
         <td>
-          {% if item.state != 'approved' %}
-          <button data-item-id="{{ item.id }}" data-state="approved">Approve</button>
-          {% endif %}
           {% if item.state != 'revoked' %}
           <button data-item-id="{{ item.id }}" data-state="revoked">Revoke</button>
           {% endif %}
@@ -142,7 +136,7 @@ document.getElementById('kids-source-form').addEventListener('submit', async (ev
       body: JSON.stringify(Object.fromEntries(form.entries()))
     });
     if (!response.ok) throw new Error(await response.text());
-    statusNode.textContent = 'Candidate added. Approve it only after parent review.';
+    statusNode.textContent = 'Source added. Guardian will check it before publishing.';
     event.currentTarget.reset();
     setTimeout(() => location.reload(), 500);
   } catch (error) {

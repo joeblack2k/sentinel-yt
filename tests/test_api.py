@@ -27,7 +27,7 @@ def test_api_status_and_control(tmp_path, monkeypatch):
         assert status_after.json()["active"] is False
 
 
-def test_api_sponsorblock_and_blocklists(tmp_path, monkeypatch):
+def test_api_kids_guardian_surfaces(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
     monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("SENTINEL_PORT", "8091")
@@ -35,12 +35,23 @@ def test_api_sponsorblock_and_blocklists(tmp_path, monkeypatch):
     module = importlib.reload(module)
 
     with TestClient(module.app) as client:
-        sb = client.post("/api/sponsorblock/state", json={"active": True})
-        assert sb.status_code == 200
-        assert sb.json()["active"] is True
+        root = client.get("/", follow_redirects=False)
+        assert root.status_code == 307
+        assert root.headers["location"] == "/kids"
+        for path in ("/live", "/allowlist", "/devices", "/automation", "/mqtt", "/sponsorblock", "/rules"):
+            assert client.get(path).status_code == 404
+
+        for path in (
+            "/api/sponsorblock/state",
+            "/api/mqtt/state",
+            "/api/devices/pair/code",
+            "/api/live/events",
+            "/api/rules/whitelist",
+        ):
+            assert client.post(path, json={"active": True}).status_code == 404
 
         save_local = client.post(
-            "/api/rules/blocklists/local",
+            "/api/blocklist/local",
             json={
                 "content": (
                     "# test\n"
@@ -67,35 +78,17 @@ def test_api_sponsorblock_and_blocklists(tmp_path, monkeypatch):
                 "start": "18:00",
                 "end": "21:00",
                 "timezone": "UTC",
-                "mode": "whitelist",
+                "mode": "blocklist",
             },
         )
         assert add_schedule.status_code == 200
 
-        mqtt_cfg = client.post(
-            "/api/mqtt/config",
-            json={
-                "enabled": False,
-                "host": "",
-                "port": 1883,
-                "username": "",
-                "password": "",
-                "base_topic": "sentinel",
-                "discovery_prefix": "homeassistant",
-                "retain": True,
-                "tls": False,
-                "publish_interval_seconds": 30,
-            },
-        )
-        assert mqtt_cfg.status_code == 200
-        assert mqtt_cfg.json()["ok"] is True
-
-        mqtt_state = client.post("/api/mqtt/state", json={"enabled": False})
-        assert mqtt_state.status_code == 200
-        assert mqtt_state.json()["ok"] is True
+        history = client.get("/api/history")
+        assert history.status_code == 200
+        assert history.json()["kids_watch_events"] == []
 
 
-def test_api_manual_pair_validation_message(tmp_path, monkeypatch):
+def test_api_removed_device_surface_is_unavailable(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
     monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("SENTINEL_PORT", "8092")
@@ -104,7 +97,4 @@ def test_api_manual_pair_validation_message(tmp_path, monkeypatch):
 
     with TestClient(module.app) as client:
         resp = client.post("/api/devices/pair/code", json={"pairing_code": "123"})
-        assert resp.status_code == 422
-        payload = resp.json()
-        assert payload["detail"]["code"] == "validation_error"
-        assert "at least 4 characters" in payload["detail"]["message"]
+        assert resp.status_code == 404

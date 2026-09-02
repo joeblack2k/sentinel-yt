@@ -1,35 +1,42 @@
 # Troubleshooting
 
-## Device not found in scan
-1. Confirm Sentinel container runs with host networking on Linux.
-2. Confirm Apple TV and Sentinel host are on same LAN/VLAN.
-3. Run scan again while YouTube app is open on TV.
+## `/readyz` reports stale ingest
 
-## Pairing fails with code error
-1. Request a fresh TV code in YouTube settings.
-2. Use the `Pair` button on the exact discovered row (avoid stale rows).
-3. Retry within code validity window.
+Check the ingest service and the existing persistent Chromium session. The
+worker stops safely when YouTube Kids requires parent setup or the page is no
+longer a valid Kids page. Complete the one-time setup in the existing profile,
+then let the next scheduled ingest run.
 
-## "Device disconnected" events
-- Sentinel reconnects automatically with backoff.
-- If persistent, re-pair device and check network stability.
+## No new sources or videos appear
 
-## Gemini unavailable / quota/auth issues
-- Sentinel fail-open behavior allows playback when Gemini is down.
-- Local blocklist/allowlist still applies.
-- Configure `failure_webhook_url` to notify Home Assistant.
+1. Confirm the source is a YouTube Kids channel or playlist reference.
+2. Check the `/kids` page for ingest and resolver errors.
+3. Check `/blocklist` for a matching channel, video, or policy rule.
+4. Confirm OpenCodex is reachable and `/readyz` reports it as ready.
 
-## SponsorBlock not skipping
-1. Verify SponsorBlock module is enabled.
-2. Verify SponsorBlock schedule is active now.
-3. Ensure temporary release is not active.
-4. Reduce minimum segment length if needed.
+Unknown or uncertain content stays hidden. There is no general YouTube
+fallback.
 
-## History too large
-- Use DB stats to monitor size.
-- Purge only cache or history via `/api/admin/purge`.
+## A blocked item is still visible
+
+Reload the blocklist and check the catalog revision. Matching sources and
+items are reconciled out of the Kids feed. A revoked or stale playback lease
+cannot authorize the item again.
+
+## Playback is unavailable
+
+Confirm that monitoring is active, the current schedule is open, and the
+resolver has a fresh candidate at the configured 720p or 1080p minimum.
+Playback authorization is checked again for every session.
+
+## Watch history is missing
+
+Open `/history` or `GET /api/kids/watch-events`. The Kids app must send an
+event with the correct catalog item and profile. Database counts are available
+from `GET /api/db/stats`.
 
 ## Data persistence
-- SQLite data is persisted in mounted `/data`.
-- If you recreate containers without the volume, pairing/history are lost.
 
+SQLite data is stored in the configured data directory. Keep the data volume
+when recreating the service or the catalog, resolver backlog, and watch
+history will be lost.

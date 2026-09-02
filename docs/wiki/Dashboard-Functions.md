@@ -1,114 +1,75 @@
 # Dashboard Functions
 
-## Home
-Shows totals, trends, and block/allow analytics.
+The Guardian dashboard is the parent control surface for SubTube Kids. It
+contains only catalog, filtering, schedule, settings, and watch-history
+controls.
+
+## Kids
+
+Shows configured channels and playlists, catalog items, resolver backlog, and
+the Kids watch log.
 
 ### Configure
-- No setup required.
-- Data comes from `video_decisions` and DB stats.
+- Add a channel or playlist source.
+- Revoke a source or catalog item.
+- Review source checks, resolver quality, expiry, and ingest state.
 
 ### Example Use
-- Check if block rate is rising after enabling strict policy toggles.
-
-## Live
-Real-time stream of current video decisions and interventions.
-
-### Configure
-- Auto-updates through SSE (`/api/live/events`).
-
-### Example Use
-- Confirm a blocked video triggers `intervention_play_safe`.
+- Add a trusted educational channel and wait for the ingest worker to publish
+  its eligible videos.
 
 ## History
-Paginated decision log (50 per page, max 500 retained for UI paging).
+
+Shows the latest playback events received from the Kids app.
 
 ### Configure
-- Add manual rules directly from rows.
+- No separate history source is required.
+- Events are written to the shared SQLite database.
 
 ### Example Use
-- Review a false ALLOW and blacklist that video/channel.
+- Review selections, starts, completions, positions, and startup timings when
+  adjusting the Kids catalog.
 
 ## Blocklist
-Manage what must be blocked.
+
+The blocklist is the source of truth for content that must not appear in the
+Kids catalog or start playback.
 
 ### Configure
-- Manual rules: `video:<id>` or `channel:<id>`
-- Policy toggles: strict filters (brainrot/horror/violence/etc)
-- Remote source lists: import raw TXT files (GitHub raw URLs)
-- Local file editor: maintain custom block entries with comments
+- Add manual video or channel rules.
+- Enable policy flags for categories such as brainrot, horror, violence,
+  weapons, dangerous challenges, and clickbait.
+- Import external TXT blocklist sources.
+- Maintain local blocklist entries and comments.
 
 ### Example Use
-- Add `video:dQw4w9WgXcQ | Example | https://www.youtube.com/watch?v=dQw4w9WgXcQ`
-
-## Allowlist
-Manage what is explicitly allowed.
-
-### Configure
-- Manual allow rules for video/channel
-- Allow-policy toggles (cartoons, educational, Disney, etc)
-- Remote source lists and local allowlist file
-
-### Example Use
-- Enforce whitelist-only schedule mode, then allow only trusted channels.
+- Add `channel:UC...` or `video:dQw4w9WgXcQ` and reload the blocklist.
+  Matching catalog sources and items are removed from the Kids feed.
 
 ## Schedule
-Create multiple schedule windows with individual enforcement mode.
+
+Controls when the Kids dataplane is available. The schedule always uses
+blocklist enforcement.
 
 ### Configure
-- Add/remove windows
-- Per window:
-  - timezone
-  - start/end
-  - mode: `blocklist` or `whitelist`
+- Add, update, or remove schedule windows.
+- Set timezone, start time, end time, and enabled state.
 
 ### Example Use
-- School hours = `whitelist`, evening = `blocklist`.
-
-## SponsorBlock
-Independent sponsor segment skipper.
-
-### Configure
-- Enabled state toggle
-- Own schedule + timezone
-- Segment categories
-- Minimum segment length
-- Temporary remote release (minutes)
-
-### Example Use
-- Disable interventions for 15 minutes during Shorts:
-  - set release minutes to `15`
-
-## Devices
-Find, pair, and monitor TV connection status.
-
-### Configure
-- Scan network
-- Pair per discovered row (preferred)
-- Manual code-only pairing fallback
-
-### Example Use
-- Re-pair after token expiry and confirm device status changes to connected.
+- Close the Kids feed during school or bedtime hours.
 
 ## Settings
-Global Sentinel behavior and AI configuration.
+
+Controls the Guardian runtime.
 
 ### Configure
-- Active state
-- Gemini key runtime override + enable/disable
-- Custom prompt editor
-- Locked JSON output contract suffix (always appended)
-- Failure webhook URL
-- DB stats and purge controls
+- Enable or disable monitoring.
+- Inspect the configured OpenCodex classifier endpoint and model.
+- Configure the failure webhook.
+- Inspect database statistics and purge watch history.
 
-### Example Use
-- Disable Gemini and run with local block/allow rules only.
+## Readiness
 
-## Automation
-Shows webhook/API payloads for Home Assistant or external automation.
-
-### Configure
-- Use control endpoints in scripts/automations.
-
-### Example Use
-- HA automation pauses Sentinel at bedtime with `POST /api/webhook/control`.
-
+`/readyz` reports whether OpenCodex is reachable, ingest is fresh, and the
+resolver has enough fresh playable items. A stale ingest or unavailable
+classifier keeps the Kids dataplane closed until the pipeline recovers.

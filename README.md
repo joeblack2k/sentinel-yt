@@ -1,9 +1,8 @@
-# Sentinel YT
+# Sentinel Kids Guardian
 
-Sentinel is a LAN-first parental-control gateway for YouTube on Apple TV.
-It keeps the existing Sentinel dashboard for monitoring, blocklist policy,
-history, scheduling, devices, and automation. The Kids catalog, resolver,
-playback relay, and watch history use the same service and SQLite database.
+Sentinel is the LAN-first Guardian control plane for SubTube Kids. It manages
+the Kids catalog, blocklist policy, YouTube Kids ingest, resolver backlog,
+playback relay, schedules, and watch history in one service and SQLite database.
 
 ## Quick Start
 
@@ -12,7 +11,8 @@ cp .env.example .env
 docker compose --env-file .env up -d --build
 ```
 
-Open `http://localhost:8090`, or replace `localhost` with the host LAN address.
+Open `http://localhost:8090/kids`, or replace `localhost` with the host LAN
+address.
 The data directory is mounted at `/data` and the database is
 `/data/sentinel.db`.
 
@@ -21,9 +21,9 @@ The data directory is mounted at `/data` and the database is
 General service:
 
 - `GET /healthz`
+- `GET /readyz`
 - `GET /api/status`
 - `GET /api/history`
-- `GET /api/live/events`
 
 Kids dataplane:
 
@@ -35,6 +35,14 @@ Kids dataplane:
 - `POST /v1/kids/events`
 - `GET /api/kids/status`
 - `GET /api/kids/readyz`
+
+Guardian control:
+
+- `GET /kids`
+- `GET /history`
+- `GET /blocklist`
+- `GET /schedule`
+- `GET /settings`
 
 The Kids client receives opaque asset IDs and thumbnails only. Playback is
 revalidated against the current catalog, schedule, blocklist, and resolver
@@ -55,9 +63,9 @@ The main settings are:
 - `KIDS_BROWSER_CDP_URL`, the existing persistent Kids Chromium CDP endpoint
 - `KIDS_RESOLVER_MIN_QUALITY_HEIGHT`, `720` or `1080`; 4K is not supported
 
-The existing `/blocklist` page and its policy flags are the source of truth for
-Kids catalog filtering. The Kids ingest worker never approves a source from
-AI output alone, and uncertain classification remains hidden.
+The `/blocklist` page and its policy flags are the source of truth for Kids
+catalog filtering. The Kids ingest worker never approves a source from AI
+output alone, and uncertain classification remains hidden.
 
 ## Deployment
 

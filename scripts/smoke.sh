@@ -9,37 +9,20 @@ curl -fsS "${BASE_URL}/healthz" | jq .
 echo "[smoke] status"
 curl -fsS "${BASE_URL}/api/status" | jq .
 
-echo "[smoke] control toggle false"
-curl -fsS -X POST "${BASE_URL}/api/control/state" \
-  -H 'Content-Type: application/json' \
-  -d '{"active":false}' | jq .
+echo "[smoke] kids status"
+curl -fsS "${BASE_URL}/api/kids/status" | jq .
 
-echo "[smoke] control toggle true"
-curl -fsS -X POST "${BASE_URL}/api/control/state" \
-  -H 'Content-Type: application/json' \
-  -d '{"active":true}' | jq .
+echo "[smoke] guardian pages"
+for path in /kids /history /blocklist /schedule /settings; do
+  curl -fsS "${BASE_URL}${path}" >/dev/null
+done
 
-echo "[smoke] sponsorblock toggle true"
-curl -fsS -X POST "${BASE_URL}/api/sponsorblock/state" \
-  -H 'Content-Type: application/json' \
-  -d '{"active":true}' | jq .
-
-echo "[smoke] sponsorblock release 2m"
-curl -fsS -X POST "${BASE_URL}/api/sponsorblock/release" \
-  -H 'Content-Type: application/json' \
-  -d '{"minutes":2,"source":"smoke","reason":"validation"}' | jq .
-
-echo "[smoke] sponsorblock release clear"
-curl -fsS -X POST "${BASE_URL}/api/sponsorblock/release" \
-  -H 'Content-Type: application/json' \
-  -d '{"minutes":0,"source":"smoke","reason":"clear"}' | jq .
-
-echo "[smoke] sponsorblock toggle false"
-curl -fsS -X POST "${BASE_URL}/api/sponsorblock/state" \
-  -H 'Content-Type: application/json' \
-  -d '{"active":false}' | jq .
+echo "[smoke] removed legacy pages"
+for path in /live /allowlist /devices /automation /mqtt /sponsorblock /rules; do
+  test "$(curl -s -o /dev/null -w '%{http_code}' "${BASE_URL}${path}")" = 404
+done
 
 echo "[smoke] db stats"
-curl -fsS "${BASE_URL}/api/db/stats" | jq '{total_bytes, video_decisions, analysis_cache, rules, sponsorblock_actions}'
+curl -fsS "${BASE_URL}/api/db/stats" | jq '{total_bytes, kids_watch_events, rules}'
 
 echo "[smoke] done"

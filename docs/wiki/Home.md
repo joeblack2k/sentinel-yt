@@ -1,23 +1,24 @@
-# Sentinel Wiki
+# Sentinel Kids Guardian
 
-Sentinel is a YouTube AI guardian for Apple TV sessions.  
-This wiki explains every user-facing function and every API in plain English.
+Sentinel is the parent-side Guardian for SubTube Kids. It maintains the
+approved catalog from the existing YouTube Kids browser session and exposes a
+small Kids-only dataplane.
 
 ## Pages
+
 - [Getting Started](Getting-Started)
 - [Dashboard Functions](Dashboard-Functions)
 - [API Reference](API-Reference)
 - [Troubleshooting](Troubleshooting)
 
 ## What Sentinel Does
-1. Discovers YouTube Lounge devices on your LAN.
-2. Pairs to your TV with a YouTube TV code.
-3. Monitors current/up-next videos in real time.
-4. Decides ALLOW/BLOCK via local lists and optional Gemini.
-5. On BLOCK, forces playback to a safe candidate video.
-6. Stores history and supports manual allow/block control.
 
-## What SponsorBlock Does
-SponsorBlock is a separate module that skips known sponsor segments.  
-It has independent state, schedule, and webhook controls.
+1. Reads configured YouTube Kids channel and playlist sources.
+2. Applies the shared `/blocklist` rules and policy flags.
+3. Classifies eligible content through the configured OpenCodex model.
+4. Resolves playable media and stores the result in the SQLite backlog.
+5. Exposes only approved, currently playable thumbnails to SubTube Kids.
+6. Revalidates playback and records Kids watch events.
 
+The blocklist is authoritative. AI output can hide or reject content, but it
+cannot publish a blocked source or item.

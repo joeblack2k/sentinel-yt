@@ -13,20 +13,14 @@
 </section>
 
 <section class="card">
-  <h2>Gemini Runtime Key (Optional Override)</h2>
-  <form id="gemini-form">
-    <label>Gemini enabled
-      <select name="enabled">
-        <option value="true" {% if gemini_enabled %}selected{% endif %}>true</option>
-        <option value="false" {% if not gemini_enabled %}selected{% endif %}>false</option>
-      </select>
-    </label>
-    <label>API key
-      <input name="api_key" type="password" placeholder="optional runtime key">
-    </label>
-    <button type="submit">Save Runtime Key</button>
-  </form>
-  <p class="muted">When disabled, Sentinel uses local rules + blocklists only (no Gemini token usage).</p>
+  <h2>Kids Classifier</h2>
+  <dl>
+    <dt>Gateway</dt>
+    <dd>{{ opencodex_base_url }}</dd>
+    <dt>Model</dt>
+    <dd>{{ opencodex_model }}</dd>
+  </dl>
+  <p class="muted">OpenCodex is the only classifier used by Kids ingest. An unavailable classifier keeps new content out of the catalog.</p>
 </section>
 
 <section class="card">
@@ -40,45 +34,17 @@
 </section>
 
 <section class="card">
-  <h2>Filter Brain (System Prompt)</h2>
-  <p>The text below controls Sentinel behavior. JSON output format is always enforced and cannot be removed.</p>
-  <p class="muted">
-    Current source:
-    {% if is_using_default_prompt %}
-      Safe default prompt
-    {% else %}
-      Custom prompt
-    {% endif %}
-  </p>
-  <form id="prompt-form">
-    <label>Editable Base Prompt (what Sentinel uses before policy addons)
-      <textarea name="custom_prompt" rows="14">{{ base_prompt }}</textarea>
-    </label>
-    <label>Effective Prompt Preview (base + policy addons + locked JSON contract)
-      <textarea rows="14" readonly>{{ effective_prompt }}</textarea>
-    </label>
-    <label>Locked JSON Contract
-      <textarea rows="4" readonly>{{ output_contract }}</textarea>
-    </label>
-    <button type="submit">Save Prompt</button>
-  </form>
-  <button type="button" onclick="resetPrompt()">Reset to Default</button>
-</section>
-
-<section class="card">
   <h2>Database</h2>
   <table>
     <tbody>
       <tr><th>SQLite file</th><td>{{ db_stats.db_file_bytes }} bytes</td></tr>
       <tr><th>WAL file</th><td>{{ db_stats.wal_file_bytes }} bytes</td></tr>
       <tr><th>Total size</th><td>{{ db_stats.total_bytes }} bytes</td></tr>
-      <tr><th>Cached Gemini decisions</th><td>{{ db_stats.analysis_cache }}</td></tr>
-      <tr><th>History rows</th><td>{{ db_stats.video_decisions }}</td></tr>
+      <tr><th>Kids watch events</th><td>{{ db_stats.kids_watch_events|default(0) }}</td></tr>
       <tr><th>Rules rows</th><td>{{ db_stats.rules }}</td></tr>
     </tbody>
   </table>
   <div class="inline-actions">
-    <button type="button" class="small-btn" onclick="purgeDb('analysis_cache')">Purge Gemini Cache</button>
     <button type="button" class="small-btn" onclick="purgeDb('history')">Purge History</button>
   </div>
   <p id="db-status" class="muted"></p>
@@ -91,21 +57,6 @@ async function setActive(active) {
   else location.reload();
 }
 
-document.getElementById('gemini-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  const r = await fetch('/api/settings/gemini', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      api_key: fd.get('api_key') || '',
-      enabled: fd.get('enabled') === 'true'
-    })
-  });
-  if (!r.ok) alert(await r.text());
-  else location.reload();
-});
-
 document.getElementById('webhook-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
@@ -113,20 +64,6 @@ document.getElementById('webhook-form').addEventListener('submit', async (e) => 
   if (!r.ok) alert(await r.text());
   else alert('Saved');
 });
-
-document.getElementById('prompt-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  const r = await fetch('/api/settings/prompt', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({custom_prompt: fd.get('custom_prompt') || ''})});
-  if (!r.ok) alert(await r.text());
-  else alert('Saved');
-});
-
-async function resetPrompt() {
-  const r = await fetch('/api/settings/prompt/reset', {method:'POST'});
-  if (!r.ok) alert(await r.text());
-  else location.reload();
-}
 
 async function purgeDb(target) {
   const status = document.getElementById('db-status');

@@ -18,7 +18,6 @@ from ..db import Database, utc_now_iso
 from .blocklists import BlocklistService
 from .kids_classifier import KidsClassificationError, OpenCodexKidsClassifier
 from .judge import JudgeService
-from .webhook import WebhookClient
 
 logger = logging.getLogger("sentinel.kids_ingest")
 
@@ -977,8 +976,6 @@ async def _main() -> None:
     await blocklists.reload(db)
     judge = JudgeService(
         db,
-        settings,
-        WebhookClient(settings.webhook_timeout_seconds),
         blocklists=blocklists,
     )
     classifier = OpenCodexKidsClassifier(

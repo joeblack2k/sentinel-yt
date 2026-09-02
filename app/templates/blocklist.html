@@ -25,29 +25,6 @@
 </section>
 
 <section class="card">
-  <h2>Recent Blocked Videos (Last 10)</h2>
-  <table>
-    <thead><tr><th>Time</th><th>Video</th><th>Source</th><th>Action</th></tr></thead>
-    <tbody>
-      {% for row in blocked_recent %}
-      <tr>
-        <td>{{ row.created_at }}</td>
-        <td>
-          {% if row.video_id %}
-          <a class="small-link" href="https://www.youtube.com/watch?v={{ row.video_id }}" target="_blank" rel="noopener noreferrer">{{ row.title or row.video_id }}</a>
-          {% else %}
-          {{ row.title }}
-          {% endif %}
-        </td>
-        <td>{{ row.source }}</td>
-        <td>{{ row.action_taken }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</section>
-
-<section class="card">
   <h2>Blocklist Sources</h2>
   <p class="muted">Adblock-style shared lists. Fast in-memory lookup supports large lists.</p>
   <table>
@@ -164,13 +141,13 @@ document.getElementById('bl-form').addEventListener('submit', async (e) => {
     label: fd.get('label') || null,
     url: fd.get('url') || null,
   };
-  const r = await fetch('/api/rules/blacklist', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  const r = await fetch('/api/blocklist/rules', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   if (!r.ok) alert(await r.text());
   else location.reload();
 });
 
 async function deleteRule(id) {
-  const r = await fetch('/api/rules/' + id, {method:'DELETE'});
+  const r = await fetch('/api/blocklist/rules/' + id, {method:'DELETE'});
   if (!r.ok) alert(await r.text());
   else location.reload();
 }

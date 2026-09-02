@@ -17,7 +17,6 @@ from app.services.kids_ingest import (
     parse_cards,
     source_url,
 )
-from app.services.webhook import WebhookClient
 
 
 def test_source_url_stays_inside_youtube_kids():
@@ -1025,7 +1024,7 @@ async def test_safe_new_source_blocked_by_judge_does_not_auto_approve(tmp_path):
     blocklists = BlocklistService(settings)
     await blocklists.save_local_content(f"channel:{channel_id} | configured block\n")
     await blocklists.reload(db)
-    judge = JudgeService(db, settings, WebhookClient(), blocklists=blocklists)
+    judge = JudgeService(db, blocklists=blocklists)
 
     classifier = FakeClassifier("SAFE")
     report = await ingest_once(
@@ -1093,7 +1092,7 @@ async def test_ingest_honors_local_blocklist_and_demotes_existing_approved_item(
     blocklists = BlocklistService(settings)
     await blocklists.save_local_content("video:deny0000001 | configured block\n")
     await blocklists.reload(db)
-    judge = JudgeService(db, settings, WebhookClient(), blocklists=blocklists)
+    judge = JudgeService(db, blocklists=blocklists)
     classifier = FakeClassifier("SAFE")
     report = await ingest_once(db, BlocklistedBrowser(), classifier, judge=judge)
 

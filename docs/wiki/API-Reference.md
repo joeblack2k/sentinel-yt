@@ -1,21 +1,22 @@
 # API Reference
 
-All payloads are JSON unless noted.
+This document describes the Kids-focused Sentinel Guardian API. All payloads
+are JSON unless noted.
 
 ## Health
 
 ### `GET /healthz`
-Basic container health check.
+Basic process health check.
 
-Example:
-```bash
-curl -s http://localhost:8090/healthz
-```
+### `GET /readyz`
+Readiness check for the Kids pipeline. It verifies OpenCodex availability,
+ingest freshness, and the resolver backlog. The equivalent namespaced route is
+`GET /api/kids/readyz`.
 
 ## Control and Status
 
 ### `POST /api/control/state`
-Enable or disable Sentinel globally.
+Enable or disable Guardian monitoring globally.
 
 Payload:
 ```json
@@ -23,91 +24,25 @@ Payload:
 ```
 
 ### `GET /api/status`
-Returns active state, schedule state, device counts, judge status, timezone, build version.
+Returns monitoring, schedule, judge, timezone, error, and build information.
 
 ### `POST /api/webhook/control`
-Webhook equivalent for Home Assistant.
+Webhook equivalent for changing the global monitoring state.
 
 Payload:
 ```json
 {"active": false, "source": "home_assistant"}
 ```
 
-## SponsorBlock APIs
+## Blocklist
 
-### `POST /api/sponsorblock/state`
-Enable or disable SponsorBlock module.
+The blocklist is the source of truth for content that must not enter the Kids
+catalog.
 
-### `POST /api/webhook/sponsorblock/state`
-Webhook version for external automation.
-
-### `POST /api/sponsorblock/schedule`
-Set SponsorBlock schedule.
+### `POST /api/blocklist/rules`
+Add a block rule.
 
 Payload:
-```json
-{"enabled": true, "start": "07:00", "end": "21:00", "timezone": "Europe/Amsterdam"}
-```
-
-### `POST /api/sponsorblock/config`
-Set categories and minimum skip segment length.
-
-Payload:
-```json
-{"categories": ["sponsor", "selfpromo"], "min_length_seconds": 1.0}
-```
-
-### `POST /api/sponsorblock/release`
-Temporarily release remote interventions for N minutes.
-
-Payload:
-```json
-{"minutes": 15, "reason": "shorts", "source": "dashboard"}
-```
-
-### `POST /api/webhook/sponsorblock/release`
-Webhook version of temporary release.
-
-## Device APIs
-
-### `POST /api/devices/scan`
-Scans LAN for candidate YouTube Lounge devices.
-
-### `POST /api/devices/pair`
-Pair selected discovered device using TV code.
-
-Payload:
-```json
-{"device_ref": "<from-scan>", "pairing_code": "123 456 789 012"}
-```
-
-### `POST /api/devices/pair/code`
-Manual pairing fallback using only TV code.
-
-Payload:
-```json
-{"pairing_code": "123 456 789 012"}
-```
-
-## Live Stream API
-
-### `GET /api/live/events`
-Server-Sent Events stream for live dashboard updates.
-
-Example:
-```bash
-curl -N http://localhost:8090/api/live/events
-```
-
-## Rules APIs
-
-### `POST /api/rules/whitelist`
-Add manual allow rule.
-
-### `POST /api/rules/blacklist`
-Add manual block rule.
-
-Payload for both:
 ```json
 {
   "scope": "video",
@@ -117,83 +52,134 @@ Payload for both:
 }
 ```
 
-### `DELETE /api/rules/{rule_id}`
-Delete manual rule by id.
+### `DELETE /api/blocklist/rules/{rule_id}`
+Delete a block rule by id.
 
 ### `POST /api/blocklist/policies`
-Set strict block policy flags.
-
-### `POST /api/allowlist/policies`
-Set allow policy flags.
+Update the blocklist policy flags.
 
 ### `POST /api/blocklist/sources`
 Save external blocklist TXT source URLs.
 
 ### `POST /api/blocklist/reload`
-Reload blocklists from local and remote sources.
+Reload local and external blocklist sources.
 
 ### `POST /api/blocklist/local`
-Update local blocklist TXT content.
+Replace the local blocklist TXT content.
 
-### `POST /api/allowlist/sources`
-Save external allowlist TXT source URLs.
+## Kids Catalog
 
-### `POST /api/allowlist/reload`
-Reload allowlists from local and remote sources.
+### `GET /api/kids/catalog/revision`
+Return the current catalog revision.
 
-### `POST /api/allowlist/local`
-Update local allowlist TXT content.
+### `GET /api/kids/sources`
+List configured channel and playlist sources.
 
-## Prompt and Settings APIs
+### `POST /api/kids/sources`
+Add a channel or playlist source for Guardian ingest.
 
-### `POST /api/settings/prompt`
-Save custom prompt text (empty string resets to default behavior).
+### `PATCH /api/kids/sources/{source_id}/state`
+Change a source state, including `revoked`.
 
-### `POST /api/settings/prompt/reset`
-Force reset prompt to built-in default.
+### `GET /api/kids/catalog/items`
+List catalog items visible to the Guardian UI.
 
-### `POST /api/settings/webhook`
-Set failure webhook URL for fatal Gemini incidents.
+### `GET /api/kids/catalog/items/{item_id}`
+Return one catalog item.
 
-### `POST /api/settings/gemini`
-Update runtime Gemini key and optional enable/disable state.
+### `GET /api/kids/catalog/items/by-video/{video_id}`
+Return the catalog item for a video id.
 
-Payload:
-```json
-{"api_key": "AIza...", "enabled": true}
-```
+### `POST /api/kids/catalog/items`
+Add a catalog candidate.
 
-## Schedule APIs
+### `PATCH /api/kids/catalog/items/{item_id}/state`
+Change an item state, including `revoked`.
 
-### `GET /api/schedules`
-List all schedule windows.
+### `GET /api/kids/status`
+Return kill-switch, schedule, catalog, and resolver status.
 
-### `POST /api/schedules/add`
-Add schedule window.
+### `GET /api/kids/control/kill-switch`
+Read the Kids kill-switch state.
 
-### `POST /api/schedules/{schedule_id}/update`
-Update schedule window.
+### `POST /api/kids/control/kill-switch`
+Set the Kids kill-switch state. Enabling it empties the Kids feed and stops
+playback authorization.
 
-### `DELETE /api/schedules/{schedule_id}`
-Delete schedule window (at least one must remain).
+## Kids Dataplane
 
-### `POST /api/settings/schedule`
-Legacy compatibility endpoint for single schedule setup.
+The tvOS client uses only these minimal dataplane routes. It does not connect
+to YouTube directly.
 
-## History and DB APIs
+### `GET /v1/kids/feed?cursor=&limit=&profile=`
+Return an opaque-cursor page of approved, currently playable thumbnails. The
+response contains no titles, channel names, or raw YouTube URLs.
 
-### `GET /api/history?page=<n>`
-Paged history (50/page, max 500 total).
+### `GET /v1/kids/thumbnails/{asset_id}`
+Proxy one approved thumbnail.
+
+### `POST /v1/kids/playback-sessions`
+Create a short-lived playback lease after a fresh Guardian check.
+
+### `GET /v1/kids/playback-sessions/{lease_id}/manifest`
+Return the authorized video and audio relay endpoints.
+
+### `GET /v1/kids/playback-sessions/{lease_id}/status`
+Check whether a playback lease is still active.
+
+### `DELETE /v1/kids/playback-sessions/{lease_id}`
+Close a playback lease.
+
+### `GET|HEAD /v1/kids/playback-sessions/{lease_id}/{video|audio}`
+Relay the authorized media stream while the lease remains valid.
+
+### `POST /v1/kids/events`
+Record a dataplane event such as `selected`, `started`, `stopped`, or
+`completed`.
+
+## History and Audit
+
+### `GET /api/kids/watch-events?limit=`
+Return Kids playback events.
+
+### `POST /api/kids/watch-events`
+Record a Kids playback event from an authorized integration.
+
+### `GET /api/kids/audit?limit=`
+Return Guardian audit events for catalog and policy changes.
+
+### `GET /api/history`
+Return the latest Kids watch events for the Guardian history view.
 
 ### `GET /api/db/stats`
-Returns database size and table stats.
+Return database size and table statistics.
 
 ### `POST /api/admin/purge`
 Purge selected data.
 
 Payload:
 ```json
-{"target":"analysis_cache"}
+{"target": "history"}
 ```
-Allowed targets: `analysis_cache`, `history`, `all`.
 
+Allowed targets are `history` and `all`.
+
+## Settings and Schedule
+
+### `POST /api/settings/webhook`
+Set the failure webhook URL.
+
+### `GET /api/schedules`
+List schedule windows.
+
+### `POST /api/schedules/add`
+Add a blocklist schedule window.
+
+### `POST /api/schedules/{schedule_id}/update`
+Update a schedule window.
+
+### `DELETE /api/schedules/{schedule_id}`
+Delete a schedule window. At least one window must remain.
+
+### `POST /api/settings/schedule`
+Update the single schedule compatibility endpoint.
