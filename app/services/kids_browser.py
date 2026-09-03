@@ -7,13 +7,12 @@ import shutil
 import signal
 import socket
 import sqlite3
-import tempfile
 import time
 from pathlib import Path
 from subprocess import DEVNULL, Popen, TimeoutExpired
 from typing import Any, Callable, Iterable
-from urllib.parse import quote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 from websockets.sync.client import connect
 
@@ -61,27 +60,6 @@ def require_existing_profile(profile_dir: str | Path) -> Path:
     except OSError as error:
         raise BrowserStartupError(f"Chromium profile cannot be read: {path}") from error
     return path
-
-
-def enable_chromium_session_restore(profile_dir: str | Path) -> None:
-    preferences_path = Path(profile_dir) / "Default" / "Preferences"
-    try:
-        preferences = json.loads(preferences_path.read_text())
-        preferences.setdefault("session", {})["restore_on_startup"] = 1
-        with tempfile.NamedTemporaryFile(
-            "w",
-            dir=preferences_path.parent,
-            prefix=".Preferences.",
-            delete=False,
-        ) as stream:
-            json.dump(preferences, stream, separators=(",", ":"))
-            temporary_path = Path(stream.name)
-        temporary_path.chmod(preferences_path.stat().st_mode)
-        temporary_path.replace(preferences_path)
-    except (OSError, TypeError, ValueError) as error:
-        raise BrowserStartupError(
-            "Chromium session restore preference could not be saved"
-        ) from error
 
 
 def clear_stale_chromium_singleton_locks(profile_dir: str | Path) -> None:
@@ -372,38 +350,6 @@ def checkpoint_kids_session_cookies(
     return persisted
 
 
-def open_kids_page_if_missing(
-    debug_port: int,
-    targets: Iterable[object],
-    *,
-    opener: Callable[..., Any] = urlopen,
-) -> bool:
-    pages = page_targets(targets)
-    if any(is_kids_page_target(target) for target in pages):
-        return False
-    for target in pages:
-        target_id = str(target.get("id", ""))
-        if target_id and not is_parent_auth_target(target):
-            with contextlib.suppress(OSError):
-                with opener(
-                    Request(
-                        f"http://{DEFAULT_CDP_HOST}:{debug_port}/json/close/{quote(target_id, safe='')}",
-                        method="PUT",
-                    ),
-                    timeout=0.75,
-                ):
-                    pass
-    with opener(
-        Request(
-            f"http://{DEFAULT_CDP_HOST}:{debug_port}/json/new?https://{KIDS_HOST}/",
-            method="PUT",
-        ),
-        timeout=0.75,
-    ):
-        pass
-    return True
-
-
 def wait_for_kids_page(
     debug_port: int,
     *,
@@ -420,19 +366,11 @@ def wait_for_kids_page(
     process_list = tuple(processes)
     deadline = monotonic() + max(0, timeout)
     last_error: Exception | None = None
-    recovery_attempted = False
     while True:
         if any(process.poll() is not None for process in process_list):
             raise BrowserStartupError("A browser process stopped during startup")
         try:
-            targets = reader(debug_port)
-            if (
-                not recovery_attempted
-                and not any(is_kids_page_target(target) for target in targets)
-            ):
-                recovery_attempted = open_kids_page_if_missing(debug_port, targets)
-                continue
-            return validate_kids_targets(targets)
+            return validate_kids_targets(reader(debug_port))
         except (BrowserStartupError, OSError, ValueError, TypeError) as error:
             last_error = error
         if monotonic() >= deadline:
@@ -503,7 +441,6 @@ def launch_browser_runtime(
 
     # Lock cleanup is deliberately after the live-port check.
     clear_stale_chromium_singleton_locks(profile)
-    enable_chromium_session_restore(profile)
     persist_kids_session_cookies(profile)
     popen = popen_factory or Popen
     sleeper = sleep_fn or time.sleep
@@ -601,7 +538,8 @@ def main() -> None:
             checkpoint_kids_session_cookies(debug_port)
         with contextlib.suppress(Exception):
             close_chromium_browser(debug_port)
-        time.sleep(0.5)
+        with contextlib.suppress(TimeoutExpired):
+            processes[-1].wait(timeout=5)
         stop_browser_processes(processes)
 
 
