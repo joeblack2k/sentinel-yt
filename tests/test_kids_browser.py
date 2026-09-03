@@ -68,7 +68,7 @@ def test_browser_allows_only_google_parent_auth_beside_kids_page() -> None:
 def test_chromium_command_uses_the_persistent_kids_profile_only() -> None:
     command = chromium_command("chromium", "/persistent/kids-profile")
     rendered = " ".join(command)
-    assert "--app=https://www.youtubekids.com/" in command
+    assert "--app=" not in rendered
     assert "--user-data-dir=/persistent/kids-profile" in command
     assert "--restore-last-session" in command
     assert "--remote-debugging-port=9223" in command

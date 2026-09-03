@@ -166,7 +166,6 @@ def chromium_command(
 ) -> list[str]:
     command = [
         executable,
-        "--app=https://www.youtubekids.com/",
         "--disable-dev-shm-usage",
         "--password-store=basic",
         "--no-first-run",
