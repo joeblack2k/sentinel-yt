@@ -449,14 +449,7 @@ async function loadPosterOptions() {
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
     if (requestToken !== posterLoadToken || posterPickerState !== stateAtRequest) return;
-    const items = Array.isArray(payload) ? payload : (Array.isArray(payload.items) ? payload.items : []);
-    const approvedItems = items.filter((item) => {
-      const itemState = String(item.state || 'approved').toLowerCase();
-      const itemSourceId = item.source_id ?? item.sourceId;
-      return itemState === 'approved' &&
-        (itemSourceId == null || String(itemSourceId) === stateAtRequest.sourceId) &&
-        String(item.thumbnail_url || '').trim();
-    });
+    const approvedItems = Array.isArray(payload.items) ? payload.items : [];
     renderPosterOptions(approvedItems);
     setPosterDialogStatus(
       approvedItems.length
