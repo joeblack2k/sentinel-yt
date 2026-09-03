@@ -147,7 +147,6 @@ def chromium_command(
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-sync",
-        "--disable-account-consistency",
         # Restore both the app tab state and session cookies after a clean exit.
         "--restore-last-session",
         "--disable-session-crashed-bubble",
