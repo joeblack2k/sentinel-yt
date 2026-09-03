@@ -11,8 +11,8 @@ import time
 from pathlib import Path
 from subprocess import DEVNULL, Popen, TimeoutExpired
 from typing import Any, Callable, Iterable
-from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.parse import quote, urlsplit
+from urllib.request import Request, urlopen
 
 
 KIDS_HOST = "www.youtubekids.com"
@@ -248,6 +248,38 @@ def validate_kids_targets(targets: Iterable[object]) -> dict[str, Any]:
     return next(target for target in pages if is_kids_page_target(target))
 
 
+def open_kids_page_if_missing(
+    debug_port: int,
+    targets: Iterable[object],
+    *,
+    opener: Callable[..., Any] = urlopen,
+) -> bool:
+    pages = page_targets(targets)
+    if any(is_kids_page_target(target) for target in pages):
+        return False
+    for target in pages:
+        target_id = str(target.get("id", ""))
+        if target_id and not is_parent_auth_target(target):
+            with contextlib.suppress(OSError):
+                with opener(
+                    Request(
+                        f"http://{DEFAULT_CDP_HOST}:{debug_port}/json/close/{quote(target_id, safe='')}",
+                        method="PUT",
+                    ),
+                    timeout=0.75,
+                ):
+                    pass
+    with opener(
+        Request(
+            f"http://{DEFAULT_CDP_HOST}:{debug_port}/json/new?https://{KIDS_HOST}/",
+            method="PUT",
+        ),
+        timeout=0.75,
+    ):
+        pass
+    return True
+
+
 def wait_for_kids_page(
     debug_port: int,
     *,
@@ -264,11 +296,19 @@ def wait_for_kids_page(
     process_list = tuple(processes)
     deadline = monotonic() + max(0, timeout)
     last_error: Exception | None = None
+    recovery_attempted = False
     while True:
         if any(process.poll() is not None for process in process_list):
             raise BrowserStartupError("A browser process stopped during startup")
         try:
-            return validate_kids_targets(reader(debug_port))
+            targets = reader(debug_port)
+            if (
+                not recovery_attempted
+                and not any(is_kids_page_target(target) for target in targets)
+            ):
+                recovery_attempted = open_kids_page_if_missing(debug_port, targets)
+                continue
+            return validate_kids_targets(targets)
         except (BrowserStartupError, OSError, ValueError, TypeError) as error:
             last_error = error
         if monotonic() >= deadline:

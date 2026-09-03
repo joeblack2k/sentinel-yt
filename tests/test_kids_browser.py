@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import socket
 import sqlite3
@@ -12,6 +13,7 @@ from app.services.kids_browser import (
     browser_target_status,
     clear_stale_chromium_singleton_locks,
     chromium_command,
+    open_kids_page_if_missing,
     persist_kids_session_cookies,
     require_existing_profile,
 )
@@ -73,6 +75,48 @@ def test_chromium_command_uses_the_persistent_kids_profile_only() -> None:
     assert "--restore-last-session" in command
     assert "--remote-debugging-port=9223" in command
     assert "www.youtube.com" not in rendered
+
+
+def test_browser_opens_kids_only_when_no_restorable_kids_page_exists() -> None:
+    requests = []
+
+    def opener(request, *, timeout):
+        requests.append((request.get_method(), request.full_url, timeout))
+        return io.BytesIO(b"{}")
+
+    targets = [
+        {"id": "new-tab", "type": "page", "url": "chrome://newtab/"},
+        {
+            "id": "parent-auth",
+            "type": "page",
+            "url": "https://accounts.google.com/signin",
+        },
+    ]
+    assert open_kids_page_if_missing(9223, targets, opener=opener)
+    assert requests == [
+        ("PUT", "http://127.0.0.1:9223/json/close/new-tab", 0.75),
+        ("PUT", "http://127.0.0.1:9223/json/new?https://www.youtubekids.com/", 0.75),
+    ]
+    requests.clear()
+    assert not open_kids_page_if_missing(
+        9223,
+        [{"id": "kids", "type": "page", "url": "https://www.youtubekids.com/"}],
+        opener=opener,
+    )
+    assert not requests
+
+
+def test_browser_recovery_tolerates_an_already_closed_page() -> None:
+    def opener(request, *, timeout):
+        if "/json/close/" in request.full_url:
+            raise OSError("target already closed")
+        return io.BytesIO(b"{}")
+
+    assert open_kids_page_if_missing(
+        9223,
+        [{"id": "gone", "type": "page", "url": "chrome://newtab/"}],
+        opener=opener,
+    )
 
 
 def test_only_youtube_kids_session_cookies_become_persistent(tmp_path: Path) -> None:
