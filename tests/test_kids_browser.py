@@ -70,7 +70,7 @@ def test_browser_allows_only_google_parent_auth_beside_kids_page() -> None:
 def test_chromium_command_uses_the_persistent_kids_profile_only() -> None:
     command = chromium_command("chromium", "/persistent/kids-profile")
     rendered = " ".join(command)
-    assert "--app=https://www.youtubekids.com/" in command
+    assert "--app=" not in rendered
     assert "--user-data-dir=/persistent/kids-profile" in command
     assert "--disable-sync" in command
     assert "--disable-account-consistency" not in command
