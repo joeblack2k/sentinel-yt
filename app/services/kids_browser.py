@@ -141,13 +141,13 @@ def chromium_command(
 ) -> list[str]:
     command = [
         executable,
+        "--app=https://www.youtubekids.com/",
         "--disable-dev-shm-usage",
         "--password-store=basic",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-sync",
-        "--disable-extensions",
-        # Chromium restores session cookies only when the browser exits cleanly.
+        # Restore both the app tab state and session cookies after a clean exit.
         "--restore-last-session",
         "--disable-session-crashed-bubble",
         "--disable-infobars",
