@@ -146,6 +146,7 @@ def chromium_command(
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-account-consistency",
+        "--disable-extensions",
         # Chromium restores session cookies only when the browser exits cleanly.
         "--restore-last-session",
         "--disable-session-crashed-bubble",
