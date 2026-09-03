@@ -124,17 +124,55 @@ async def test_kids_schema_init_is_idempotent_with_language_and_defaults(tmp_pat
         source_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(catalog_sources)")
         }
+        feed_session_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(feed_sessions)")
+        }
         tables = {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-    assert "language" in source_columns
+    assert {"language", "poster_item_id"} <= source_columns
+    assert "source_id" in feed_session_columns
     assert {"feed_sessions", "feed_session_items", "relay_leases"} <= tables
 
     await db.init()
     assert await db.kids_kill_switch_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_kids_schema_migrates_feed_source_columns_without_backfill(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+
+    with sqlite3.connect(db.db_path) as connection:
+        connection.execute("ALTER TABLE catalog_sources DROP COLUMN poster_item_id")
+        connection.execute("ALTER TABLE feed_sessions DROP COLUMN source_id")
+        connection.execute(
+            """
+            INSERT INTO feed_sessions(
+                id, profile, catalog_revision, policy_version, created_at, expires_at
+            ) VALUES ('legacy-feed', 'noah', 0, 'test', 'now', 'later')
+            """
+        )
+        connection.commit()
+
+    await db._migrate_schema()
+
+    with sqlite3.connect(db.db_path) as connection:
+        source_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(catalog_sources)")
+        }
+        feed_session_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(feed_sessions)")
+        }
+        source_id = connection.execute(
+            "SELECT source_id FROM feed_sessions WHERE id='legacy-feed'"
+        ).fetchone()[0]
+    assert "poster_item_id" in source_columns
+    assert "source_id" in feed_session_columns
+    assert source_id is None
 
 
 @pytest.mark.asyncio

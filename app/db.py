@@ -60,6 +60,7 @@ class Database(KidsDatabaseMixin):
                     reference TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL DEFAULT '',
                     avatar_url TEXT NOT NULL DEFAULT '',
+                    poster_item_id INTEGER,
                     language TEXT NOT NULL DEFAULT 'unknown'
                         CHECK(language IN ('nl', 'en', 'mixed', 'unknown')),
                     safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN',
@@ -171,6 +172,7 @@ class Database(KidsDatabaseMixin):
                 CREATE TABLE IF NOT EXISTS feed_sessions (
                     id TEXT PRIMARY KEY,
                     profile TEXT NOT NULL DEFAULT 'noah',
+                    source_id INTEGER,
                     catalog_revision INTEGER NOT NULL CHECK(catalog_revision >= 0),
                     policy_version TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -262,6 +264,10 @@ class Database(KidsDatabaseMixin):
                 await db.execute(
                     "ALTER TABLE catalog_sources ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''"
                 )
+            if "poster_item_id" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN poster_item_id INTEGER"
+                )
             cur = await db.execute("PRAGMA table_info(catalog_items)")
             item_cols = {row[1] for row in await cur.fetchall()}
             if "thumbnail_url" not in item_cols:
@@ -333,6 +339,10 @@ class Database(KidsDatabaseMixin):
                 await db.execute(
                     "ALTER TABLE catalog_sources ADD COLUMN safety_sample_count INTEGER NOT NULL DEFAULT 0"
                 )
+            cur = await db.execute("PRAGMA table_info(feed_sessions)")
+            feed_session_cols = {row[1] for row in await cur.fetchall()}
+            if "source_id" not in feed_session_cols:
+                await db.execute("ALTER TABLE feed_sessions ADD COLUMN source_id INTEGER")
 
             await db.commit()
 

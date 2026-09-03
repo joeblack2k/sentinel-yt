@@ -13,6 +13,8 @@ from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
+from websockets.sync.client import connect
+
 
 KIDS_HOST = "www.youtubekids.com"
 DEFAULT_PROFILE_PATH = Path("/opt/youtube-sub-browser/data/youtube-web-profile")
@@ -139,11 +141,13 @@ def chromium_command(
 ) -> list[str]:
     command = [
         executable,
-        "--app=https://www.youtubekids.com/",
         "--disable-dev-shm-usage",
         "--password-store=basic",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-sync",
+        # Restore the existing Kids tab, including its per-tab session storage.
+        "--restore-last-session",
         "--disable-session-crashed-bubble",
         "--disable-infobars",
         "--disable-blink-features=AutomationControlled",
@@ -171,6 +175,23 @@ def cdp_targets(
     if not isinstance(payload, list):
         raise BrowserStartupError("CDP target list is not a JSON array")
     return [item for item in payload if isinstance(item, dict)]
+
+
+def close_chromium_browser(
+    debug_port: int = DEFAULT_CDP_PORT,
+    *,
+    opener: Callable[..., Any] = urlopen,
+    connector: Callable[..., Any] = connect,
+) -> None:
+    with opener(
+        f"http://{DEFAULT_CDP_HOST}:{debug_port}/json/version", timeout=0.75
+    ) as response:
+        version = json.load(response)
+    _page_command(
+        {"webSocketDebuggerUrl": version.get("webSocketDebuggerUrl")},
+        "Browser.close",
+        connector=connector,
+    )
 
 
 def page_targets(targets: Iterable[object]) -> list[dict[str, Any]]:
@@ -219,6 +240,28 @@ def validate_kids_targets(targets: Iterable[object]) -> dict[str, Any]:
             "Chromium must expose one YouTube Kids page and only parent-auth pages"
         )
     return next(target for target in pages if is_kids_page_target(target))
+
+
+def _page_command(
+    target: dict[str, Any],
+    method: str,
+    params: dict[str, Any] | None = None,
+    *,
+    connector: Callable[..., Any] = connect,
+) -> dict[str, Any]:
+    websocket_url = str(target.get("webSocketDebuggerUrl", ""))
+    if not websocket_url:
+        raise BrowserStartupError("YouTube Kids page is not connectable")
+    with connector(websocket_url, open_timeout=2, close_timeout=1) as websocket:
+        websocket.send(
+            json.dumps({"id": 1, "method": method, "params": params or {}})
+        )
+        while True:
+            response = json.loads(websocket.recv(timeout=3))
+            if response.get("id") == 1:
+                if "error" in response:
+                    raise BrowserStartupError(f"CDP {method} failed")
+                return response.get("result", {})
 
 
 def wait_for_kids_page(
@@ -399,6 +442,10 @@ def main() -> None:
                         "and only parent-auth pages"
                     )
     finally:
+        with contextlib.suppress(Exception):
+            close_chromium_browser(debug_port)
+        with contextlib.suppress(TimeoutExpired):
+            processes[-1].wait(timeout=5)
         stop_browser_processes(processes)
 
 

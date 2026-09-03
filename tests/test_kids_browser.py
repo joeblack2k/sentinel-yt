@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import socket
 from pathlib import Path
@@ -10,8 +12,10 @@ from app.services.kids_browser import (
     BrowserStartupError,
     browser_target_status,
     clear_stale_chromium_singleton_locks,
+    close_chromium_browser,
     chromium_command,
     require_existing_profile,
+    wait_for_kids_page,
 )
 
 
@@ -66,10 +70,66 @@ def test_browser_allows_only_google_parent_auth_beside_kids_page() -> None:
 def test_chromium_command_uses_the_persistent_kids_profile_only() -> None:
     command = chromium_command("chromium", "/persistent/kids-profile")
     rendered = " ".join(command)
-    assert "--app=https://www.youtubekids.com/" in command
+    assert "--app=" not in rendered
     assert "--user-data-dir=/persistent/kids-profile" in command
+    assert "--disable-sync" in command
+    assert "--disable-account-consistency" not in command
+    assert "--restore-last-session" in command
     assert "--remote-debugging-port=9223" in command
     assert "www.youtube.com" not in rendered
+
+
+class FakeWebSocket:
+    def __init__(self, result):
+        self.result = result
+        self.sent = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return None
+
+    def send(self, message):
+        self.sent.append(json.loads(message))
+
+    def recv(self, *, timeout):
+        return json.dumps({"id": 1, "result": self.result})
+
+
+def test_browser_closes_chromium_through_its_browser_endpoint() -> None:
+    requests = []
+    websocket = FakeWebSocket({})
+
+    def opener(url, *, timeout):
+        requests.append((url, timeout))
+        return io.BytesIO(b'{"webSocketDebuggerUrl":"ws://browser"}')
+
+    close_chromium_browser(
+        9223,
+        opener=opener,
+        connector=lambda *_, **__: websocket,
+    )
+
+    assert requests == [("http://127.0.0.1:9223/json/version", 0.75)]
+    assert websocket.sent == [{"id": 1, "method": "Browser.close", "params": {}}]
+
+
+def test_browser_waits_for_the_restored_kids_page_without_creating_a_tab() -> None:
+    responses = iter(
+        [
+            [{"id": "new-tab", "type": "page", "url": "chrome://newtab/"}],
+            [{"id": "kids", "type": "page", "url": "https://www.youtubekids.com/"}],
+        ]
+    )
+
+    assert wait_for_kids_page(
+        9223,
+        timeout=1,
+        poll_seconds=0,
+        targets_reader=lambda _: next(responses),
+        sleep_fn=lambda _: None,
+    )["id"] == "kids"
 
 
 def test_browser_never_clears_a_live_or_unverifiable_profile_lock(
@@ -126,6 +186,7 @@ def test_sentinel_units_own_the_persistent_browser_runtime() -> None:
 
     assert "app.services.kids_browser" in browser_unit
     assert "/opt/sentinel-yt/current" in browser_unit
+    assert "KillMode=mixed" in browser_unit
     assert (
         "KIDS_BROWSER_PROFILE_PATH=/opt/youtube-sub-browser/data/youtube-web-profile"
         in browser_unit

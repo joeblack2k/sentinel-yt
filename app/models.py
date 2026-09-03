@@ -43,6 +43,13 @@ class KidsSourceProfilesRequest(BaseModel):
     correlation_id: str = Field(min_length=1, max_length=128)
 
 
+class KidsSourcePosterRequest(BaseModel):
+    item_id: int | None = Field(default=None, ge=1)
+    actor: str = Field(default="parent-ui", min_length=1, max_length=128)
+    reason: str = Field(default="Parent poster selection", min_length=1, max_length=1000)
+    correlation_id: str = Field(min_length=1, max_length=128)
+
+
 class KidsKillSwitchRequest(BaseModel):
     enabled: bool
     actor: str = Field(min_length=1, max_length=128)

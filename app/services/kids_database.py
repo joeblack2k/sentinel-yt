@@ -26,6 +26,15 @@ DEFAULT_KIDS_PROFILES = (
     ("felix", "Felix", 2, "tortoise.fill", 1),
 )
 DEFAULT_KIDS_PROFILE_SLUGS = frozenset(profile[0] for profile in DEFAULT_KIDS_PROFILES)
+KIDS_CHANNEL_ART_HOSTS = frozenset(
+    {
+        "yt3.ggpht.com",
+        "yt4.ggpht.com",
+        "yt3.googleusercontent.com",
+        "yt4.googleusercontent.com",
+    }
+)
+KIDS_VIDEO_THUMBNAIL_HOSTS = frozenset({"i.ytimg.com"})
 
 
 def _profile_slugs(value: Any) -> list[str]:
@@ -51,6 +60,56 @@ def _youtube_source_url(kind: Any, reference: Any) -> str:
     if kind == "playlist" and raw.startswith("PL"):
         return f"https://www.youtube.com/playlist?list={quote(raw, safe='')}"
     return ""
+
+
+def _kids_thumbnail_is_proxyable(value: Any) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname in KIDS_VIDEO_THUMBNAIL_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+    )
+
+
+def _kids_channel_avatar_is_proxyable(value: Any) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname in KIDS_CHANNEL_ART_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+    )
+
+
+def _kids_source_can_publish_poster(source: dict[str, Any]) -> bool:
+    return (
+        source.get("kind") == "channel"
+        and source.get("state") == "approved"
+        and source.get("safety_verdict") == "SAFE"
+        and source.get("reference") != KIDS_HOME_SOURCE_REFERENCE
+    )
+
+
+def _kids_effective_poster_item(
+    poster_item_id: Any,
+    items: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if poster_item_id is not None:
+        for item in items:
+            if item["id"] == poster_item_id:
+                return item
+    return items[0] if items else None
 
 
 class KidsDatabaseMixin:
@@ -413,6 +472,260 @@ class KidsDatabaseMixin:
             cols = [d[0] for d in cur.description] if row else []
         return dict(zip(cols, row)) if row else None
 
+    async def _kids_source_poster_items_bulk(
+        self,
+        source_ids: list[int],
+    ) -> dict[int, list[dict[str, Any]]]:
+        bounded_source_ids = sorted({int(source_id) for source_id in source_ids})
+        if not bounded_source_ids:
+            return {}
+        placeholders = ",".join("?" for _ in bounded_source_ids)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                f"""
+                SELECT i.source_id,i.id,i.title,i.thumbnail_url,i.state,
+                       i.channel_id,i.channel_title,
+                       s.kind,s.reference,s.title,s.state,s.safety_verdict
+                FROM catalog_items i
+                JOIN catalog_sources s ON s.id=i.source_id
+                WHERE i.source_id IN ({placeholders}) AND i.state='approved'
+                ORDER BY i.source_id ASC,i.id ASC
+                """,
+                bounded_source_ids,
+            )
+            rows = await cur.fetchall()
+        result: dict[int, list[dict[str, Any]]] = {}
+        for (
+            source_id,
+            item_id,
+            title,
+            thumbnail_url,
+            state,
+            channel_id,
+            channel_title,
+            source_kind,
+            source_reference,
+            source_title,
+            source_state,
+            source_safety_verdict,
+        ) in rows:
+            thumbnail = str(thumbnail_url or "").strip()
+            item = {
+                "state": state,
+                "channel_id": channel_id,
+                "channel_title": channel_title,
+            }
+            source = {
+                "kind": source_kind,
+                "reference": source_reference,
+                "title": source_title,
+                "state": source_state,
+                "safety_verdict": source_safety_verdict,
+            }
+            if (
+                not _catalog_item_is_authorized(item, source)
+                or not _kids_thumbnail_is_proxyable(thumbnail)
+            ):
+                continue
+            result.setdefault(int(source_id), []).append(
+                {
+                    "id": int(item_id),
+                    "title": str(title or ""),
+                    "thumbnail_url": thumbnail,
+                    "state": str(state),
+                }
+            )
+        return result
+
+    async def kids_source_poster_items(
+        self,
+        source_id: int,
+    ) -> list[dict[str, Any]] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute(
+                    "SELECT id FROM catalog_sources WHERE id=?",
+                    (source_id,),
+                )
+            ).fetchone()
+        if row is None:
+            return None
+        return (await self._kids_source_poster_items_bulk([source_id])).get(
+            int(source_id),
+            [],
+        )
+
+    async def kids_source_poster_state(
+        self,
+        source_id: int,
+    ) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT id,kind,reference,title,avatar_url,poster_item_id,
+                       state,safety_verdict,revision
+                FROM catalog_sources
+                WHERE id=?
+                """,
+                (source_id,),
+            )
+            row = await cur.fetchone()
+            columns = [description[0] for description in cur.description] if row else []
+        if row is None:
+            return None
+        source = dict(zip(columns, row))
+        source["id"] = int(source["id"])
+        source["poster_item_id"] = (
+            int(source["poster_item_id"])
+            if source["poster_item_id"] is not None
+            else None
+        )
+        avatar_url = str(source.get("avatar_url") or "").strip()
+        source["genuine_avatar_url"] = (
+            avatar_url if _kids_channel_avatar_is_proxyable(avatar_url) else ""
+        )
+        items = (
+            await self._kids_source_poster_items_bulk([source_id])
+        ).get(int(source_id), [])
+        effective = (
+            _kids_effective_poster_item(source["poster_item_id"], items)
+            if _kids_source_can_publish_poster(source)
+            else None
+        )
+        source["effective_poster_thumbnail_url"] = (
+            effective["thumbnail_url"] if effective else ""
+        )
+        return {
+            "source": source,
+            "effective_poster": {
+                "mode": (
+                    "explicit"
+                    if effective is not None
+                    and effective["id"] == source["poster_item_id"]
+                    else "automatic"
+                ),
+                "item": effective,
+            },
+        }
+
+    async def kids_source_poster_set(
+        self,
+        source_id: int,
+        poster_item_id: int | None,
+        *,
+        actor: str,
+        reason: str,
+        correlation_id: str,
+    ) -> dict[str, Any] | None:
+        if poster_item_id is not None and (
+            type(poster_item_id) is not int or poster_item_id < 1
+        ):
+            raise ValueError("invalid poster item")
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    """
+                    SELECT id,kind,reference,title,state,safety_verdict,poster_item_id
+                    FROM catalog_sources
+                    WHERE id=?
+                    """,
+                    (source_id,),
+                )
+                source_row = await cur.fetchone()
+                if source_row is None:
+                    await db.rollback()
+                    return None
+                source = dict(
+                    zip(
+                        [
+                            "id",
+                            "kind",
+                            "reference",
+                            "title",
+                            "state",
+                            "safety_verdict",
+                            "poster_item_id",
+                        ],
+                        source_row,
+                    )
+                )
+                if not _kids_source_can_publish_poster(source):
+                    raise ValueError("catalog source is not eligible for poster management")
+                if poster_item_id is not None:
+                    item = await (
+                        await db.execute(
+                            """
+                            SELECT source_id,state,thumbnail_url,channel_id,channel_title
+                            FROM catalog_items
+                            WHERE id=?
+                            """,
+                            (poster_item_id,),
+                        )
+                    ).fetchone()
+                    if item is None:
+                        raise ValueError("poster item not found")
+                    if item[0] != source_id:
+                        raise ValueError("poster item belongs to a different source")
+                    if item[1] != "approved":
+                        raise ValueError("poster item is not approved")
+                    if not _kids_thumbnail_is_proxyable(item[2]):
+                        raise ValueError("poster item thumbnail is not proxyable")
+                    if not _catalog_item_is_authorized(
+                        {
+                            "state": item[1],
+                            "channel_id": item[3],
+                            "channel_title": item[4],
+                        },
+                        source,
+                    ):
+                        raise ValueError("poster item is not authorized")
+                if source["poster_item_id"] == poster_item_id:
+                    await db.rollback()
+                else:
+                    revision = await self._catalog_revision(db)
+                    await db.execute(
+                        """
+                        UPDATE catalog_sources
+                        SET poster_item_id=?,actor=?,changed_at=?,reason=?,
+                            revision=?,correlation_id=?
+                        WHERE id=?
+                        """,
+                        (
+                            poster_item_id,
+                            actor,
+                            now,
+                            reason,
+                            revision,
+                            correlation_id,
+                            source_id,
+                        ),
+                    )
+                    await db.execute(
+                        """
+                        INSERT INTO kids_audit_events(
+                            event,entity_type,entity_id,actor,reason,revision,
+                            correlation_id,created_at
+                        ) VALUES(?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            "source_poster_changed",
+                            "source",
+                            source_id,
+                            actor,
+                            reason,
+                            revision,
+                            correlation_id,
+                            now,
+                        ),
+                    )
+                    await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return await self.kids_source_poster_state(source_id)
+
     async def catalog_transition(
         self,
         entity: str,
@@ -771,6 +1084,7 @@ class KidsDatabaseMixin:
         minimum_quality_height: int = 720,
         expires_in_seconds: int = 4 * 60 * 60,
         include_items: bool = True,
+        source_id: int | None = None,
     ) -> dict[str, Any]:
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         now = datetime.now(timezone.utc)
@@ -789,14 +1103,19 @@ class KidsDatabaseMixin:
             await db.execute(
                 """
                 INSERT INTO feed_sessions(
-                    id,profile,catalog_revision,policy_version,created_at,expires_at
-                ) VALUES(?,?,?,?,?,?)
+                    id,profile,source_id,catalog_revision,policy_version,created_at,expires_at
+                ) VALUES(?,?,?,?,?,?,?)
                 """,
-                (session_id, profile, revision, policy_version, now_iso, expires_at),
+                (session_id, profile, source_id, revision, policy_version, now_iso, expires_at),
             )
             if include_items:
+                source_filter = ""
+                source_args: tuple[Any, ...] = ()
+                if source_id is not None:
+                    source_filter = " AND s.id=?"
+                    source_args = (source_id,)
                 cur = await db.execute(
-                    """
+                    f"""
                     SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
                            s.title AS _source_title,s.state AS _source_state,
                            s.safety_verdict AS _source_safety_verdict,
@@ -808,16 +1127,22 @@ class KidsDatabaseMixin:
                     JOIN kids_resolve_backlog b ON b.item_id=i.id
                     WHERE i.state='approved' AND s.state='approved'
                       AND s.safety_verdict='SAFE' AND s.reference!=?
+                      {source_filter}
                       AND b.status='ready' AND b.quality_height>=? AND b.expires_at>?
                     ORDER BY
                         ROW_NUMBER() OVER (
                             PARTITION BY i.source_id
-                            ORDER BY b.resolved_at DESC,i.id ASC
+                            ORDER BY RANDOM()
                         ),
-                        MAX(b.resolved_at) OVER (PARTITION BY i.source_id) DESC,
-                        b.resolved_at DESC,i.id ASC
+                        RANDOM()
                     """,
-                    (profile, KIDS_HOME_SOURCE_REFERENCE, minimum_quality_height, expires_after),
+                    (
+                        profile,
+                        KIDS_HOME_SOURCE_REFERENCE,
+                        *source_args,
+                        minimum_quality_height,
+                        expires_after,
+                    ),
                 )
                 rows = await cur.fetchall()
                 columns = [description[0] for description in cur.description]
@@ -853,6 +1178,146 @@ class KidsDatabaseMixin:
             "expires_at": expires_at,
         }
 
+    async def kids_feed_session_binding(self, session_id: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (
+                await db.execute(
+                    "SELECT profile,source_id FROM feed_sessions WHERE id=?",
+                    (session_id,),
+                )
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "profile": str(row[0]),
+            "source_id": int(row[1]) if row[1] is not None else None,
+        }
+
+    async def kids_eligible_channels(
+        self,
+        *,
+        profile: str,
+        minimum_remaining_seconds: int,
+        minimum_quality_height: int = 720,
+    ) -> list[dict[str, Any]]:
+        """Return current profile-bound sources with a usable approved poster."""
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
+        now = datetime.now(timezone.utc)
+        expires_after = now + timedelta(seconds=max(0, int(minimum_remaining_seconds)))
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT s.id,s.kind,s.reference,s.title,s.avatar_url,s.poster_item_id,
+                       s.state,s.safety_verdict,
+                       i.id AS _item_id,i.video_id,i.title AS _item_title,
+                       i.channel_id,i.channel_title,i.state AS _item_state,
+                       i.thumbnail_url,
+                       b.status AS _backlog_status,b.candidate_json AS _candidate_json,
+                       b.quality_height AS _backlog_quality_height,
+                       b.expires_at AS _backlog_expires_at
+                FROM catalog_sources s
+                JOIN catalog_source_profiles ps
+                  ON ps.source_id=s.id AND ps.profile_slug=?
+                JOIN catalog_items i ON i.source_id=s.id
+                JOIN kids_resolve_backlog b ON b.item_id=i.id
+                WHERE s.state='approved' AND s.safety_verdict='SAFE'
+                  AND s.kind='channel' AND s.reference!=? AND b.status='ready'
+                  AND b.expires_at>?
+                ORDER BY s.id ASC,i.id ASC
+                """,
+                (
+                    profile,
+                    KIDS_HOME_SOURCE_REFERENCE,
+                    expires_after.isoformat(),
+                ),
+            )
+            rows = await cur.fetchall()
+
+        channels: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            (
+                source_id,
+                source_kind,
+                source_reference,
+                source_title,
+                avatar_url,
+                poster_item_id,
+                source_state,
+                source_safety_verdict,
+                item_id,
+                video_id,
+                item_title,
+                channel_id,
+                channel_title,
+                item_state,
+                thumbnail_url,
+                backlog_status,
+                candidate_json,
+                backlog_quality_height,
+                backlog_expires_at,
+            ) = row
+            item = {
+                "id": item_id,
+                "state": item_state,
+                "video_id": video_id,
+                "title": item_title,
+                "channel_id": channel_id,
+                "channel_title": channel_title,
+            }
+            source = {
+                "kind": source_kind,
+                "reference": source_reference,
+                "title": source_title,
+                "state": source_state,
+                "safety_verdict": source_safety_verdict,
+            }
+            if (
+                not _catalog_item_is_authorized(item, source)
+                or backlog_status != "ready"
+                or not _stored_candidate_meets_policy(
+                    candidate_json,
+                    backlog_quality_height,
+                    minimum_quality_height,
+                )
+                or _parse_utc(backlog_expires_at) is None
+                or _parse_utc(backlog_expires_at) <= expires_after
+            ):
+                continue
+            channel = channels.setdefault(
+                int(source_id),
+                {
+                    "source_id": int(source_id),
+                    "kind": source_kind,
+                    "reference": source_reference,
+                    "title": str(source_title or "").strip(),
+                    "avatar_url": str(avatar_url or "").strip(),
+                    "poster_item_id": (
+                        int(poster_item_id) if poster_item_id is not None else None
+                    ),
+                },
+            )
+
+        poster_items_by_source = await self._kids_source_poster_items_bulk(
+            list(channels)
+        )
+        result: list[dict[str, Any]] = []
+        for channel in channels.values():
+            poster = _kids_effective_poster_item(
+                channel["poster_item_id"],
+                poster_items_by_source.get(channel["source_id"], []),
+            )
+            channel["poster_item"] = (
+                {
+                    "item_id": poster["id"],
+                    "thumbnail_url": poster["thumbnail_url"],
+                }
+                if poster
+                else None
+            )
+            result.append(channel)
+        secrets.SystemRandom().shuffle(result)
+        return result
+
     async def kids_feed_session_page(
         self,
         session_id: str,
@@ -875,7 +1340,7 @@ class KidsDatabaseMixin:
             session = await (
                 await db.execute(
                     """
-                    SELECT profile,catalog_revision,policy_version,expires_at
+                    SELECT profile,catalog_revision,policy_version,expires_at,source_id
                     FROM feed_sessions WHERE id=?
                     """,
                     (session_id,),
@@ -883,7 +1348,13 @@ class KidsDatabaseMixin:
             ).fetchone()
             if not session:
                 return {"status": "not_found"}
-            session_profile, session_revision, session_policy, session_expires = session
+            (
+                session_profile,
+                session_revision,
+                session_policy,
+                session_expires,
+                session_source_id,
+            ) = session
             parsed_expiry = _parse_utc(session_expires)
             if parsed_expiry is None or parsed_expiry <= now:
                 return {"status": "expired"}
@@ -925,6 +1396,7 @@ class KidsDatabaseMixin:
                           SELECT 1 FROM catalog_source_profiles ps
                           WHERE ps.source_id=i.source_id AND ps.profile_slug=?
                       )
+                      AND (? IS NULL OR i.source_id=?)
                       AND b.status='ready' AND b.expires_at>?
                     ORDER BY f.ordinal ASC
                     LIMIT ?
@@ -934,6 +1406,8 @@ class KidsDatabaseMixin:
                         scan_ordinal,
                         KIDS_HOME_SOURCE_REFERENCE,
                         profile,
+                        session_source_id,
+                        session_source_id,
                         expires_after,
                         batch_size,
                     ),
@@ -1576,18 +2050,36 @@ class KidsDatabaseMixin:
             cur = await db.execute(
                 """
                 SELECT item_id,video_id FROM (
-                    SELECT item_id,video_id,1 AS priority,COALESCE(next_attempt_at,'') AS due
-                    FROM kids_resolve_backlog
-                    WHERE status IN ('pending','retry')
-                      AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-                    UNION ALL
-                    SELECT item_id,video_id,0 AS priority,expires_at AS due
-                    FROM kids_resolve_backlog
-                    WHERE status='ready' AND expires_at<=?
+                    SELECT item_id,video_id,priority,due,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY priority,source_id
+                               ORDER BY due ASC,item_id ASC
+                           ) AS source_position
+                    FROM (
+                        SELECT b.item_id,b.video_id,i.source_id,0 AS priority,
+                               COALESCE(b.next_attempt_at,'') AS due
+                        FROM kids_resolve_backlog b
+                        JOIN catalog_items i ON i.id=b.item_id
+                        WHERE b.status='pending'
+                          AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
+                        UNION ALL
+                        SELECT b.item_id,b.video_id,i.source_id,1 AS priority,
+                               COALESCE(b.next_attempt_at,'') AS due
+                        FROM kids_resolve_backlog b
+                        JOIN catalog_items i ON i.id=b.item_id
+                        WHERE b.status='retry'
+                          AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
+                        UNION ALL
+                        SELECT b.item_id,b.video_id,i.source_id,2 AS priority,b.expires_at AS due
+                        FROM kids_resolve_backlog b
+                        JOIN catalog_items i ON i.id=b.item_id
+                        WHERE b.status='ready' AND b.expires_at<=?
+                    )
                 )
-                ORDER BY priority ASC,due ASC,item_id ASC LIMIT ?
+                ORDER BY priority ASC,source_position ASC,due ASC,item_id ASC
+                LIMIT ?
                 """,
-                (now_iso, refresh_at, bounded),
+                (now_iso, now_iso, refresh_at, bounded),
             )
             rows = await cur.fetchall()
             for item_id, _video_id in rows:
@@ -2164,6 +2656,8 @@ class KidsDatabaseMixin:
             )
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
+        source_ids = [int(dict(zip(cols, row))["id"]) for row in rows]
+        poster_items_by_source = await self._kids_source_poster_items_bulk(source_ids)
         profile_names = {
             profile["slug"]: profile["display_name"]
             for profile in await self.kids_profiles_list()
@@ -2180,7 +2674,33 @@ class KidsDatabaseMixin:
             source["youtube_source_url"] = _youtube_source_url(
                 source.get("kind"), source.get("reference")
             )
-            source["avatar_url"] = source.get("avatar_url") or source.pop("fallback_avatar_url", "")
+            source["poster_item_id"] = (
+                int(source["poster_item_id"])
+                if source.get("poster_item_id") is not None
+                else None
+            )
+            genuine_avatar_url = str(source.get("avatar_url") or "").strip()
+            source["genuine_avatar_url"] = (
+                genuine_avatar_url
+                if _kids_channel_avatar_is_proxyable(genuine_avatar_url)
+                else ""
+            )
+            fallback_avatar_url = str(
+                source.get("fallback_avatar_url", "") or ""
+            ).strip()
+            source["fallback_avatar_url"] = fallback_avatar_url
+            source["avatar_url"] = source["genuine_avatar_url"] or fallback_avatar_url
+            effective = (
+                _kids_effective_poster_item(
+                    source["poster_item_id"],
+                    poster_items_by_source.get(int(source["id"]), []),
+                )
+                if _kids_source_can_publish_poster(source)
+                else None
+            )
+            source["effective_poster_thumbnail_url"] = (
+                effective["thumbnail_url"] if effective else ""
+            )
             result.append(source)
         return result
 

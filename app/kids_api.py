@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -20,14 +21,21 @@ from .models import (
     KidsDataplaneEventRequest,
     KidsKillSwitchRequest,
     KidsPlaybackSessionRequest,
+    KidsSourcePosterRequest,
     KidsSourceProfilesRequest,
     KidsWatchEventRequest,
 )
 from .services.kids_classifier import OpenCodexKidsClassifier
+from .services.kids_database import (
+    KIDS_CHANNEL_ART_HOSTS,
+    KIDS_VIDEO_THUMBNAIL_HOSTS,
+    _kids_channel_avatar_is_proxyable,
+)
 
 
 KIDS_DATAPLANE_POLICY_VERSION = "sentinel-kids-v1"
 KIDS_PROFILE_AVATAR_MAX_BYTES = 10 * 1024 * 1024
+KIDS_CHANNEL_ART_MAX_BYTES = 8 * 1024 * 1024
 router = APIRouter()
 
 
@@ -81,6 +89,45 @@ def _kids_unavailable(state: str) -> HTTPException:
     )
 
 
+def _kids_source_poster_response(result: dict[str, Any]) -> dict[str, Any]:
+    source = result["source"]
+    effective_poster = result["effective_poster"]
+    item = effective_poster.get("item")
+    return {
+        "source": {
+            "id": int(source["id"]),
+            "kind": str(source.get("kind") or ""),
+            "reference": str(source.get("reference") or ""),
+            "title": str(source.get("title") or ""),
+            "state": str(source.get("state") or ""),
+            "safety_verdict": str(source.get("safety_verdict") or ""),
+            "genuine_avatar_url": str(source.get("genuine_avatar_url") or ""),
+            "poster_item_id": (
+                int(source["poster_item_id"])
+                if source.get("poster_item_id") is not None
+                else None
+            ),
+            "effective_poster_thumbnail_url": str(
+                source.get("effective_poster_thumbnail_url") or ""
+            ),
+            "revision": int(source.get("revision") or 0),
+        },
+        "effective_poster": {
+            "mode": str(effective_poster.get("mode") or "automatic"),
+            "item": (
+                {
+                    "id": int(item["id"]),
+                    "title": str(item.get("title") or ""),
+                    "thumbnail_url": str(item.get("thumbnail_url") or ""),
+                    "state": str(item.get("state") or ""),
+                }
+                if item is not None
+                else None
+            ),
+        },
+    }
+
+
 def _kids_lease_failure(result: dict[str, Any]) -> HTTPException:
     failure = result.get("status", "ineligible")
     if failure == "not_found":
@@ -104,6 +151,117 @@ async def _kids_profile(request: Request, profile: str, *, require_enabled: bool
             detail={"code": "kids_profile_not_found", "message": "Kids profile is unavailable."},
         )
     return row
+
+
+def _kids_channel_opaque_id(channel: dict[str, Any]) -> str:
+    identity = f"{channel.get('kind', '')}\x00{channel.get('reference', '')}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _kids_channel_accessibility_label(channel: dict[str, Any]) -> str:
+    label = str(channel.get("title") or "").strip()
+    reference = str(channel.get("reference") or "").strip()
+    lowered = label.casefold()
+    if (
+        not label
+        or label == reference
+        or "http://" in lowered
+        or "https://" in lowered
+        or "youtube.com/" in lowered
+        or "youtu.be/" in lowered
+    ):
+        return "Kids channel"
+    return label[:200]
+
+
+def _kids_channel_artwork_url(
+    request: Request,
+    opaque_id: str,
+    artwork: str,
+    profile: str,
+    revision: int,
+) -> str:
+    base_url = str(request.base_url).rstrip("/")
+    return (
+        f"{base_url}/v1/kids/channels/{opaque_id}/artwork/{artwork}"
+        f"?profile={quote(profile, safe='')}&v={revision}"
+    )
+
+
+async def _kids_current_channel(
+    request: Request,
+    profile: str,
+    opaque_id: str,
+) -> tuple[str, dict[str, Any]]:
+    runtime: Any = request.app.state.runtime
+    profile_row = await _kids_profile(request, profile)
+    await runtime.reconcile_kids_catalog_policy()
+    if await runtime.kids_policy_state() != "ready":
+        raise _kids_unavailable(await runtime.kids_policy_state())
+    channels = await runtime.db.kids_eligible_channels(
+        profile=profile_row["slug"],
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+    )
+    for channel in channels:
+        if _kids_channel_opaque_id(channel) == opaque_id:
+            return profile_row["slug"], channel
+    raise HTTPException(
+        status_code=404,
+        detail={"code": "kids_channel_not_found", "message": "Kids channel is unavailable."},
+    )
+
+
+async def _kids_proxy_image(
+    runtime: Any,
+    image_url: str,
+    *,
+    allowed_hosts: frozenset[str],
+    unavailable_detail: str = "Kids artwork is unavailable",
+    upstream_detail: str = "Kids artwork upstream unavailable",
+) -> Response:
+    try:
+        parsed = urlsplit(image_url)
+        port = parsed.port
+    except ValueError:
+        port = None
+        parsed = None
+    if (
+        parsed is None
+        or parsed.scheme != "https"
+        or parsed.hostname not in allowed_hosts
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+    ):
+        raise HTTPException(status_code=404, detail=unavailable_detail)
+    try:
+        upstream = await runtime.kids_http_client.get(
+            image_url,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=upstream_detail) from exc
+    content_type = upstream.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    try:
+        content_length = int(upstream.headers.get("content-length", "0"))
+    except ValueError:
+        content_length = 0
+    if (
+        upstream.status_code != 200
+        or not content_type.startswith("image/")
+        or content_length > KIDS_CHANNEL_ART_MAX_BYTES
+        or len(upstream.content) > KIDS_CHANNEL_ART_MAX_BYTES
+    ):
+        await upstream.aclose()
+        raise HTTPException(status_code=502, detail=upstream_detail)
+    content = upstream.content
+    await upstream.aclose()
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 def _kids_profile_avatar_path(request: Request, profile: str) -> Path:
@@ -196,15 +354,112 @@ def _kids_upstream_headers(response: httpx.Response) -> dict[str, str]:
     }
 
 
+@router.get("/v1/kids/channels")
+async def kids_channels(
+    request: Request,
+    profile: str = Query(default="noah", min_length=1, max_length=64),
+) -> dict[str, Any]:
+    runtime: Any = request.app.state.runtime
+    profile_row = await _kids_profile(request, profile)
+    await runtime.reconcile_kids_catalog_policy()
+    state = await runtime.kids_policy_state()
+    revision = await runtime.db.catalog_revision()
+    if state != "ready":
+        return {
+            "state": state,
+            "catalog_revision": str(revision),
+            "retry_after_seconds": 30,
+            "channels": [],
+        }
+    channels = await runtime.db.kids_eligible_channels(
+        profile=profile_row["slug"],
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+    )
+    response_channels = []
+    for channel in channels:
+        opaque_id = _kids_channel_opaque_id(channel)
+        poster_url = None
+        if channel.get("poster_item"):
+            poster_url = _kids_channel_artwork_url(
+                request,
+                opaque_id,
+                "background",
+                profile_row["slug"],
+                revision,
+            )
+        avatar_url = (
+            _kids_channel_artwork_url(
+                request,
+                opaque_id,
+                "avatar",
+                profile_row["slug"],
+                revision,
+            )
+            if _kids_channel_avatar_is_proxyable(channel.get("avatar_url"))
+            else None
+        )
+        response_channels.append(
+            {
+                "id": opaque_id,
+                "poster_background_url": poster_url,
+                "avatar_url": avatar_url,
+                "accessibility_label": _kids_channel_accessibility_label(channel),
+            }
+        )
+    return {
+        "state": state,
+        "catalog_revision": str(revision),
+        "retry_after_seconds": 30,
+        "channels": response_channels,
+    }
+
+
+@router.get("/v1/kids/channels/{opaque_id}/artwork/background")
+async def kids_channel_background(
+    opaque_id: str,
+    request: Request,
+    profile: str = Query(default="noah", min_length=1, max_length=64),
+) -> Response:
+    _profile, channel = await _kids_current_channel(request, profile, opaque_id)
+    poster = channel.get("poster_item")
+    if not poster:
+        raise HTTPException(status_code=404, detail="Kids channel artwork is unavailable")
+    return await _kids_proxy_image(
+        request.app.state.runtime,
+        str(poster["thumbnail_url"]),
+        allowed_hosts=KIDS_VIDEO_THUMBNAIL_HOSTS,
+    )
+
+
+@router.get("/v1/kids/channels/{opaque_id}/artwork/avatar")
+async def kids_channel_avatar(
+    opaque_id: str,
+    request: Request,
+    profile: str = Query(default="noah", min_length=1, max_length=64),
+) -> Response:
+    _profile, channel = await _kids_current_channel(request, profile, opaque_id)
+    avatar_url = str(channel.get("avatar_url") or "").strip()
+    if not _kids_channel_avatar_is_proxyable(avatar_url):
+        raise HTTPException(status_code=404, detail="Kids channel avatar is unavailable")
+    return await _kids_proxy_image(
+        request.app.state.runtime,
+        avatar_url,
+        allowed_hosts=KIDS_CHANNEL_ART_HOSTS,
+    )
+
+
 @router.get("/v1/kids/feed")
 async def kids_feed(
     request: Request,
     cursor: str | None = Query(default=None),
     limit: int = Query(default=36, ge=1, le=60),
     profile: str | None = Query(default=None, min_length=1, max_length=64),
+    channel: str | None = Query(default=None, min_length=1, max_length=128),
 ) -> dict[str, Any]:
     runtime: Any = request.app.state.runtime
     requested_profile = str(profile or "").strip().lower()
+    requested_channel = str(channel or "").strip()
     await runtime.reconcile_kids_catalog_policy()
     state = await runtime.kids_policy_state()
     if cursor:
@@ -220,12 +475,32 @@ async def kids_feed(
         profile = (await _kids_profile(request, cursor_profile))["slug"]
     else:
         profile = (await _kids_profile(request, requested_profile or "noah"))["slug"]
+    channel_source_id: int | None = None
+    if requested_channel:
+        _channel_profile, channel_row = await _kids_current_channel(
+            request,
+            profile,
+            requested_channel,
+        )
+        channel_source_id = int(channel_row["source_id"])
+        if cursor:
+            binding = await runtime.db.kids_feed_session_binding(session_id)
+            if binding is not None and binding["source_id"] != channel_source_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "kids_feed_channel_mismatch",
+                        "message": "Kids feed cursor is no longer valid.",
+                    },
+                )
+    if not cursor:
         session = await runtime.db.kids_feed_session_create(
             profile=profile,
             policy_version=KIDS_DATAPLANE_POLICY_VERSION,
             minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
             minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
             include_items=state == "ready",
+            source_id=channel_source_id,
         )
         session_id, offset = session["id"], 0
     page = await runtime.db.kids_feed_session_page(
@@ -283,23 +558,12 @@ async def kids_thumbnail(asset_id: str, request: Request) -> Response:
         raise HTTPException(status_code=404, detail="Kids asset not found")
     if asset["catalog_revision"] != await runtime.db.catalog_revision():
         raise HTTPException(status_code=409, detail="Kids asset is stale")
-    parsed = urlsplit(str(asset["thumbnail_url"]))
-    if parsed.scheme != "https" or parsed.hostname != "i.ytimg.com":
-        raise HTTPException(status_code=404, detail="Kids thumbnail is unavailable")
-    try:
-        upstream = await runtime.kids_http_client.get(str(asset["thumbnail_url"]))
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Kids thumbnail upstream unavailable") from exc
-    content_type = upstream.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if upstream.status_code != 200 or not content_type.startswith("image/"):
-        await upstream.aclose()
-        raise HTTPException(status_code=502, detail="Kids thumbnail upstream unavailable")
-    content = upstream.content
-    await upstream.aclose()
-    return Response(
-        content=content,
-        media_type=content_type,
-        headers={"Cache-Control": "public, max-age=86400"},
+    return await _kids_proxy_image(
+        runtime,
+        str(asset["thumbnail_url"]),
+        allowed_hosts=KIDS_VIDEO_THUMBNAIL_HOSTS,
+        unavailable_detail="Kids thumbnail is unavailable",
+        upstream_detail="Kids thumbnail upstream unavailable",
     )
 
 
@@ -569,6 +833,40 @@ async def api_catalog_sources(
             limit=limit,
         )
     }
+
+
+@router.get("/api/kids/sources/{source_id}/poster-items")
+async def api_kids_source_poster_items(
+    source_id: int,
+    request: Request,
+) -> dict[str, Any]:
+    items = await request.app.state.runtime.db.kids_source_poster_items(source_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="catalog source not found")
+    return {"source_id": source_id, "items": items}
+
+
+@router.put("/api/kids/sources/{source_id}/poster")
+async def api_kids_source_poster(
+    source_id: int,
+    payload: KidsSourcePosterRequest,
+    request: Request,
+) -> dict[str, Any]:
+    runtime: Any = request.app.state.runtime
+    await runtime.reconcile_kids_catalog_policy()
+    try:
+        result = await runtime.db.kids_source_poster_set(
+            source_id,
+            payload.item_id,
+            actor=payload.actor,
+            reason=payload.reason,
+            correlation_id=payload.correlation_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="catalog source not found")
+    return _kids_source_poster_response(result)
 
 
 @router.post("/api/kids/sources")
