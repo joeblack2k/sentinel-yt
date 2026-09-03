@@ -655,6 +655,42 @@ def test_channel_artwork_proxy_rejects_declared_and_actual_oversized_responses(
         assert actual.status_code == 502
 
 
+def test_channel_artwork_proxy_never_follows_redirects(tmp_path, monkeypatch):
+    db_path = tmp_path / "sentinel.db"
+    asyncio.run(seed_catalog(db_path, qualities=(720,)))
+    module = load_app(tmp_path, monkeypatch)
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "i.ytimg.com":
+            return httpx.Response(
+                302,
+                headers={"location": "https://example.invalid/artwork.jpg"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "image/jpeg"},
+            content=b"redirected",
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+    )
+    monkeypatch.setattr(module, "_new_kids_http_client", lambda: client)
+
+    with TestClient(module.app) as app_client:
+        channel = app_client.get("/v1/kids/channels").json()["channels"][0]
+        response = app_client.get(channel["poster_background_url"])
+
+    assert response.status_code == 502
+    assert len(requests) == 1
+    assert requests[0].url.host == "i.ytimg.com"
+
+
 def test_channel_poster_override_stays_on_source_and_falls_back_after_revoke(
     tmp_path, monkeypatch
 ):

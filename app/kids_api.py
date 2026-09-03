@@ -236,7 +236,10 @@ async def _kids_proxy_image(
     ):
         raise HTTPException(status_code=404, detail=unavailable_detail)
     try:
-        upstream = await runtime.kids_http_client.get(image_url)
+        upstream = await runtime.kids_http_client.get(
+            image_url,
+            follow_redirects=False,
+        )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=upstream_detail) from exc
     content_type = upstream.headers.get("content-type", "").split(";", 1)[0].strip().lower()
