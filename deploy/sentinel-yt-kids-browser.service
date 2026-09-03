@@ -20,6 +20,7 @@ Environment=KIDS_BROWSER_DISPLAY=:99
 ExecStart=/opt/sentinel-yt/.venv/bin/python -m app.services.kids_browser
 Restart=always
 RestartSec=5
+KillMode=mixed
 TimeoutStopSec=10
 NoNewPrivileges=true
 PrivateTmp=true

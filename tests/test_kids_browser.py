@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import socket
 import sqlite3
@@ -11,8 +12,11 @@ import pytest
 from app.services.kids_browser import (
     BrowserStartupError,
     browser_target_status,
+    checkpoint_kids_session_cookies,
     clear_stale_chromium_singleton_locks,
+    close_chromium_browser,
     chromium_command,
+    enable_chromium_session_restore,
     open_kids_page_if_missing,
     persist_kids_session_cookies,
     require_existing_profile,
@@ -75,6 +79,114 @@ def test_chromium_command_uses_the_persistent_kids_profile_only() -> None:
     assert "--restore-last-session" in command
     assert "--remote-debugging-port=9223" in command
     assert "www.youtube.com" not in rendered
+
+
+def test_browser_enables_native_session_restore_atomically(tmp_path: Path) -> None:
+    preferences = tmp_path / "Default" / "Preferences"
+    preferences.parent.mkdir()
+    preferences.write_text('{"profile":{"name":"Default"}}')
+
+    enable_chromium_session_restore(tmp_path)
+
+    assert json.loads(preferences.read_text()) == {
+        "profile": {"name": "Default"},
+        "session": {"restore_on_startup": 1},
+    }
+    assert not list(preferences.parent.glob(".Preferences.*"))
+
+
+class FakeWebSocket:
+    def __init__(self, result):
+        self.result = result
+        self.sent = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return None
+
+    def send(self, message):
+        self.sent.append(json.loads(message))
+
+    def recv(self, *, timeout):
+        return json.dumps({"id": 1, "result": self.result})
+
+
+def test_browser_closes_chromium_through_its_browser_endpoint() -> None:
+    requests = []
+    websocket = FakeWebSocket({})
+
+    def opener(url, *, timeout):
+        requests.append((url, timeout))
+        return io.BytesIO(b'{"webSocketDebuggerUrl":"ws://browser"}')
+
+    close_chromium_browser(
+        9223,
+        opener=opener,
+        connector=lambda *_, **__: websocket,
+    )
+
+    assert requests == [("http://127.0.0.1:9223/json/version", 0.75)]
+    assert websocket.sent == [{"id": 1, "method": "Browser.close", "params": {}}]
+
+
+def test_browser_persists_only_relevant_session_cookies() -> None:
+    target = {
+        "type": "page",
+        "url": "https://www.youtubekids.com/",
+        "webSocketDebuggerUrl": "ws://kids-page",
+    }
+    sockets = []
+    results = [
+        {
+            "cookies": [
+                {
+                    "name": "google-session",
+                    "value": "secret",
+                    "domain": ".google.com",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                    "session": True,
+                },
+                {
+                    "name": "already-persistent",
+                    "value": "kept",
+                    "domain": ".youtube.com",
+                    "session": False,
+                    "expires": 999,
+                },
+                {
+                    "name": "unrelated",
+                    "value": "ignored",
+                    "domain": ".example.com",
+                    "session": True,
+                },
+            ]
+        },
+        {"success": True},
+    ]
+
+    def connector(*_, **__):
+        websocket = FakeWebSocket(results.pop(0))
+        sockets.append(websocket)
+        return websocket
+
+    assert checkpoint_kids_session_cookies(
+        targets_reader=lambda _: [target],
+        connector=connector,
+        now_fn=lambda: 1000,
+    ) == 1
+    assert [socket.sent[0]["method"] for socket in sockets] == [
+        "Network.getAllCookies",
+        "Network.setCookie",
+    ]
+    params = sockets[1].sent[0]["params"]
+    assert params["name"] == "google-session"
+    assert params["domain"] == ".google.com"
+    assert params["expires"] == 1000 + 400 * 24 * 60 * 60
+    assert "session" not in params
 
 
 def test_browser_opens_kids_only_when_no_restorable_kids_page_exists() -> None:
@@ -213,6 +325,7 @@ def test_sentinel_units_own_the_persistent_browser_runtime() -> None:
 
     assert "app.services.kids_browser" in browser_unit
     assert "/opt/sentinel-yt/current" in browser_unit
+    assert "KillMode=mixed" in browser_unit
     assert (
         "KIDS_BROWSER_PROFILE_PATH=/opt/youtube-sub-browser/data/youtube-web-profile"
         in browser_unit
