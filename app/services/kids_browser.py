@@ -171,6 +171,7 @@ def chromium_command(
         "--password-store=basic",
         "--no-first-run",
         "--no-default-browser-check",
+        "--restore-last-session",
         "--disable-session-crashed-bubble",
         "--disable-infobars",
         "--disable-blink-features=AutomationControlled",
