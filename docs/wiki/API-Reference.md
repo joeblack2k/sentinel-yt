@@ -111,8 +111,15 @@ playback authorization.
 The tvOS client uses only these minimal dataplane routes. It does not connect
 to YouTube directly.
 
-### `GET /v1/kids/feed?cursor=&limit=&profile=`
-Return an opaque-cursor page of approved, currently playable thumbnails. The
+### `GET /v1/kids/channels?profile=`
+Return the approved channel wall for one child profile. Each entry uses an
+opaque channel ID and local artwork URLs. Poster backgrounds come from real
+approved videos; trusted channel avatars may be overlaid by the client.
+
+### `GET /v1/kids/feed?cursor=&limit=&profile=&channel=`
+Return an opaque-cursor page from the selected channel. The first request
+supplies the opaque channel ID. Sentinel stores that binding in the feed
+session, so later cursor-only requests cannot cross into another channel. The
 response contains no titles, channel names, or raw YouTube URLs.
 
 ### `GET /v1/kids/thumbnails/{asset_id}`

@@ -31,6 +31,7 @@ General service:
 
 Kids dataplane:
 
+- `GET /v1/kids/channels?profile=`
 - `GET /v1/kids/feed`
 - `GET /v1/kids/thumbnails/{asset_id}`
 - `POST /v1/kids/playback-sessions`
@@ -44,6 +45,8 @@ Kids dataplane:
 - `PUT /api/kids/profiles/{profile}/avatar`
 - `DELETE /api/kids/profiles/{profile}/avatar`
 - `GET /api/kids/sources`
+- `GET /api/kids/sources/{source_id}/poster-items`
+- `PUT /api/kids/sources/{source_id}/poster`
 - `GET /api/kids/resolve`
 
 Guardian control:

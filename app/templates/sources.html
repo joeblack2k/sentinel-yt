@@ -162,7 +162,7 @@
     <table>
       <thead>
         <tr>
-          <th style="width:48px;">Avatar</th>
+          <th style="width:86px;">Poster</th>
           <th style="width:75px;">Type</th>
           <th>Source Name &amp; Safe Links</th>
           <th style="width:170px;">Profile Assignment</th>
@@ -174,6 +174,7 @@
       </thead>
       <tbody id="kids-sources-tbody">
         {% for source in sources if sources is defined %}
+        {% set is_system_source = source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
         <tr class="source-row"
             data-id="{{ source.id }}"
             data-title="{{ (source.title or '')|lower }}"
@@ -184,14 +185,36 @@
             data-profiles="{{ (source.profile_slugs or [])|join(',')|lower }}"
             data-samples="{{ source.safety_sample_count or 0 }}"
             data-ready="{{ source.ready_item_count or 0 }}">
-          <td>
-            <div class="channel-avatar">
-              {% if source.avatar_url %}
-                <img src="{{ source.avatar_url }}" alt="" onerror="this.parentElement.innerHTML='{{ ((source.title or source.reference or 'S')|string)[:1]|upper }}';">
-              {% else %}
-                {{ ((source.title or source.reference or 'S')|string)[:1]|upper }}
-              {% endif %}
-            </div>
+          <td class="source-art-cell">
+            {% if is_system_source %}
+              <span class="muted" style="font-size:12px;">-</span>
+            {% else %}
+              <div class="source-art">
+                {% if source.effective_poster_thumbnail_url %}
+                  <img class="source-poster"
+                       src="{{ source.effective_poster_thumbnail_url }}"
+                       alt="{{ source.title or 'Source' }} poster"
+                       loading="lazy"
+                       decoding="async"
+                       onerror="this.hidden=true; this.nextElementSibling.hidden=false;">
+                  <span class="source-poster source-poster-fallback" hidden>Poster unavailable</span>
+                {% else %}
+                  <span class="source-poster source-poster-fallback" role="img" aria-label="Approved poster unavailable">
+                    {{ 'Custom poster unavailable' if source.poster_item_id else 'Auto poster unavailable' }}
+                  </span>
+                {% endif %}
+                {% if source.genuine_avatar_url %}
+                  <span class="source-avatar" aria-label="Genuine channel avatar">
+                    <img src="{{ source.genuine_avatar_url }}"
+                         alt=""
+                         loading="lazy"
+                         decoding="async"
+                         onerror="this.closest('.source-avatar').remove();">
+                  </span>
+                {% endif %}
+              </div>
+              <span class="source-poster-mode">{{ 'Custom' if source.poster_item_id else 'Auto' }}</span>
+            {% endif %}
           </td>
           <td>
             <span class="badge badge-quality">{{ source.kind }}</span>
@@ -199,7 +222,7 @@
           <td>
             <strong style="font-size:14.5px; color:#13232f;">{{ source.title or 'Untitled Source' }}</strong>
             <div style="margin-top:3px;">
-              <code>{{ source.reference }}</code>
+              <code class="source-reference">{{ source.reference }}</code>
             </div>
             <div style="margin-top:4px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
               {% if source.source_url %}
@@ -215,7 +238,7 @@
             </div>
           </td>
           <td>
-            {% if source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
+            {% if is_system_source %}
               <span class="muted" style="font-size:12px;">System ingest source</span>
             {% else %}
             <div class="profile-assignment-group" data-source-id="{{ source.id }}">
@@ -282,14 +305,26 @@
             {% endif %}
           </td>
           <td style="text-align:right;">
-            {% if source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
+            {% if is_system_source %}
               <span class="muted" style="font-size:12px;">-</span>
-            {% elif source.state != 'revoked' %}
-              <button type="button" class="btn-revoke" data-source-id="{{ source.id }}" data-state="revoked" title="Revoke and remove from Kids feed">
-                Revoke (Unsave)
-              </button>
             {% else %}
-              <span class="muted" style="font-size:12px;">Revoked</span>
+              <div class="source-actions">
+                <button type="button"
+                        class="btn-poster"
+                        data-source-id="{{ source.id }}"
+                        data-source-title="{{ source.title or 'Untitled Source' }}"
+                        data-poster-item-id="{{ source.poster_item_id or '' }}"
+                        title="Choose a poster from approved videos">
+                  Choose poster
+                </button>
+                {% if source.state != 'revoked' %}
+                  <button type="button" class="btn-revoke" data-source-id="{{ source.id }}" data-state="revoked" title="Revoke and remove from Kids feed">
+                    Revoke (Unsave)
+                  </button>
+                {% else %}
+                  <span class="muted" style="font-size:12px;">Revoked</span>
+                {% endif %}
+              </div>
             {% endif %}
           </td>
         </tr>
@@ -301,9 +336,218 @@
   </div>
 </section>
 
+<dialog id="poster-dialog" class="poster-dialog" aria-labelledby="poster-dialog-title">
+  <div class="poster-dialog-header">
+    <div>
+      <p class="poster-dialog-eyebrow">Kids channel poster</p>
+      <h2 id="poster-dialog-title">Choose poster</h2>
+      <p id="poster-dialog-status" class="muted" aria-live="polite"></p>
+    </div>
+    <button type="button" id="poster-dialog-close" class="poster-dialog-close" aria-label="Close poster picker" title="Close">
+      &times;
+    </button>
+  </div>
+  <div id="poster-options" class="poster-options" aria-live="polite" aria-busy="false"></div>
+  <div class="poster-dialog-footer">
+    <button type="button" id="poster-auto" class="btn-secondary">Use Auto</button>
+    <button type="button" id="poster-cancel" class="btn-secondary">Close</button>
+  </div>
+</dialog>
+
 <script>
 const statusNode = document.getElementById('kids-source-status');
 const correlation = () => `kids-sources-ui-${Date.now()}`;
+const posterDialog = document.getElementById('poster-dialog');
+const posterDialogTitle = document.getElementById('poster-dialog-title');
+const posterDialogStatus = document.getElementById('poster-dialog-status');
+const posterOptions = document.getElementById('poster-options');
+const posterAutoButton = document.getElementById('poster-auto');
+let posterPickerState = null;
+let posterLoadToken = 0;
+
+function parsePosterItemId(value) {
+  const itemId = Number(value);
+  return Number.isSafeInteger(itemId) && itemId > 0 ? itemId : null;
+}
+
+function setPosterDialogStatus(message, isError = false) {
+  posterDialogStatus.textContent = message;
+  posterDialogStatus.style.color = isError ? '#b91c1c' : '#5f6d6f';
+}
+
+function renderPosterOptions(items) {
+  posterOptions.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = 'No approved video thumbnails are available for this source.';
+    posterOptions.appendChild(empty);
+    return;
+  }
+
+  items.forEach((item) => {
+    const itemId = parsePosterItemId(item.id);
+    if (!itemId) return;
+    const title = String(item.title || 'Approved video');
+    const option = document.createElement('button');
+    option.type = 'button';
+    option.className = 'poster-option';
+    option.dataset.itemId = String(itemId);
+    const selected = posterPickerState && posterPickerState.posterItemId === itemId;
+    option.setAttribute('aria-pressed', String(selected));
+
+    const image = document.createElement('img');
+    image.className = 'poster-option-thumb';
+    image.src = String(item.thumbnail_url);
+    image.alt = '';
+    image.loading = 'lazy';
+    image.decoding = 'async';
+
+    const imageFallback = document.createElement('span');
+    imageFallback.className = 'poster-option-thumb poster-option-thumb-fallback';
+    imageFallback.textContent = 'Unavailable';
+    imageFallback.hidden = true;
+    image.addEventListener('error', () => {
+      image.hidden = true;
+      imageFallback.hidden = false;
+    });
+
+    const copy = document.createElement('span');
+    copy.className = 'poster-option-copy';
+    const titleNode = document.createElement('strong');
+    titleNode.className = 'poster-option-title';
+    titleNode.textContent = title;
+    copy.appendChild(titleNode);
+    const meta = String(item.channel_title || '');
+    if (meta) {
+      const metaNode = document.createElement('span');
+      metaNode.className = 'poster-option-meta';
+      metaNode.textContent = meta;
+      copy.appendChild(metaNode);
+    }
+
+    const marker = document.createElement('span');
+    marker.className = 'poster-option-status';
+    marker.textContent = selected ? 'Selected' : '';
+
+    option.append(image, imageFallback, copy, marker);
+    option.addEventListener('click', () => savePoster(itemId));
+    posterOptions.appendChild(option);
+  });
+}
+
+async function loadPosterOptions() {
+  const stateAtRequest = posterPickerState;
+  const requestToken = ++posterLoadToken;
+  posterOptions.replaceChildren();
+  posterOptions.setAttribute('aria-busy', 'true');
+    setPosterDialogStatus('Loading approved videos...');
+  try {
+    const response = await fetch(
+      `/api/kids/sources/${encodeURIComponent(stateAtRequest.sourceId)}/poster-items`
+    );
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    if (requestToken !== posterLoadToken || posterPickerState !== stateAtRequest) return;
+    const items = Array.isArray(payload) ? payload : (Array.isArray(payload.items) ? payload.items : []);
+    const approvedItems = items.filter((item) => {
+      const itemState = String(item.state || 'approved').toLowerCase();
+      const itemSourceId = item.source_id ?? item.sourceId;
+      return itemState === 'approved' &&
+        (itemSourceId == null || String(itemSourceId) === stateAtRequest.sourceId) &&
+        String(item.thumbnail_url || '').trim();
+    });
+    renderPosterOptions(approvedItems);
+    setPosterDialogStatus(
+      approvedItems.length
+        ? 'Select an approved video thumbnail, or reset to Auto.'
+        : 'No approved video thumbnails are available for this source.'
+    );
+  } catch (error) {
+    if (requestToken !== posterLoadToken || posterPickerState !== stateAtRequest) return;
+    posterOptions.replaceChildren();
+    setPosterDialogStatus(`Could not load approved videos: ${error.message || error}`, true);
+  } finally {
+    if (requestToken === posterLoadToken) posterOptions.setAttribute('aria-busy', 'false');
+  }
+}
+
+async function savePoster(itemId) {
+  if (!posterPickerState) return;
+  const stateAtSave = posterPickerState;
+  const correlationId = correlation();
+  posterAutoButton.disabled = true;
+  posterOptions.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+  setPosterDialogStatus(itemId === null ? 'Resetting to Auto...' : 'Saving poster...');
+  try {
+    const response = await fetch(`/api/kids/sources/${stateAtSave.sourceId}/poster`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlationId},
+      body: JSON.stringify({
+        item_id: itemId,
+        actor: 'parent-ui',
+        reason: 'Parent poster selection',
+        correlation_id: correlationId
+      })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    if (posterPickerState !== stateAtSave) return;
+    closePosterDialog();
+    location.reload();
+  } catch (error) {
+    if (posterPickerState !== stateAtSave) return;
+    posterAutoButton.disabled = false;
+    posterOptions.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+    setPosterDialogStatus(`Could not save poster: ${error.message || error}`, true);
+  }
+}
+
+document.querySelectorAll('.btn-poster').forEach((button) => {
+  button.addEventListener('click', () => {
+    const sourceId = String(button.dataset.sourceId || '');
+    if (!sourceId) return;
+    posterPickerState = {
+      sourceId,
+      sourceTitle: button.dataset.sourceTitle || 'Untitled Source',
+      posterItemId: parsePosterItemId(button.dataset.posterItemId)
+    };
+    posterDialogTitle.textContent = `Choose poster for ${posterPickerState.sourceTitle}`;
+    posterAutoButton.disabled = false;
+    posterOptions.replaceChildren();
+    openPosterDialog();
+    loadPosterOptions();
+  });
+});
+
+function openPosterDialog() {
+  if (typeof posterDialog.showModal === 'function') {
+    posterDialog.showModal();
+  } else {
+    posterDialog.setAttribute('open', '');
+  }
+}
+
+function closePosterDialog() {
+  if (typeof posterDialog.close === 'function') {
+    posterDialog.close();
+  } else {
+    posterDialog.removeAttribute('open');
+    posterDialog.dispatchEvent(new Event('close'));
+  }
+}
+
+document.getElementById('poster-dialog-close').addEventListener('click', closePosterDialog);
+document.getElementById('poster-cancel').addEventListener('click', closePosterDialog);
+posterDialog.addEventListener('click', (event) => {
+  if (event.target === posterDialog) closePosterDialog();
+});
+posterDialog.addEventListener('close', () => {
+  posterLoadToken += 1;
+  posterPickerState = null;
+  posterOptions.replaceChildren();
+  setPosterDialogStatus('');
+});
+posterAutoButton.addEventListener('click', () => savePoster(null));
 
 async function changeState(url, state) {
   const response = await fetch(url, {
@@ -492,7 +736,10 @@ function initFilters() {
   applyFilters();
 }
 
-window.addEventListener('DOMContentLoaded', initFilters);
-if (document.readyState !== 'loading') initFilters();
+if (document.readyState === 'loading') {
+  window.addEventListener('DOMContentLoaded', initFilters, {once: true});
+} else {
+  initFilters();
+}
 </script>
 {% endblock %}
