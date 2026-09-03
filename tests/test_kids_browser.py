@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from app.services.kids_browser import (
     browser_target_status,
     clear_stale_chromium_singleton_locks,
     chromium_command,
+    persist_kids_session_cookies,
     require_existing_profile,
 )
 
@@ -70,6 +72,46 @@ def test_chromium_command_uses_the_persistent_kids_profile_only() -> None:
     assert "--user-data-dir=/persistent/kids-profile" in command
     assert "--remote-debugging-port=9223" in command
     assert "www.youtube.com" not in rendered
+
+
+def test_only_youtube_kids_session_cookies_become_persistent(tmp_path: Path) -> None:
+    cookie_db = tmp_path / "Default" / "Cookies"
+    cookie_db.parent.mkdir()
+    with sqlite3.connect(cookie_db) as connection:
+        connection.execute(
+            """
+            CREATE TABLE cookies (
+                host_key TEXT,
+                name TEXT,
+                expires_utc INTEGER,
+                has_expires INTEGER,
+                is_persistent INTEGER
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO cookies VALUES (?, ?, ?, ?, ?)",
+            [
+                (".youtubekids.com", "YSC", 0, 0, 0),
+                (".youtube.com", "YSC", 0, 0, 0),
+                (".www.youtubekids.com", "LOGIN_INFO", 123, 1, 1),
+            ],
+        )
+
+    persist_kids_session_cookies(tmp_path)
+
+    with sqlite3.connect(cookie_db) as connection:
+        rows = {
+            (row[0], row[1]): row[2:]
+            for row in connection.execute(
+                "SELECT host_key, name, expires_utc, has_expires, is_persistent "
+                "FROM cookies"
+            )
+        }
+    assert rows[(".youtube.com", "YSC")] == (0, 0, 0)
+    assert rows[(".www.youtubekids.com", "LOGIN_INFO")] == (123, 1, 1)
+    assert rows[(".youtubekids.com", "YSC")][0] > 0
+    assert rows[(".youtubekids.com", "YSC")][1:] == (1, 1)
 
 
 def test_browser_never_clears_a_live_or_unverifiable_profile_lock(

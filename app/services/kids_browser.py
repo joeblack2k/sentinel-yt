@@ -6,6 +6,7 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import time
 from pathlib import Path
 from subprocess import DEVNULL, Popen, TimeoutExpired
@@ -20,6 +21,7 @@ DEFAULT_CDP_HOST = "127.0.0.1"
 DEFAULT_CDP_PORT = 9223
 DEFAULT_DISPLAY = ":99"
 DEFAULT_VNC_PORT = 5901
+KIDS_SESSION_COOKIE_LIFETIME_SECONDS = 400 * 24 * 60 * 60
 
 
 class BrowserStartupError(RuntimeError):
@@ -84,6 +86,31 @@ def clear_stale_chromium_singleton_locks(profile_dir: str | Path) -> None:
         if path.is_symlink() or path.is_file():
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()
+
+
+def persist_kids_session_cookies(profile_dir: str | Path) -> None:
+    cookie_db = Path(profile_dir) / "Default" / "Cookies"
+    if not cookie_db.is_file():
+        return
+    expires_utc = int(
+        (time.time() + KIDS_SESSION_COOKIE_LIFETIME_SECONDS + 11_644_473_600)
+        * 1_000_000
+    )
+    try:
+        with sqlite3.connect(cookie_db) as connection:
+            connection.execute(
+                """
+                UPDATE cookies
+                SET expires_utc = ?, has_expires = 1, is_persistent = 1
+                WHERE host_key IN (?, ?)
+                  AND is_persistent = 0
+                """,
+                (expires_utc, ".youtubekids.com", ".www.youtubekids.com"),
+            )
+    except sqlite3.Error as error:
+        raise BrowserStartupError(
+            "YouTube Kids session cookies could not be persisted"
+        ) from error
 
 
 def port_in_use(host: str, port: int, *, timeout: float = 0.5) -> bool:
@@ -312,6 +339,7 @@ def launch_browser_runtime(
 
     # Lock cleanup is deliberately after the live-port check.
     clear_stale_chromium_singleton_locks(profile)
+    persist_kids_session_cookies(profile)
     popen = popen_factory or Popen
     sleeper = sleep_fn or time.sleep
     processes: list[Any] = []
