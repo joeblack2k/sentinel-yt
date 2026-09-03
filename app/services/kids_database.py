@@ -812,10 +812,9 @@ class KidsDatabaseMixin:
                     ORDER BY
                         ROW_NUMBER() OVER (
                             PARTITION BY i.source_id
-                            ORDER BY b.resolved_at DESC,i.id ASC
+                            ORDER BY RANDOM()
                         ),
-                        MAX(b.resolved_at) OVER (PARTITION BY i.source_id) DESC,
-                        b.resolved_at DESC,i.id ASC
+                        RANDOM()
                     """,
                     (profile, KIDS_HOME_SOURCE_REFERENCE, minimum_quality_height, expires_after),
                 )
@@ -1576,18 +1575,36 @@ class KidsDatabaseMixin:
             cur = await db.execute(
                 """
                 SELECT item_id,video_id FROM (
-                    SELECT item_id,video_id,1 AS priority,COALESCE(next_attempt_at,'') AS due
-                    FROM kids_resolve_backlog
-                    WHERE status IN ('pending','retry')
-                      AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-                    UNION ALL
-                    SELECT item_id,video_id,0 AS priority,expires_at AS due
-                    FROM kids_resolve_backlog
-                    WHERE status='ready' AND expires_at<=?
+                    SELECT item_id,video_id,priority,due,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY priority,source_id
+                               ORDER BY due ASC,item_id ASC
+                           ) AS source_position
+                    FROM (
+                        SELECT b.item_id,b.video_id,i.source_id,0 AS priority,
+                               COALESCE(b.next_attempt_at,'') AS due
+                        FROM kids_resolve_backlog b
+                        JOIN catalog_items i ON i.id=b.item_id
+                        WHERE b.status='pending'
+                          AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
+                        UNION ALL
+                        SELECT b.item_id,b.video_id,i.source_id,1 AS priority,
+                               COALESCE(b.next_attempt_at,'') AS due
+                        FROM kids_resolve_backlog b
+                        JOIN catalog_items i ON i.id=b.item_id
+                        WHERE b.status='retry'
+                          AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
+                        UNION ALL
+                        SELECT b.item_id,b.video_id,i.source_id,2 AS priority,b.expires_at AS due
+                        FROM kids_resolve_backlog b
+                        JOIN catalog_items i ON i.id=b.item_id
+                        WHERE b.status='ready' AND b.expires_at<=?
+                    )
                 )
-                ORDER BY priority ASC,due ASC,item_id ASC LIMIT ?
+                ORDER BY priority ASC,source_position ASC,due ASC,item_id ASC
+                LIMIT ?
                 """,
-                (now_iso, refresh_at, bounded),
+                (now_iso, now_iso, refresh_at, bounded),
             )
             rows = await cur.fetchall()
             for item_id, _video_id in rows:

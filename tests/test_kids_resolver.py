@@ -364,7 +364,7 @@ async def test_resolver_queue_persists_success_expiry_backoff_and_bounded_claim(
     await db.init()
     first = await eligible_item(db, "video-one")
     await eligible_item(db, "video-two")
-    await eligible_item(db, "video-three")
+    third = await eligible_item(db, "video-three")
 
     claimed = await db.kids_resolve_claim_due(limit=2, refresh_margin_seconds=1800)
     assert [row["video_id"] for row in claimed] == ["video-one", "video-two"]
@@ -393,10 +393,29 @@ async def test_resolver_queue_persists_success_expiry_backoff_and_bounded_claim(
     assert retry["attempt_count"] == 1
     assert retry["last_error_code"] == "backend_unavailable"
     assert "candidate_json" not in retry
-    refresh_claim = await db.kids_resolve_claim_due(limit=1, refresh_margin_seconds=1800)
-    assert refresh_claim == [{"item_id": first["id"], "video_id": "video-one"}]
+    next_claim = await db.kids_resolve_claim_due(limit=1, refresh_margin_seconds=1800)
+    assert next_claim == [{"item_id": third["id"], "video_id": "video-three"}]
     assert await db.kids_playback_authorization("video-one", minimum_remaining_seconds=300)
     assert [item["video_id"] for item in await db.kids_eligible_feed_list(300)] == ["video-one"]
+
+
+@pytest.mark.asyncio
+async def test_resolver_claim_interleaves_unresolved_sources(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    first = await eligible_item(db, "video-source-a-1")
+    same_source = await approved_item_for_source(
+        db,
+        first["source_id"],
+        first["channel_id"],
+        "video-source-a-2",
+    )
+    other_source = await eligible_item(db, "video-source-b-1")
+
+    claimed = await db.kids_resolve_claim_due(limit=2, refresh_margin_seconds=300)
+
+    assert {row["item_id"] for row in claimed} == {first["id"], other_source["id"]}
+    assert same_source["id"] not in {row["item_id"] for row in claimed}
 
 
 @pytest.mark.asyncio

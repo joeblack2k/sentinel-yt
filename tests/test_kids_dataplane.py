@@ -176,6 +176,33 @@ def test_feed_is_opaque_sanitary_and_profile_bound(tmp_path, monkeypatch):
         assert client.get("/v1/kids/feed", params={"cursor": "bad.cursor"}).status_code == 400
 
 
+def test_new_feed_sessions_shuffle_the_balanced_catalog(tmp_path, monkeypatch):
+    db_path = tmp_path / "sentinel.db"
+    asyncio.run(seed_catalog(db_path, qualities=(720,) * 8))
+    module = load_app(tmp_path, monkeypatch)
+    mock_upstream(monkeypatch, module, [])
+
+    first_items = set()
+    with TestClient(module.app) as client:
+        for _ in range(12):
+            assert client.get("/v1/kids/feed", params={"limit": 1}).status_code == 200
+            with sqlite3.connect(db_path) as connection:
+                first_items.add(
+                    connection.execute(
+                        """
+                        SELECT f.item_id
+                        FROM feed_sessions s
+                        JOIN feed_session_items f ON f.feed_session_id=s.id
+                        WHERE f.ordinal=0
+                        ORDER BY s.created_at DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()[0]
+                )
+
+    assert len(first_items) > 1
+
+
 def test_feed_reuses_recent_policy_reconcile_until_forced(tmp_path, monkeypatch):
     asyncio.run(seed_catalog(tmp_path / "sentinel.db"))
     module = load_app(tmp_path, monkeypatch)
