@@ -72,6 +72,7 @@ def test_chromium_command_uses_the_persistent_kids_profile_only() -> None:
     rendered = " ".join(command)
     assert "--app=" not in rendered
     assert "--user-data-dir=/persistent/kids-profile" in command
+    assert "--disable-account-consistency" in command
     assert "--restore-last-session" in command
     assert "--remote-debugging-port=9223" in command
     assert "www.youtube.com" not in rendered
