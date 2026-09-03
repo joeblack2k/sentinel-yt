@@ -93,7 +93,9 @@ The persistent YouTube Kids Chromium and noVNC services are also owned by this
 repository through `deploy/sentinel-yt-kids-browser.service` and
 `deploy/sentinel-yt-kids-novnc.service`. The browser reuses the existing
 `/opt/youtube-sub-browser/data/youtube-web-profile`; deployments must never
-replace that profile directory.
+replace that profile directory. Chromium owns cookie persistence through
+`--restore-last-session` and a clean `Browser.close`; Sentinel does not rewrite
+Google or YouTube cookie expiry values.
 
 This Kids variant is deployed directly on the dedicated Incus backend. Docker,
 Synology, and Home Assistant add-on packaging are intentionally out of scope

@@ -6,7 +6,6 @@ import os
 import shutil
 import signal
 import socket
-import sqlite3
 import time
 from pathlib import Path
 from subprocess import DEVNULL, Popen, TimeoutExpired
@@ -23,9 +22,6 @@ DEFAULT_CDP_HOST = "127.0.0.1"
 DEFAULT_CDP_PORT = 9223
 DEFAULT_DISPLAY = ":99"
 DEFAULT_VNC_PORT = 5901
-KIDS_SESSION_COOKIE_LIFETIME_SECONDS = 400 * 24 * 60 * 60
-KIDS_SESSION_CHECKPOINT_SECONDS = 5
-SESSION_COOKIE_DOMAINS = ("google.com", "youtube.com", "youtubekids.com")
 
 
 class BrowserStartupError(RuntimeError):
@@ -92,31 +88,6 @@ def clear_stale_chromium_singleton_locks(profile_dir: str | Path) -> None:
                 path.unlink()
 
 
-def persist_kids_session_cookies(profile_dir: str | Path) -> None:
-    cookie_db = Path(profile_dir) / "Default" / "Cookies"
-    if not cookie_db.is_file():
-        return
-    expires_utc = int(
-        (time.time() + KIDS_SESSION_COOKIE_LIFETIME_SECONDS + 11_644_473_600)
-        * 1_000_000
-    )
-    try:
-        with sqlite3.connect(cookie_db) as connection:
-            connection.execute(
-                """
-                UPDATE cookies
-                SET expires_utc = ?, has_expires = 1, is_persistent = 1
-                WHERE host_key IN (?, ?)
-                  AND is_persistent = 0
-                """,
-                (expires_utc, ".youtubekids.com", ".www.youtubekids.com"),
-            )
-    except sqlite3.Error as error:
-        raise BrowserStartupError(
-            "YouTube Kids session cookies could not be persisted"
-        ) from error
-
-
 def port_in_use(host: str, port: int, *, timeout: float = 0.5) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -174,6 +145,7 @@ def chromium_command(
         "--password-store=basic",
         "--no-first-run",
         "--no-default-browser-check",
+        # Chromium restores session cookies only when the browser exits cleanly.
         "--restore-last-session",
         "--disable-session-crashed-bubble",
         "--disable-infobars",
@@ -291,65 +263,6 @@ def _page_command(
                 return response.get("result", {})
 
 
-def checkpoint_kids_session_cookies(
-    debug_port: int = DEFAULT_CDP_PORT,
-    *,
-    targets_reader: Callable[[int], list[dict[str, Any]]] = cdp_targets,
-    connector: Callable[..., Any] = connect,
-    now_fn: Callable[[], float] = time.time,
-) -> int:
-    target = validate_kids_targets(targets_reader(debug_port))
-    result = _page_command(
-        target,
-        "Network.getAllCookies",
-        connector=connector,
-    )
-    expires = now_fn() + KIDS_SESSION_COOKIE_LIFETIME_SECONDS
-    persisted = 0
-    for cookie in result.get("cookies", []):
-        if not isinstance(cookie, dict):
-            continue
-        domain = str(cookie.get("domain", "")).lstrip(".").lower()
-        if (
-            not cookie.get("session")
-            or not any(
-                domain == suffix or domain.endswith(f".{suffix}")
-                for suffix in SESSION_COOKIE_DOMAINS
-            )
-        ):
-            continue
-        params = {
-            key: cookie[key]
-            for key in (
-                "name",
-                "value",
-                "domain",
-                "path",
-                "secure",
-                "httpOnly",
-                "sameSite",
-                "priority",
-                "sameParty",
-                "sourceScheme",
-                "sourcePort",
-            )
-            if key in cookie
-        }
-        params["expires"] = expires
-        try:
-            response = _page_command(
-                target,
-                "Network.setCookie",
-                params,
-                connector=connector,
-            )
-        except BrowserStartupError:
-            continue
-        if response.get("success", True):
-            persisted += 1
-    return persisted
-
-
 def wait_for_kids_page(
     debug_port: int,
     *,
@@ -441,7 +354,6 @@ def launch_browser_runtime(
 
     # Lock cleanup is deliberately after the live-port check.
     clear_stale_chromium_singleton_locks(profile)
-    persist_kids_session_cookies(profile)
     popen = popen_factory or Popen
     sleeper = sleep_fn or time.sleep
     processes: list[Any] = []
@@ -510,7 +422,6 @@ def main() -> None:
         debug_port=debug_port,
         profile_dir=profile_dir,
     )
-    last_checkpoint = 0.0
     try:
         invalid_target_checks = 0
         while not stopped:
@@ -522,10 +433,6 @@ def main() -> None:
             try:
                 validate_kids_targets(cdp_targets(debug_port))
                 invalid_target_checks = 0
-                if time.monotonic() - last_checkpoint >= KIDS_SESSION_CHECKPOINT_SECONDS:
-                    with contextlib.suppress(Exception):
-                        checkpoint_kids_session_cookies(debug_port)
-                    last_checkpoint = time.monotonic()
             except (BrowserStartupError, OSError, ValueError, TypeError):
                 invalid_target_checks += 1
                 if invalid_target_checks >= 5:
@@ -534,8 +441,6 @@ def main() -> None:
                         "and only parent-auth pages"
                     )
     finally:
-        with contextlib.suppress(Exception):
-            checkpoint_kids_session_cookies(debug_port)
         with contextlib.suppress(Exception):
             close_chromium_browser(debug_port)
         with contextlib.suppress(TimeoutExpired):

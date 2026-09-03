@@ -4,7 +4,6 @@ import io
 import json
 import os
 import socket
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -12,11 +11,9 @@ import pytest
 from app.services.kids_browser import (
     BrowserStartupError,
     browser_target_status,
-    checkpoint_kids_session_cookies,
     clear_stale_chromium_singleton_locks,
     close_chromium_browser,
     chromium_command,
-    persist_kids_session_cookies,
     require_existing_profile,
     wait_for_kids_page,
 )
@@ -116,64 +113,6 @@ def test_browser_closes_chromium_through_its_browser_endpoint() -> None:
     assert websocket.sent == [{"id": 1, "method": "Browser.close", "params": {}}]
 
 
-def test_browser_persists_only_relevant_session_cookies() -> None:
-    target = {
-        "type": "page",
-        "url": "https://www.youtubekids.com/",
-        "webSocketDebuggerUrl": "ws://kids-page",
-    }
-    sockets = []
-    results = [
-        {
-            "cookies": [
-                {
-                    "name": "google-session",
-                    "value": "secret",
-                    "domain": ".google.com",
-                    "path": "/",
-                    "secure": True,
-                    "httpOnly": True,
-                    "session": True,
-                },
-                {
-                    "name": "already-persistent",
-                    "value": "kept",
-                    "domain": ".youtube.com",
-                    "session": False,
-                    "expires": 999,
-                },
-                {
-                    "name": "unrelated",
-                    "value": "ignored",
-                    "domain": ".example.com",
-                    "session": True,
-                },
-            ]
-        },
-        {"success": True},
-    ]
-
-    def connector(*_, **__):
-        websocket = FakeWebSocket(results.pop(0))
-        sockets.append(websocket)
-        return websocket
-
-    assert checkpoint_kids_session_cookies(
-        targets_reader=lambda _: [target],
-        connector=connector,
-        now_fn=lambda: 1000,
-    ) == 1
-    assert [socket.sent[0]["method"] for socket in sockets] == [
-        "Network.getAllCookies",
-        "Network.setCookie",
-    ]
-    params = sockets[1].sent[0]["params"]
-    assert params["name"] == "google-session"
-    assert params["domain"] == ".google.com"
-    assert params["expires"] == 1000 + 400 * 24 * 60 * 60
-    assert "session" not in params
-
-
 def test_browser_waits_for_the_restored_kids_page_without_creating_a_tab() -> None:
     responses = iter(
         [
@@ -189,46 +128,6 @@ def test_browser_waits_for_the_restored_kids_page_without_creating_a_tab() -> No
         targets_reader=lambda _: next(responses),
         sleep_fn=lambda _: None,
     )["id"] == "kids"
-
-
-def test_only_youtube_kids_session_cookies_become_persistent(tmp_path: Path) -> None:
-    cookie_db = tmp_path / "Default" / "Cookies"
-    cookie_db.parent.mkdir()
-    with sqlite3.connect(cookie_db) as connection:
-        connection.execute(
-            """
-            CREATE TABLE cookies (
-                host_key TEXT,
-                name TEXT,
-                expires_utc INTEGER,
-                has_expires INTEGER,
-                is_persistent INTEGER
-            )
-            """
-        )
-        connection.executemany(
-            "INSERT INTO cookies VALUES (?, ?, ?, ?, ?)",
-            [
-                (".youtubekids.com", "YSC", 0, 0, 0),
-                (".youtube.com", "YSC", 0, 0, 0),
-                (".www.youtubekids.com", "LOGIN_INFO", 123, 1, 1),
-            ],
-        )
-
-    persist_kids_session_cookies(tmp_path)
-
-    with sqlite3.connect(cookie_db) as connection:
-        rows = {
-            (row[0], row[1]): row[2:]
-            for row in connection.execute(
-                "SELECT host_key, name, expires_utc, has_expires, is_persistent "
-                "FROM cookies"
-            )
-        }
-    assert rows[(".youtube.com", "YSC")] == (0, 0, 0)
-    assert rows[(".www.youtubekids.com", "LOGIN_INFO")] == (123, 1, 1)
-    assert rows[(".youtubekids.com", "YSC")][0] > 0
-    assert rows[(".youtubekids.com", "YSC")][1:] == (1, 1)
 
 
 def test_browser_never_clears_a_live_or_unverifiable_profile_lock(
