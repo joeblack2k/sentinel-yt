@@ -2412,41 +2412,54 @@ class KidsDatabaseMixin:
                                  )
                            ) THEN 0 ELSE 1 END AS shelf_priority
                     FROM catalog_sources s
+                ),
+                daily_items AS (
+                    SELECT DISTINCT item_id
+                    FROM kids_daily_library
+                    WHERE item_id IS NOT NULL
+                      AND day=(SELECT MAX(day) FROM kids_daily_library)
                 )
                 SELECT item_id,video_id FROM (
-                    SELECT item_id,video_id,shelf_priority,priority,due,
+                    SELECT item_id,video_id,daily_priority,shelf_priority,priority,due,
                            ROW_NUMBER() OVER (
-                               PARTITION BY shelf_priority,priority,source_id
+                               PARTITION BY daily_priority,shelf_priority,priority,source_id
                                ORDER BY due ASC,item_id ASC
                            ) AS source_position
                     FROM (
                         SELECT b.item_id,b.video_id,i.source_id,
+                               CASE WHEN d.item_id IS NULL THEN 1 ELSE 0 END AS daily_priority,
                                sp.shelf_priority,0 AS priority,
                                COALESCE(b.next_attempt_at,'') AS due
                         FROM kids_resolve_backlog b
                         JOIN catalog_items i ON i.id=b.item_id
                         JOIN source_priority sp ON sp.id=i.source_id
+                        LEFT JOIN daily_items d ON d.item_id=b.item_id
                         WHERE b.status='pending'
                           AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
                         UNION ALL
                         SELECT b.item_id,b.video_id,i.source_id,
+                               CASE WHEN d.item_id IS NULL THEN 1 ELSE 0 END AS daily_priority,
                                sp.shelf_priority,1 AS priority,
                                COALESCE(b.next_attempt_at,'') AS due
                         FROM kids_resolve_backlog b
                         JOIN catalog_items i ON i.id=b.item_id
                         JOIN source_priority sp ON sp.id=i.source_id
+                        LEFT JOIN daily_items d ON d.item_id=b.item_id
                         WHERE b.status='retry'
                           AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
                         UNION ALL
                         SELECT b.item_id,b.video_id,i.source_id,
+                               CASE WHEN d.item_id IS NULL THEN 1 ELSE 0 END AS daily_priority,
                                sp.shelf_priority,2 AS priority,b.expires_at AS due
                         FROM kids_resolve_backlog b
                         JOIN catalog_items i ON i.id=b.item_id
                         JOIN source_priority sp ON sp.id=i.source_id
+                        LEFT JOIN daily_items d ON d.item_id=b.item_id
                         WHERE b.status='ready' AND b.expires_at<=?
                     )
                 )
-                ORDER BY shelf_priority ASC,priority ASC,source_position ASC,due ASC,item_id ASC
+                ORDER BY daily_priority ASC,shelf_priority ASC,priority ASC,
+                         source_position ASC,due ASC,item_id ASC
                 LIMIT ?
                 """,
                 (now_iso, now_iso, refresh_at, bounded),

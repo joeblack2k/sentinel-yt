@@ -441,6 +441,34 @@ async def test_resolver_claim_prioritizes_sources_used_by_profile_shelves(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_resolver_claim_prioritizes_materialized_daily_items(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    daily_item = await eligible_item(db, "video-daily")
+    shelf_item = await eligible_item(db, "video-shelf")
+    await db.catalog_source_classification_update(
+        shelf_item["source_id"],
+        language="nl",
+        content_kind="learning",
+        actor="guardian",
+        reason="resolver shelf priority test",
+        correlation_id="resolver-shelf-priority",
+    )
+    await db.kids_daily_library_get_or_create(
+        day="2026-09-04",
+        profile="noah",
+        shelf_limit=1,
+        proposed_item_ids={"learning": [daily_item["id"]]},
+    )
+
+    claimed = await db.kids_resolve_claim_due(limit=1, refresh_margin_seconds=300)
+
+    assert claimed == [
+        {"item_id": daily_item["id"], "video_id": daily_item["video_id"]}
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("height", "width", "accepted"),
     [(720, 1280, True), (1080, 1920, True), (360, 640, False), (2160, 3840, False)],
