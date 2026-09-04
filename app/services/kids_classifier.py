@@ -7,6 +7,20 @@ from urllib.parse import urlsplit
 import httpx
 
 
+AGE_SUITABILITY_VALUES = frozenset({"SUITABLE", "UNSUITABLE", "UNCERTAIN"})
+
+
+def normalize_age_suitability(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {"2", "6"}:
+        raise ValueError("invalid age suitability")
+    if any(
+        not isinstance(value[age], str) or value[age] not in AGE_SUITABILITY_VALUES
+        for age in ("2", "6")
+    ):
+        raise ValueError("invalid age suitability")
+    return {age: value[age] for age in ("2", "6")}
+
+
 class KidsClassificationError(RuntimeError):
     """The safety model could not return a usable decision."""
 
@@ -71,7 +85,8 @@ class OpenCodexKidsClassifier:
                         {
                             "role": "system",
                             "content": (
-                                "Classify this Kids source or video for a calm 6-year-old Kids catalog. "
+                                "Classify this Kids source or video for a calm children's catalog "
+                                "with separate target ages 2 and 6. "
                                 "When kind is channel, judge the channel from all supplied samples, including thumbnails. "
                                 "Mark brainrot, shouting, rapid-cut stimulation, manipulative engagement, dangerous challenges, "
                                 "horror, violence, weapons, pranks, Elsagate patterns, purchase pressure, and repetitive "
@@ -80,11 +95,17 @@ class OpenCodexKidsClassifier:
                                 "Return only strict JSON with verdict SAFE, UNSAFE, or UNCERTAIN, "
                                 "language exactly one of nl, en, mixed, or unknown, "
                                 "content_kind exactly one of learning, entertainment, mixed, or unknown, "
+                                'age_suitability exactly an object with keys "2" and "6", each '
+                                "set to SUITABLE, UNSUITABLE, or UNCERTAIN. "
                                 "a short reason, and confidence 0-100. "
                                 "Always include the language field: use nl for Dutch, en for English, mixed for both, "
                                 "and unknown when language evidence is incomplete. "
                                 "Always include the content_kind field: use learning for educational content, "
                                 "entertainment for fun content, mixed when both are central, and unknown when evidence is incomplete. "
+                                "Judge safety independently from age. For age_suitability, only mark an age "
+                                "SUITABLE when the supplied channel evidence explicitly supports that target age; "
+                                "use UNSUITABLE for clearly inappropriate developmental level and UNCERTAIN when "
+                                "evidence is incomplete. "
                                 "Choose UNCERTAIN whenever evidence is incomplete."
                             ),
                         },
@@ -109,6 +130,7 @@ class OpenCodexKidsClassifier:
                 "unknown",
             }:
                 raise ValueError("invalid content kind")
+            age_suitability = normalize_age_suitability(result.get("age_suitability"))
             confidence = int(result.get("confidence", 0))
             if not 0 <= confidence <= 100:
                 raise ValueError("invalid confidence")
@@ -116,6 +138,7 @@ class OpenCodexKidsClassifier:
                 "verdict": verdict,
                 "language": language,
                 "content_kind": content_kind,
+                "age_suitability": age_suitability,
                 "reason": str(result.get("reason", ""))[:1000],
                 "confidence": confidence,
             }

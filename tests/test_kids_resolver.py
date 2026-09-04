@@ -221,7 +221,13 @@ async def eligible_item(db: Database, video_id: str = "video-ready") -> dict:
         },
     )
     await db.catalog_source_safety_update(
-        source["id"], verdict="SAFE", reason="safe", actor="guardian", correlation_id="safe"
+        source["id"],
+        verdict="SAFE",
+        language="nl",
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+        reason="safe",
+        actor="guardian",
+        correlation_id="safe",
     )
     await db.catalog_transition(
         "source", source["id"], {"state": "approved", "actor": "parent", "reason": "approved", "correlation_id": "source-state"}
@@ -359,6 +365,62 @@ async def test_catalog_and_playback_authorization_fail_closed_for_identity_and_s
 
 
 @pytest.mark.asyncio
+async def test_playback_authorization_requires_explicit_age_suitability(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": "UC-without-age-policy",
+            "title": "Missing age policy",
+            "correlation_id": "source-without-age-policy",
+        },
+    )
+    await db.catalog_source_safety_update(
+        source["id"],
+        verdict="SAFE",
+        language="nl",
+        reason="legacy decision without age policy",
+        actor="guardian",
+        correlation_id="safe-without-age-policy",
+    )
+    await db.catalog_transition(
+        "source",
+        source["id"],
+        {
+            "state": "approved",
+            "actor": "parent",
+            "reason": "approved",
+            "correlation_id": "approve-source-without-age-policy",
+        },
+    )
+    item = await approved_item_for_source(
+        db,
+        source["id"],
+        "UC-without-age-policy",
+        "video-without-age-policy",
+    )
+    await persist_ready_candidate(db, item["id"])
+
+    assert (
+        await db.kids_playback_authorization(
+            "video-without-age-policy",
+            profile="noah",
+            minimum_remaining_seconds=300,
+        )
+        is None
+    )
+    assert (
+        await db.kids_playback_policy_authorization(
+            "video-without-age-policy",
+            profile="noah",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_resolver_queue_persists_success_expiry_backoff_and_bounded_claim(tmp_path):
     db = Database(str(tmp_path / "sentinel.db"))
     await db.init()
@@ -468,6 +530,7 @@ async def test_resolver_claim_prioritizes_sources_used_by_profile_shelves(tmp_pa
         shelf_item["source_id"],
         language="nl",
         content_kind="learning",
+        age_suitability={"2": "UNSUITABLE", "6": "SUITABLE"},
         actor="guardian",
         reason="resolver shelf priority test",
         correlation_id="resolver-shelf-priority",

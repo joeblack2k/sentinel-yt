@@ -57,6 +57,8 @@ async def approved_source_and_item(
     await db.catalog_source_safety_update(
         source["id"],
         verdict="SAFE",
+        language="nl",
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
         reason="test",
         actor="guardian",
         correlation_id=f"safety-{video_id}",

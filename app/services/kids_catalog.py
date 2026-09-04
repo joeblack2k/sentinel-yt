@@ -74,6 +74,29 @@ def _catalog_item_is_authorized(item: dict[str, Any], source: dict[str, Any]) ->
     )
 
 
+def _source_is_authorized_for_profile(
+    source: dict[str, Any],
+    profile: str,
+) -> bool:
+    try:
+        ages = json.loads(str(source.get("age_suitability_json") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    language = str(source.get("language") or "unknown")
+    return bool(
+        source.get("safety_verdict") == "SAFE"
+        and isinstance(ages, dict)
+        and (
+            profile == "felix"
+            and language in {"nl", "mixed"}
+            and ages.get("2") == "SUITABLE"
+            or profile == "noah"
+            and language in {"nl", "en", "mixed"}
+            and ages.get("6") == "SUITABLE"
+        )
+    )
+
+
 def _quality_height_or_default(value: Any) -> int:
     return value if type(value) is int and 720 <= value <= 1080 else 720
 

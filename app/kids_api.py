@@ -621,6 +621,8 @@ def _kids_candidate_headers(
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
+    elif request.method == "GET":
+        headers["Range"] = "bytes=0-"
     return headers
 
 
@@ -1290,6 +1292,7 @@ async def api_kids_source_classification(
         source_id,
         language=payload.language,
         content_kind=payload.content_kind,
+        age_suitability=payload.age_suitability,
         actor=payload.actor,
         reason=payload.reason,
         correlation_id=payload.correlation_id,
@@ -1538,8 +1541,16 @@ async def api_kids_readyz(request: Request) -> dict[str, Any]:
     finally:
         await classifier.close()
 
+    resolve_summary = await runtime.db.kids_resolve_summary(
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
+    )
     payload = {
-        "status": "ready" if opencodex_ready and ingest_fresh else "unready",
+        "status": (
+            "ready"
+            if opencodex_ready
+            and resolve_summary["fresh_ready"] >= runtime.settings.kids_ready_minimum
+            else "unready"
+        ),
         "opencodex": "ready" if opencodex_ready else "unavailable",
         "opencodex_model": runtime.settings.opencodex_model,
         "ingest": "fresh" if ingest_fresh else "stale",
@@ -1548,14 +1559,9 @@ async def api_kids_readyz(request: Request) -> dict[str, Any]:
         "catalog_revision": await runtime.db.catalog_revision(),
         "resolver_last_success_at": await runtime.db.get_setting("kids_resolver_last_success_at"),
     }
-    resolve_summary = await runtime.db.kids_resolve_summary(
-        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
-    )
     payload["backlog_counts"] = resolve_summary["counts"]
     payload["fresh_ready_count"] = resolve_summary["fresh_ready"]
     payload["ready_minimum"] = runtime.settings.kids_ready_minimum
-    if resolve_summary["fresh_ready"] < runtime.settings.kids_ready_minimum:
-        payload["status"] = "unready"
     if payload["status"] != "ready":
         raise HTTPException(status_code=503, detail=payload)
     return payload

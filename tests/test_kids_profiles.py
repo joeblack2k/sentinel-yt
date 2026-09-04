@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.db import Database
@@ -32,6 +33,18 @@ def test_default_profiles_and_assignment_changes_survive_reinit(tmp_path):
         )
     )
     assert asyncio.run(db.kids_source_profile_slugs(source["id"])) == ["noah"]
+    asyncio.run(
+        db.catalog_source_safety_update(
+            source["id"],
+            verdict="SAFE",
+            language="nl",
+            content_kind="learning",
+            age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+            reason="profile test",
+            actor="test",
+            correlation_id="profile-safety",
+        )
+    )
 
     asyncio.run(
         db.kids_source_profiles_set(
@@ -44,6 +57,29 @@ def test_default_profiles_and_assignment_changes_survive_reinit(tmp_path):
     )
     asyncio.run(db.init())
     assert asyncio.run(db.kids_source_profile_slugs(source["id"])) == ["felix"]
+
+    asyncio.run(
+        db.catalog_source_safety_update(
+            source["id"],
+            verdict="SAFE",
+            language="en",
+            content_kind="learning",
+            age_suitability={"2": "UNSUITABLE", "6": "SUITABLE"},
+            reason="English source for older child",
+            actor="test",
+            correlation_id="profile-safety-change",
+        )
+    )
+    with pytest.raises(ValueError, match="not suitable"):
+        asyncio.run(
+            db.kids_source_profiles_set(
+                source["id"],
+                ["felix"],
+                actor="test",
+                reason="Invalid Felix assignment",
+                correlation_id="invalid-profile-assignment",
+            )
+        )
 
 
 def test_feed_is_separated_by_profile(tmp_path, monkeypatch):
@@ -97,6 +133,18 @@ def test_source_api_exposes_profiles_and_assignment_endpoint(tmp_path, monkeypat
         )
         assert source.status_code == 200
         source_id = source.json()["id"]
+        asyncio.run(
+            module.app.state.runtime.db.catalog_source_safety_update(
+                source_id,
+                verdict="SAFE",
+                language="nl",
+                content_kind="learning",
+                age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+                reason="profile API test",
+                actor="test",
+                correlation_id="profile-api-safety",
+            )
+        )
 
         profiles = client.get("/api/kids/profiles")
         assert profiles.status_code == 200

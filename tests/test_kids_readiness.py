@@ -23,7 +23,7 @@ class FakeClassifier:
         return None
 
 
-def test_kids_readyz_requires_fresh_ingest_and_opencodex(tmp_path, monkeypatch):
+def test_kids_readyz_uses_resolver_inventory_when_ingest_is_deferred(tmp_path, monkeypatch):
     db_path = str(tmp_path / "sentinel.db")
     monkeypatch.setenv("SENTINEL_DB_PATH", db_path)
     monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
@@ -33,8 +33,10 @@ def test_kids_readyz_requires_fresh_ingest_and_opencodex(tmp_path, monkeypatch):
     monkeypatch.setattr(kids_api, "OpenCodexKidsClassifier", FakeClassifier)
 
     with TestClient(module.app) as client:
-        assert client.get("/api/kids/readyz").status_code == 503
-        assert client.get("/readyz").status_code == 503
+        ready = client.get("/api/kids/readyz")
+        assert ready.status_code == 200
+        assert ready.json()["ingest"] == "stale"
+        assert client.get("/readyz").status_code == 200
 
     asyncio.run(
         Database(db_path).set_setting(

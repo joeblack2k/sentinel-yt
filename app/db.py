@@ -71,6 +71,7 @@ class Database(KidsDatabaseMixin):
                     safety_policy_version TEXT NOT NULL DEFAULT '',
                     safety_evidence_json TEXT NOT NULL DEFAULT '[]',
                     safety_sample_count INTEGER NOT NULL DEFAULT 0,
+                    age_suitability_json TEXT NOT NULL DEFAULT '{}',
                     state TEXT NOT NULL DEFAULT 'candidate'
                         CHECK(state IN ('candidate', 'approved', 'blocked', 'revoked', 'unknown')),
                     actor TEXT NOT NULL,
@@ -357,6 +358,10 @@ class Database(KidsDatabaseMixin):
             if "safety_sample_count" not in source_cols:
                 await db.execute(
                     "ALTER TABLE catalog_sources ADD COLUMN safety_sample_count INTEGER NOT NULL DEFAULT 0"
+                )
+            if "age_suitability_json" not in source_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_sources ADD COLUMN age_suitability_json TEXT NOT NULL DEFAULT '{}'"
                 )
             cur = await db.execute("PRAGMA table_info(feed_sessions)")
             feed_session_cols = {row[1] for row in await cur.fetchall()}

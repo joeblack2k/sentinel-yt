@@ -54,6 +54,8 @@ async def seed_catalog(db_path, *, qualities=(720, 1080)) -> Database:
         actor="test",
         correlation_id="dataplane-safety",
         policy_version="test-v1",
+        language="nl",
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
     )
     source = await db.catalog_transition(
         "source",
@@ -139,6 +141,8 @@ async def add_ready_source_item(
         actor="test",
         correlation_id=f"secondary-safety-{suffix}",
         policy_version="test-v1",
+        language="nl",
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
     )
     source = await db.catalog_transition(
         "source",
@@ -951,9 +955,15 @@ def test_playback_relay_manifest_range_head_event_and_delete(tmp_path, monkeypat
         assert upstream.headers["accept-encoding"] == "identity"
         assert "cookie" not in upstream.headers
 
+        media_without_range = client.get(manifest_payload["video_url"])
+        assert media_without_range.status_code == 200
+        assert requests[-1].headers["range"] == "bytes=0-"
+        assert lease_checks == 2
+
         head = client.head(manifest_payload["video_url"])
         assert head.status_code == 200
         assert head.content == b""
+        assert "range" not in requests[-1].headers
         monkeypatch.setattr(
             module.app.state.runtime,
             "reconcile_kids_catalog_policy",
@@ -1112,6 +1122,52 @@ def test_kill_switch_and_schedule_close_revoke_leases(tmp_path, monkeypatch):
         ).fetchone()
     assert state == "revoked"
     assert reason == "schedule_closed"
+
+
+def test_age_policy_removes_feed_item_and_revokes_active_playback(tmp_path, monkeypatch):
+    db_path = tmp_path / "sentinel.db"
+    db = asyncio.run(seed_catalog(db_path, qualities=(1080,)))
+    module = load_app(tmp_path, monkeypatch)
+    mock_upstream(monkeypatch, module, [])
+
+    with TestClient(module.app) as client:
+        asset_id = client.get(
+            "/v1/kids/feed",
+            params={"profile": "noah", "limit": 1},
+        ).json()["items"][0]["id"]
+        lease_id = client.post(
+            "/v1/kids/playback-sessions",
+            json={"asset_id": asset_id},
+        ).json()["id"]
+        source = asyncio.run(db.catalog_sources_list())[0]
+        asyncio.run(
+            db.catalog_source_safety_update(
+                source["id"],
+                verdict="SAFE",
+                language="nl",
+                content_kind="learning",
+                age_suitability={"2": "SUITABLE", "6": "UNSUITABLE"},
+                reason="no longer suitable for age six",
+                actor="test",
+                correlation_id="age-policy-change",
+            )
+        )
+
+        assert client.get(
+            "/v1/kids/feed",
+            params={"profile": "noah", "limit": 1},
+        ).json()["items"] == []
+        assert client.get(
+            f"/v1/kids/playback-sessions/{lease_id}/status"
+        ).status_code == 403
+
+    with sqlite3.connect(db_path) as connection:
+        state, reason = connection.execute(
+            "SELECT state,revoked_reason FROM relay_leases WHERE id=?",
+            (lease_id,),
+        ).fetchone()
+    assert state == "revoked"
+    assert reason == "profile_unassigned"
 
 
 def test_lease_recheck_uses_current_quality_policy(tmp_path, monkeypatch):

@@ -11,6 +11,7 @@ from app.config import Settings
 from app.db import Database
 from app.services.blocklists import BlocklistService
 from app.services.judge import JudgeService
+from app.services.kids_catalog import _source_is_authorized_for_profile
 from app.services.kids_ingest import (
     HOME_SOURCE_REFERENCE,
     KidsBrowserSetupRequired,
@@ -20,6 +21,7 @@ from app.services.kids_ingest import (
     fetch_channel_avatar_url,
     ingest_once,
     parse_cards,
+    rejudge_stored_sources,
     source_url,
 )
 
@@ -943,9 +945,12 @@ class FakeClassifier:
     verdict: str
     language: str = "unknown"
     content_kind: str = "unknown"
+    age_suitability: dict[str, str] = None
     calls: list[dict] = None
 
     def __post_init__(self):
+        if self.age_suitability is None:
+            self.age_suitability = {"2": "SUITABLE", "6": "SUITABLE"}
         self.calls = []
 
     async def classify(self, metadata):
@@ -954,8 +959,111 @@ class FakeClassifier:
             "verdict": self.verdict,
             "language": self.language,
             "content_kind": self.content_kind,
+            "age_suitability": self.age_suitability,
             "reason": "test",
         }
+
+
+def test_channel_profiles_require_explicit_age_and_allowed_language():
+    base = {
+        "safety_verdict": "SAFE",
+        "age_suitability_json": '{"2":"SUITABLE","6":"SUITABLE"}',
+    }
+    assert _source_is_authorized_for_profile({**base, "language": "nl"}, "felix")
+    assert _source_is_authorized_for_profile({**base, "language": "nl"}, "noah")
+    assert not _source_is_authorized_for_profile({**base, "language": "en"}, "felix")
+    assert _source_is_authorized_for_profile({**base, "language": "en"}, "noah")
+    assert not _source_is_authorized_for_profile(
+        {
+            **base,
+            "language": "mixed",
+            "age_suitability_json": '{"2":"UNCERTAIN","6":"SUITABLE"}',
+        },
+        "felix",
+    )
+    assert _source_is_authorized_for_profile(
+        {
+            **base,
+            "language": "mixed",
+            "age_suitability_json": '{"2":"UNCERTAIN","6":"SUITABLE"}',
+        },
+        "noah",
+    )
+    assert not _source_is_authorized_for_profile(
+        {**base, "language": "nl", "safety_verdict": "UNCERTAIN"},
+        "noah",
+    )
+    assert not _source_is_authorized_for_profile(
+        {**base, "language": "nl", "age_suitability_json": "{}"},
+        "noah",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejudge_uses_stored_evidence_and_reconciles_profiles(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": "UC123",
+            "title": "Stored evidence channel",
+            "profile_slugs": ["felix", "noah"],
+            "correlation_id": "stored-evidence-source",
+        },
+    )
+    source = await db.catalog_source_safety_update(
+        source["id"],
+        verdict="SAFE",
+        language="nl",
+        content_kind="learning",
+        reason="old decision",
+        actor="test",
+        correlation_id="old-classification",
+        evidence=[
+            {
+                "video_id": "abcdefghijk",
+                "title": "Calm learning",
+                "thumbnail_url": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg",
+            }
+        ],
+    )
+    await db.catalog_transition(
+        "source",
+        source["id"],
+        {
+            "state": "approved",
+            "actor": "test",
+            "reason": "old approval",
+            "correlation_id": "old-approval",
+        },
+    )
+    classifier = FakeClassifier(
+        "SAFE",
+        "en",
+        "learning",
+        {"2": "UNSUITABLE", "6": "SUITABLE"},
+    )
+
+    report = await rejudge_stored_sources(
+        db,
+        classifier,
+        JudgeService(db),
+        policy_version="sampled-channel-v3-age-suitability",
+    )
+
+    assert report.safe == 1
+    assert report.errors == 0
+    assert len(classifier.calls) == 1
+    assert classifier.calls[0]["sample_videos"][0]["video_id"] == "abcdefghijk"
+    assert await db.kids_source_profile_slugs(source["id"]) == ["noah"]
+    updated = await db.catalog_get("source", source["id"])
+    assert json.loads(updated["age_suitability_json"]) == {
+        "2": "UNSUITABLE",
+        "6": "SUITABLE",
+    }
+    assert updated["safety_policy_version"] == "sampled-channel-v3-age-suitability"
 
 
 @pytest.mark.asyncio
@@ -1039,7 +1147,7 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
     assert items[0]["channel_id"] == "UC123"
     assert items[0]["channel_title"] == "Kids Channel"
     checked_source = await db.catalog_get("source", source["id"])
-    assert checked_source["safety_policy_version"] == "sampled-channel-v2-content-kind"
+    assert checked_source["safety_policy_version"] == "sampled-channel-v3-age-suitability"
     assert checked_source["language"] == "en"
     assert checked_source["content_kind"] == "learning"
     assert checked_source["safety_sample_count"] == 1
@@ -1228,7 +1336,7 @@ async def test_uncertain_or_unknown_source_stays_hidden(tmp_path):
     stored = await db.catalog_get("source", source["id"])
     assert stored["state"] == "candidate"
     assert stored["safety_verdict"] == "UNCERTAIN"
-    assert stored["language"] == "nl"
+    assert stored["language"] == "unknown"
     assert await db.catalog_items_list() == []
 
 

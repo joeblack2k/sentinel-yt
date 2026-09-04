@@ -212,6 +212,10 @@ async def _ready_item(
         actor="test",
         correlation_id=f"shelf-safety-{index}",
         policy_version="test-v1",
+        age_suitability={
+            "2": "SUITABLE" if "felix" in profile_slugs else "UNSUITABLE",
+            "6": "SUITABLE" if "noah" in profile_slugs else "UNSUITABLE",
+        },
     )
     source = await db.catalog_transition(
         "source",

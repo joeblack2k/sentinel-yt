@@ -18,7 +18,7 @@ class CatalogSourceRequest(BaseModel):
     title: str = Field(default="", max_length=500)
     language: Literal["nl", "en", "mixed", "unknown"] = "unknown"
     content_kind: Literal["learning", "entertainment", "mixed", "unknown"] = "unknown"
-    profile_slugs: list[str] = Field(default_factory=lambda: ["noah"], max_length=2)
+    profile_slugs: list[str] = Field(default_factory=list, max_length=2)
 
 
 class CatalogItemRequest(BaseModel):
@@ -47,9 +47,17 @@ class KidsSourceProfilesRequest(BaseModel):
 class KidsSourceClassificationRequest(BaseModel):
     language: Literal["nl", "en", "mixed", "unknown"]
     content_kind: Literal["learning", "entertainment", "mixed", "unknown"]
+    age_suitability: dict[str, Literal["SUITABLE", "UNSUITABLE", "UNCERTAIN"]] | None = None
     actor: str = Field(default="parent-ui", min_length=1, max_length=128)
     reason: str = Field(default="Parent source classification", max_length=1000)
     correlation_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("age_suitability")
+    @classmethod
+    def validate_age_suitability(cls, value):
+        if value is not None and set(value) != {"2", "6"}:
+            raise ValueError('age_suitability requires exactly keys "2" and "6"')
+        return value
 
 
 class KidsSourcePosterRequest(BaseModel):

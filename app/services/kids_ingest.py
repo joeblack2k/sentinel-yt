@@ -17,7 +17,12 @@ import websockets
 from ..config import Settings
 from ..db import Database, utc_now_iso
 from .blocklists import BlocklistService
-from .kids_classifier import KidsClassificationError, OpenCodexKidsClassifier
+from .kids_catalog import _source_is_authorized_for_profile
+from .kids_classifier import (
+    KidsClassificationError,
+    OpenCodexKidsClassifier,
+    normalize_age_suitability,
+)
 from .kids_database import _kids_channel_avatar_is_proxyable
 from .judge import JudgeService
 
@@ -90,6 +95,16 @@ class IngestReport:
     uncertain: int = 0
     channels_screened: int = 0
     skipped: int = 0
+    errors: int = 0
+
+
+@dataclass
+class RejudgeReport:
+    sources_seen: int = 0
+    channels_screened: int = 0
+    safe: int = 0
+    blocked: int = 0
+    uncertain: int = 0
     errors: int = 0
 
 
@@ -328,6 +343,188 @@ def source_safety_is_current(
     if checked_at.tzinfo is None:
         return False
     return checked_at >= datetime.now(timezone.utc) - timedelta(seconds=max(0, recheck_seconds))
+
+
+def _uncertain_channel_decision(reason: str) -> dict[str, Any]:
+    return {
+        "verdict": "UNCERTAIN",
+        "language": "unknown",
+        "content_kind": "unknown",
+        "age_suitability": {"2": "UNCERTAIN", "6": "UNCERTAIN"},
+        "reason": reason,
+    }
+
+
+def _channel_decision(
+    decision: Any,
+) -> dict[str, Any]:
+    if not isinstance(decision, dict):
+        return _uncertain_channel_decision("Classifier returned an invalid decision")
+    verdict = decision.get("verdict")
+    language = decision.get("language", "unknown")
+    content_kind = decision.get("content_kind", "unknown")
+    try:
+        age_suitability = normalize_age_suitability(decision.get("age_suitability"))
+    except ValueError:
+        return _uncertain_channel_decision("Classifier returned an invalid age suitability")
+    if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
+        return _uncertain_channel_decision("Classifier returned an invalid verdict")
+    if not isinstance(language, str) or language not in {"nl", "en", "mixed", "unknown"}:
+        return _uncertain_channel_decision("Classifier returned an invalid language")
+    if not isinstance(content_kind, str) or content_kind not in {
+        "learning",
+        "entertainment",
+        "mixed",
+        "unknown",
+    }:
+        return _uncertain_channel_decision("Classifier returned an invalid content kind")
+    return {
+        "verdict": verdict,
+        "language": language,
+        "content_kind": content_kind,
+        "age_suitability": age_suitability,
+        "reason": str(decision.get("reason", ""))[:1000]
+        or "Sampled channel safety classification",
+    }
+
+
+async def apply_channel_classification(
+    db: Database,
+    source: dict[str, Any],
+    decision: Any,
+    *,
+    evidence: list[dict[str, Any]],
+    policy_version: str,
+    actor: str,
+    correlation_id: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    normalized = _channel_decision(decision)
+    source = await db.catalog_source_safety_update(
+        int(source["id"]),
+        verdict=normalized["verdict"],
+        language=normalized["language"],
+        content_kind=normalized["content_kind"],
+        reason=normalized["reason"],
+        actor=actor,
+        correlation_id=correlation_id,
+        policy_version=policy_version,
+        evidence=evidence,
+        age_suitability=normalized["age_suitability"],
+        sync_backlog=False,
+    )
+    if source is None:
+        return None, normalized
+    profiles = [] if source.get("state") in {"blocked", "revoked"} else [
+        profile
+        for profile in ("felix", "noah")
+        if _source_is_authorized_for_profile(source, profile)
+    ]
+    source = await db.kids_source_profiles_set(
+        int(source["id"]),
+        profiles,
+        actor=actor,
+        reason="Automatic age suitability profile reconciliation",
+        correlation_id=f"{correlation_id}-profiles",
+    )
+    if normalized["verdict"] == "SAFE" and source.get("state") == "candidate":
+        source = await db.catalog_transition(
+            "source",
+            int(source["id"]),
+            {
+                "state": "approved",
+                "actor": actor,
+                "reason": "Automatically approved after SAFE channel classification",
+                "correlation_id": f"{correlation_id}-approval",
+            },
+            expected_state="candidate",
+            sync_backlog=False,
+        )
+    elif normalized["verdict"] == "UNSAFE" and source.get("state") not in {"blocked", "revoked"}:
+        source = await db.catalog_transition(
+            "source",
+            int(source["id"]),
+            {
+                "state": "blocked",
+                "actor": actor,
+                "reason": normalized["reason"],
+                "correlation_id": f"{correlation_id}-block",
+            },
+            sync_backlog=False,
+        )
+    return source, normalized
+
+
+async def rejudge_stored_sources(
+    db: Database,
+    classifier: OpenCodexKidsClassifier,
+    judge: JudgeService,
+    *,
+    policy_version: str,
+) -> RejudgeReport:
+    report = RejudgeReport()
+    report.blocked += await judge.reconcile_catalog_policy()
+    for source in await db.catalog_sources_list(limit=1000):
+        if (
+            source.get("kind") != "channel"
+            or source.get("reference") == HOME_SOURCE_REFERENCE
+            or source.get("state") not in {"approved", "candidate", "unknown"}
+        ):
+            continue
+        report.sources_seen += 1
+        try:
+            evidence = json.loads(str(source.get("safety_evidence_json") or "[]"))
+        except json.JSONDecodeError:
+            evidence = []
+        if not isinstance(evidence, list):
+            evidence = []
+        evidence = [sample for sample in evidence if isinstance(sample, dict)][:20]
+        if evidence:
+            try:
+                decision = await classifier.classify(
+                    {
+                        "kind": "channel",
+                        "channel_id": channel_id_from_reference(
+                            str(source["reference"])
+                        ),
+                        "channel_title": str(source.get("title", "")).strip(),
+                        "source_reference": str(source["reference"]).strip(),
+                        "policy_version": policy_version,
+                        "sample_videos": evidence,
+                    }
+                )
+            except KidsClassificationError:
+                decision = _uncertain_channel_decision("OpenCodex unavailable")
+            except Exception:
+                decision = _uncertain_channel_decision("Classifier failure")
+        else:
+            decision = _uncertain_channel_decision(
+                "No stored channel evidence was available"
+            )
+        report.channels_screened += 1
+        try:
+            updated, normalized = await apply_channel_classification(
+                db,
+                source,
+                decision,
+                evidence=evidence,
+                policy_version=policy_version,
+                actor="kids-channel-rejudge",
+                correlation_id=f"kids-channel-rejudge-{source['id']}",
+            )
+        except Exception:
+            logger.exception("Stored Kids channel rejudge failed")
+            report.errors += 1
+            continue
+        if updated is None:
+            report.errors += 1
+        elif normalized["verdict"] == "SAFE":
+            report.safe += 1
+        elif normalized["verdict"] == "UNSAFE":
+            report.blocked += 1
+        else:
+            report.uncertain += 1
+    await db.kids_resolve_sync_backlog()
+    return report
 
 
 def parse_cards(
@@ -766,7 +963,7 @@ async def ingest_once(
     classifier: OpenCodexKidsClassifier,
     *,
     max_cards_per_source: int = 48,
-    channel_policy_version: str = "sampled-channel-v2-content-kind",
+    channel_policy_version: str = "sampled-channel-v3-age-suitability",
     channel_recheck_seconds: int = 604800,
     channel_sample_size: int = 8,
     source_batch_size: int | None = None,
@@ -845,6 +1042,7 @@ async def ingest_once(
                 "kind": "channel",
                 "reference": channel_id,
                 "title": channel_title,
+                "profile_slugs": [],
                 "correlation_id": f"kids-discovered-channel-{channel_id}",
             },
         )
@@ -923,7 +1121,6 @@ async def ingest_once(
             limit=channel_sample_size,
         )
         verdict = str(source.get("safety_verdict", "UNCERTAIN")).upper()
-        reason = str(source.get("safety_reason", "")).strip()
         if not source_safety_is_current(
             source,
             policy_version=channel_policy_version,
@@ -962,78 +1159,31 @@ async def ingest_once(
                         "content_kind": "unknown",
                         "reason": "classifier failure",
                     }
-            verdict = str(decision.get("verdict", "UNCERTAIN")).upper()
-            if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
-                verdict = "UNCERTAIN"
-            language = str(decision.get("language", "unknown")).lower()
-            if language not in {"nl", "en", "mixed", "unknown"}:
-                language = "unknown"
-            raw_content_kind = decision.get("content_kind")
-            content_kind = (
-                raw_content_kind.strip().lower()
-                if isinstance(raw_content_kind, str)
-                else ""
-            )
-            if content_kind not in {
-                "learning",
-                "entertainment",
-                "mixed",
-                "unknown",
-            }:
-                verdict = "UNCERTAIN"
-                language = "unknown"
-                content_kind = "unknown"
-                reason = "Classifier returned an invalid content kind"
-            else:
-                reason = str(decision.get("reason", ""))[:1000] or "Sampled channel safety classification"
-            updated_source = await db.catalog_source_safety_update(
-                int(source["id"]),
-                verdict=verdict,
-                language=language,
-                content_kind=content_kind,
-                reason=reason,
+            updated_source, normalized = await apply_channel_classification(
+                db,
+                source,
+                decision,
+                evidence=evidence,
+                policy_version=channel_policy_version,
                 actor="kids-channel-guardian",
                 correlation_id=f"kids-channel-classify-{source['id']}",
-                policy_version=channel_policy_version,
-                evidence=evidence,
             )
             if updated_source is not None:
                 source = updated_source
+            verdict = normalized["verdict"]
+            if updated_source is None:
+                report.errors += 1
+                continue
         if verdict == "SAFE":
-            if source.get("state") == "candidate":
-                approved_source = await db.catalog_transition(
-                    "source",
-                    int(source["id"]),
-                    {
-                        "state": "approved",
-                        "actor": "kids-channel-guardian",
-                        "reason": "Automatically approved after SAFE channel classification",
-                        "correlation_id": f"kids-channel-approval-{source['id']}",
-                    },
-                    expected_state="candidate",
-                )
-                if approved_source is None:
-                    report.errors += 1
-                    continue
-                source = approved_source
             if source.get("state") == "approved":
                 safe_source_by_channel[channel_id] = source
         elif verdict == "UNSAFE":
             report.blocked += 1
-            await db.catalog_transition(
-                "source",
-                int(source["id"]),
-                {
-                    "state": "blocked",
-                    "actor": "kids-channel-guardian",
-                    "reason": reason,
-                    "correlation_id": f"kids-channel-block-{source['id']}",
-                },
-            )
         else:
             report.uncertain += 1
 
     if home_source.get("state") != "approved" or not safe_source_by_channel:
+        await db.kids_resolve_sync_backlog()
         if next_source_offset is not None:
             await db.set_setting("kids_ingest_source_offset", str(next_source_offset))
         return report
@@ -1154,7 +1304,7 @@ async def ingest_once(
     return report
 
 
-async def _main() -> None:
+async def _main(*, rejudge_only: bool = False) -> None:
     settings = Settings()
     db = Database(settings.db_path)
     await db.init()
@@ -1168,30 +1318,47 @@ async def _main() -> None:
         base_url=settings.opencodex_base_url,
         model=settings.opencodex_model,
     )
-    browser = YouTubeKidsCDP(os.getenv("KIDS_BROWSER_CDP_URL", "http://127.0.0.1:9223"))
     try:
-        report = await ingest_once(
-            db,
-            browser,
-            classifier,
-            max_cards_per_source=max(1, int(os.getenv("KIDS_INGEST_MAX_CARDS", "96"))),
-            channel_policy_version=settings.kids_channel_policy_version,
-            channel_recheck_seconds=settings.kids_channel_recheck_seconds,
-            channel_sample_size=settings.kids_channel_sample_size,
-            source_batch_size=max(1, int(os.getenv("KIDS_INGEST_SOURCE_BATCH_SIZE", "12"))),
-            avatar_backfill_limit=max(
-                0,
-                min(_MAX_AVATAR_BACKFILL_ATTEMPTS, int(os.getenv("KIDS_INGEST_AVATAR_BATCH_SIZE", "8"))),
-            ),
-            judge=judge,
-        )
-        if report.errors == 0:
-            await db.set_setting("kids_ingest_last_success_at", utc_now_iso())
+        if rejudge_only:
+            report = await rejudge_stored_sources(
+                db,
+                classifier,
+                judge,
+                policy_version=settings.kids_channel_policy_version,
+            )
+        else:
+            browser = YouTubeKidsCDP(
+                os.getenv("KIDS_BROWSER_CDP_URL", "http://127.0.0.1:9223")
+            )
+            try:
+                report = await ingest_once(
+                    db,
+                    browser,
+                    classifier,
+                    max_cards_per_source=max(1, int(os.getenv("KIDS_INGEST_MAX_CARDS", "96"))),
+                    channel_policy_version=settings.kids_channel_policy_version,
+                    channel_recheck_seconds=settings.kids_channel_recheck_seconds,
+                    channel_sample_size=settings.kids_channel_sample_size,
+                    source_batch_size=max(1, int(os.getenv("KIDS_INGEST_SOURCE_BATCH_SIZE", "12"))),
+                    avatar_backfill_limit=max(
+                        0,
+                        min(
+                            _MAX_AVATAR_BACKFILL_ATTEMPTS,
+                            int(os.getenv("KIDS_INGEST_AVATAR_BATCH_SIZE", "8")),
+                        ),
+                    ),
+                    judge=judge,
+                )
+                if report.errors == 0:
+                    await db.set_setting("kids_ingest_last_success_at", utc_now_iso())
+            finally:
+                await browser.restore_home()
         print(json.dumps(asdict(report), sort_keys=True))
     finally:
-        await browser.restore_home()
         await classifier.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    if sys.argv[1:] not in ([], ["--rejudge-stored"]):
+        raise SystemExit("usage: python -m app.services.kids_ingest [--rejudge-stored]")
+    asyncio.run(_main(rejudge_only=sys.argv[1:] == ["--rejudge-stored"]))
