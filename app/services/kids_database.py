@@ -2388,34 +2388,65 @@ class KidsDatabaseMixin:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
                 """
+                WITH source_priority AS (
+                    SELECT s.id,
+                           CASE WHEN EXISTS (
+                               SELECT 1
+                               FROM catalog_source_profiles ps
+                               WHERE ps.source_id=s.id
+                                 AND (
+                                     (
+                                         s.language IN ('nl','mixed')
+                                         AND s.content_kind IN ('learning','mixed')
+                                     )
+                                     OR (
+                                         ps.profile_slug='noah'
+                                         AND s.language IN ('en','mixed')
+                                         AND s.content_kind IN ('entertainment','mixed')
+                                     )
+                                     OR (
+                                         ps.profile_slug='felix'
+                                         AND s.language IN ('nl','mixed')
+                                         AND s.content_kind IN ('entertainment','mixed')
+                                     )
+                                 )
+                           ) THEN 0 ELSE 1 END AS shelf_priority
+                    FROM catalog_sources s
+                )
                 SELECT item_id,video_id FROM (
-                    SELECT item_id,video_id,priority,due,
+                    SELECT item_id,video_id,shelf_priority,priority,due,
                            ROW_NUMBER() OVER (
-                               PARTITION BY priority,source_id
+                               PARTITION BY shelf_priority,priority,source_id
                                ORDER BY due ASC,item_id ASC
                            ) AS source_position
                     FROM (
-                        SELECT b.item_id,b.video_id,i.source_id,0 AS priority,
+                        SELECT b.item_id,b.video_id,i.source_id,
+                               sp.shelf_priority,0 AS priority,
                                COALESCE(b.next_attempt_at,'') AS due
                         FROM kids_resolve_backlog b
                         JOIN catalog_items i ON i.id=b.item_id
+                        JOIN source_priority sp ON sp.id=i.source_id
                         WHERE b.status='pending'
                           AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
                         UNION ALL
-                        SELECT b.item_id,b.video_id,i.source_id,1 AS priority,
+                        SELECT b.item_id,b.video_id,i.source_id,
+                               sp.shelf_priority,1 AS priority,
                                COALESCE(b.next_attempt_at,'') AS due
                         FROM kids_resolve_backlog b
                         JOIN catalog_items i ON i.id=b.item_id
+                        JOIN source_priority sp ON sp.id=i.source_id
                         WHERE b.status='retry'
                           AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
                         UNION ALL
-                        SELECT b.item_id,b.video_id,i.source_id,2 AS priority,b.expires_at AS due
+                        SELECT b.item_id,b.video_id,i.source_id,
+                               sp.shelf_priority,2 AS priority,b.expires_at AS due
                         FROM kids_resolve_backlog b
                         JOIN catalog_items i ON i.id=b.item_id
+                        JOIN source_priority sp ON sp.id=i.source_id
                         WHERE b.status='ready' AND b.expires_at<=?
                     )
                 )
-                ORDER BY priority ASC,source_position ASC,due ASC,item_id ASC
+                ORDER BY shelf_priority ASC,priority ASC,source_position ASC,due ASC,item_id ASC
                 LIMIT ?
                 """,
                 (now_iso, now_iso, refresh_at, bounded),

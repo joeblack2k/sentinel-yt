@@ -419,6 +419,28 @@ async def test_resolver_claim_interleaves_unresolved_sources(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_resolver_claim_prioritizes_sources_used_by_profile_shelves(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    await eligible_item(db, "video-generic")
+    shelf_item = await eligible_item(db, "video-shelf")
+    await db.catalog_source_classification_update(
+        shelf_item["source_id"],
+        language="nl",
+        content_kind="learning",
+        actor="guardian",
+        reason="resolver shelf priority test",
+        correlation_id="resolver-shelf-priority",
+    )
+
+    claimed = await db.kids_resolve_claim_due(limit=1, refresh_margin_seconds=300)
+
+    assert claimed == [
+        {"item_id": shelf_item["id"], "video_id": shelf_item["video_id"]}
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("height", "width", "accepted"),
     [(720, 1280, True), (1080, 1920, True), (360, 640, False), (2160, 3840, False)],
