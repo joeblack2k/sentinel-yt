@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -920,14 +921,18 @@ async def kids_playback_stream(
         return Response(status_code=status_code, headers=response_headers)
 
     async def body() -> AsyncGenerator[bytes, None]:
+        next_authorization_check = time.monotonic() + 1
         try:
             async for chunk in upstream.aiter_bytes():
-                if not await _kids_checked_stream(
-                    runtime,
-                    lease_id,
-                    minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
-                ):
-                    break
+                now = time.monotonic()
+                if now >= next_authorization_check:
+                    if not await _kids_checked_stream(
+                        runtime,
+                        lease_id,
+                        minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+                    ):
+                        break
+                    next_authorization_check = now + 1
                 yield chunk
         finally:
             await upstream.aclose()

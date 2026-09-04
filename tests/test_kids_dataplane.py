@@ -920,12 +920,26 @@ def test_playback_relay_manifest_range_head_event_and_delete(tmp_path, monkeypat
             },
         ).status_code == 409
 
+        lease_checks = 0
+        relay_lease_get = module.app.state.runtime.db.kids_relay_lease_get
+
+        async def count_lease_checks(*args, **kwargs):
+            nonlocal lease_checks
+            lease_checks += 1
+            return await relay_lease_get(*args, **kwargs)
+
+        monkeypatch.setattr(
+            module.app.state.runtime.db,
+            "kids_relay_lease_get",
+            count_lease_checks,
+        )
         media = client.get(
             manifest_payload["video_url"],
             headers={"Range": "bytes=0-4", "Cookie": "not-forwarded"},
         )
         assert media.status_code == 200
         assert media.content == b"media"
+        assert lease_checks == 1
         upstream = requests[-1]
         assert upstream.headers["range"] == "bytes=0-4"
         assert upstream.headers["accept-encoding"] == "identity"
