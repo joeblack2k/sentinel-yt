@@ -973,7 +973,7 @@ button:active, .btn:active { transform: translateY(1px); }
   overflow-x: auto;
 }
 .table-wrap table {
-  min-width: 1300px;
+  min-width: 1000px;
 }
 
 .cell-wrap {
