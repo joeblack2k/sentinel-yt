@@ -1413,6 +1413,27 @@ class KidsDatabaseMixin:
         session_id = secrets.token_urlsafe(24)
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("BEGIN IMMEDIATE")
+            if source_id is not None:
+                if type(source_id) is not int or source_id <= 0:
+                    raise ValueError("invalid Kids feed source")
+                eligible_source = await (
+                    await db.execute(
+                        """
+                        SELECT 1
+                        FROM catalog_sources s
+                        WHERE s.id=? AND s.reference!=?
+                          AND s.state='approved' AND s.safety_verdict='SAFE'
+                          AND EXISTS (
+                              SELECT 1
+                              FROM catalog_source_profiles ps
+                              WHERE ps.source_id=s.id AND ps.profile_slug=?
+                          )
+                        """,
+                        (source_id, KIDS_HOME_SOURCE_REFERENCE, profile),
+                    )
+                ).fetchone()
+                if eligible_source is None:
+                    raise ValueError("Kids feed source is not eligible")
             revision_row = await (
                 await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")
             ).fetchone()
@@ -1534,6 +1555,7 @@ class KidsDatabaseMixin:
             "policy_version": policy_version,
             "created_at": now_iso,
             "expires_at": expires_at,
+            "source_id": source_id,
             "items": asset_items,
         }
 
@@ -1843,7 +1865,7 @@ class KidsDatabaseMixin:
             cur = await db.execute(
                 f"""
                 SELECT f.asset_id,f.feed_session_id,fs.profile,fs.catalog_revision,
-                       fs.policy_version,fs.expires_at,
+                       fs.policy_version,fs.expires_at,fs.source_id AS session_source_id,
                        i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
                        i.thumbnail_url,i.duration_seconds,i.visual_category,i.state,
                        s.kind AS _source_kind,s.reference AS _source_reference,
@@ -1859,6 +1881,7 @@ class KidsDatabaseMixin:
                 JOIN catalog_sources s ON s.id=i.source_id
                 LEFT JOIN kids_resolve_backlog b ON b.item_id=i.id
                 WHERE f.asset_id=? AND fs.expires_at>?
+                  AND (fs.source_id IS NULL OR i.source_id=fs.source_id)
                   AND EXISTS (
                       SELECT 1 FROM catalog_source_profiles ps
                       WHERE ps.source_id=i.source_id AND ps.profile_slug=fs.profile
@@ -1910,6 +1933,11 @@ class KidsDatabaseMixin:
             "profile": values["profile"],
             "catalog_revision": int(values["catalog_revision"]),
             "policy_version": values["policy_version"],
+            "source_id": (
+                int(values["session_source_id"])
+                if values["session_source_id"] is not None
+                else None
+            ),
             "item_id": int(values["item_id"]),
             "video_id": values["video_id"],
             "thumbnail_url": values["thumbnail_url"] or "",
@@ -1953,6 +1981,7 @@ class KidsDatabaseMixin:
                 JOIN catalog_sources s ON s.id=i.source_id
                 LEFT JOIN kids_resolve_backlog b ON b.item_id=i.id
                 WHERE f.asset_id=?
+                  AND (fs.source_id IS NULL OR i.source_id=fs.source_id)
                   AND EXISTS (
                       SELECT 1 FROM catalog_source_profiles ps
                       WHERE ps.source_id=i.source_id AND ps.profile_slug=fs.profile
@@ -2082,6 +2111,7 @@ class KidsDatabaseMixin:
                 JOIN catalog_items i ON i.id=l.item_id
                 JOIN catalog_sources s ON s.id=i.source_id
                 WHERE l.id=?
+                  AND (fs.source_id IS NULL OR i.source_id=fs.source_id)
                   AND EXISTS (
                       SELECT 1 FROM catalog_source_profiles ps
                       WHERE ps.source_id=i.source_id AND ps.profile_slug=fs.profile
@@ -2201,7 +2231,17 @@ class KidsDatabaseMixin:
     async def kids_relay_lease_item_id(self, lease_id: str) -> int | None:
         async with aiosqlite.connect(self.db_path) as db:
             row = await (
-                await db.execute("SELECT item_id FROM relay_leases WHERE id=?", (lease_id,))
+                await db.execute(
+                    """
+                    SELECT l.item_id
+                    FROM relay_leases l
+                    JOIN feed_sessions fs ON fs.id=l.feed_session_id
+                    JOIN catalog_items i ON i.id=l.item_id
+                    WHERE l.id=?
+                      AND (fs.source_id IS NULL OR i.source_id=fs.source_id)
+                    """,
+                    (lease_id,),
+                )
             ).fetchone()
         return int(row[0]) if row else None
 
@@ -2213,10 +2253,12 @@ class KidsDatabaseMixin:
             row = await (
                 await db.execute(
                     """
-                    SELECT l.item_id,l.feed_session_id,l.state,fs.profile
+                    SELECT l.item_id,l.feed_session_id,l.state,fs.profile,fs.source_id
                     FROM relay_leases l
                     JOIN feed_sessions fs ON fs.id=l.feed_session_id
+                    JOIN catalog_items i ON i.id=l.item_id
                     WHERE l.id=?
+                      AND (fs.source_id IS NULL OR i.source_id=fs.source_id)
                     """,
                     (lease_id,),
                 )
@@ -2228,6 +2270,7 @@ class KidsDatabaseMixin:
             "feed_session_id": str(row[1]),
             "state": str(row[2]),
             "profile": str(row[3]),
+            "source_id": int(row[4]) if row[4] is not None else None,
         }
 
     async def kids_revoke_active_leases(self, *, reason: str) -> int:

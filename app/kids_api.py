@@ -1054,6 +1054,7 @@ async def kids_playback_stream(
                 headers=headers,
             ),
             stream=request.method != "HEAD",
+            follow_redirects=True,
         )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="Kids media upstream unavailable") from exc

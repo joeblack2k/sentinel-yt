@@ -289,6 +289,7 @@ def merge_kids_database(source_path: str | Path, destination_path: str | Path) -
                 "watch_events_imported": 0,
                 "source_profile_assignments": 0,
                 "profile_setting_imported": 0,
+                "source_posters_imported": 0,
                 "skipped_home_rows": 0,
             }
 
@@ -433,6 +434,26 @@ def merge_kids_database(source_path: str | Path, destination_path: str | Path) -
                 )
                 item_map[int(row["id"])] = int(cursor.lastrowid)
                 counts["items_inserted"] += 1
+
+            if "poster_item_id" in {
+                str(column[1])
+                for column in source.execute("PRAGMA table_info(catalog_sources)")
+            }:
+                for row in _rows(
+                    source,
+                    "SELECT id,poster_item_id FROM catalog_sources "
+                    "WHERE poster_item_id IS NOT NULL ORDER BY id",
+                ):
+                    mapped_source = source_map.get(int(row["id"]))
+                    mapped_poster = item_map.get(int(row["poster_item_id"]))
+                    if mapped_source is None or mapped_poster is None:
+                        continue
+                    cursor = destination.execute(
+                        "UPDATE catalog_sources SET poster_item_id=? "
+                        "WHERE id=? AND poster_item_id IS NULL",
+                        (mapped_poster, mapped_source),
+                    )
+                    counts["source_posters_imported"] += cursor.rowcount
 
             for row in _rows(source, "SELECT * FROM kids_resolve_backlog ORDER BY item_id"):
                 target_item = item_map.get(int(row["item_id"]))

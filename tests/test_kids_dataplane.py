@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from app.db import Database
@@ -365,14 +366,8 @@ def test_ineligible_source_yields_empty_feed_session(tmp_path):
     source = asyncio.run(
         add_ready_source_item(db, suffix="unsafe", safety_verdict="UNSAFE")
     )[0]
-    session = asyncio.run(create_feed_session(db, source_id=source["id"]))
-
-    with sqlite3.connect(db_path) as connection:
-        item_count = connection.execute(
-            "SELECT COUNT(*) FROM feed_session_items WHERE feed_session_id=?",
-            (session["id"],),
-        ).fetchone()[0]
-    assert item_count == 0
+    with pytest.raises(ValueError, match="Kids feed source is not eligible"):
+        asyncio.run(create_feed_session(db, source_id=source["id"]))
 
 
 def test_global_feed_session_contains_multiple_sources(tmp_path):
@@ -997,6 +992,57 @@ def test_playback_relay_manifest_range_head_event_and_delete(tmp_path, monkeypat
             },
         ).status_code == 202
         assert client.delete(f"/v1/kids/playback-sessions/{lease['id']}").json() == {"closed": False}
+
+
+def test_playback_relay_follows_upstream_media_redirects(tmp_path, monkeypatch):
+    asyncio.run(seed_catalog(tmp_path / "sentinel.db", qualities=(1080,)))
+    module = load_app(tmp_path, monkeypatch)
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "rr1---sn.example.googlevideo.com":
+            return httpx.Response(
+                302,
+                headers={"location": "https://media.test/video"},
+                request=request,
+            )
+        return httpx.Response(
+            206,
+            headers={
+                "accept-ranges": "bytes",
+                "content-length": "5",
+                "content-range": "bytes 0-4/5",
+                "content-type": "video/mp4",
+            },
+            content=b"media",
+            request=request,
+        )
+
+    upstream = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+    )
+    monkeypatch.setattr(module, "_new_kids_http_client", lambda: upstream)
+
+    with TestClient(module.app) as client:
+        item = client.get("/v1/kids/feed").json()["items"][0]
+        created = client.post(
+            "/v1/kids/playback-sessions",
+            json={"asset_id": item["id"]},
+        ).json()
+        response = client.get(
+            f"/v1/kids/playback-sessions/{created['id']}/video",
+            headers={"Range": "bytes=0-4"},
+        )
+
+    assert response.status_code == 206
+    assert response.content == b"media"
+    assert [request.url.host for request in requests[-2:]] == [
+        "rr1---sn.example.googlevideo.com",
+        "media.test",
+    ]
+    assert requests[-1].headers["range"] == "bytes=0-4"
 
 
 def test_kill_switch_and_schedule_close_revoke_leases(tmp_path, monkeypatch):
