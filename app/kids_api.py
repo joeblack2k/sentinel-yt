@@ -1039,7 +1039,7 @@ async def kids_playback_stream(
 ) -> Response | StreamingResponse:
     if stream_name not in {"video", "audio"}:
         raise HTTPException(status_code=404, detail="Kids media stream not found")
-    runtime, lease = await _kids_checked_lease(request, lease_id)
+    runtime, lease = await _kids_checked_lease(request, lease_id, reconcile=False)
     candidate = lease["candidate"]
     source_url = candidate.get("media_url" if stream_name == "video" else "audio_url")
     parsed = urlsplit(str(source_url))

@@ -933,6 +933,17 @@ def test_playback_relay_manifest_range_head_event_and_delete(tmp_path, monkeypat
             "kids_relay_lease_get",
             count_lease_checks,
         )
+
+        reconcile = module.app.state.runtime.reconcile_kids_catalog_policy
+
+        async def reject_reconcile(*, force=False):
+            raise AssertionError("media stream must not reconcile the catalog")
+
+        monkeypatch.setattr(
+            module.app.state.runtime,
+            "reconcile_kids_catalog_policy",
+            reject_reconcile,
+        )
         media = client.get(
             manifest_payload["video_url"],
             headers={"Range": "bytes=0-4", "Cookie": "not-forwarded"},
@@ -948,6 +959,11 @@ def test_playback_relay_manifest_range_head_event_and_delete(tmp_path, monkeypat
         head = client.head(manifest_payload["video_url"])
         assert head.status_code == 200
         assert head.content == b""
+        monkeypatch.setattr(
+            module.app.state.runtime,
+            "reconcile_kids_catalog_policy",
+            reconcile,
+        )
 
         event = client.post(
             "/v1/kids/events",
