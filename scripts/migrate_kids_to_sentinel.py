@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 MIGRATION_KEY = "subtube-kids-to-sentinel-v1"
 STATE_VALUES = {"candidate", "approved", "blocked", "revoked", "unknown"}
 LANGUAGE_VALUES = {"nl", "en", "mixed", "unknown"}
+CONTENT_KIND_VALUES = {"learning", "entertainment", "mixed", "unknown"}
 CORE_TABLES = (
     "catalog_meta",
     "catalog_sources",
@@ -60,6 +61,11 @@ def _state(value: Any) -> str:
 def _language(value: Any) -> str:
     value = _iso(value).lower()
     return value if value in LANGUAGE_VALUES else "unknown"
+
+
+def _content_kind(value: Any) -> str:
+    value = _iso(value).lower()
+    return value if value in CONTENT_KIND_VALUES else "unknown"
 
 
 def _verdict(value: Any) -> str:
@@ -304,6 +310,11 @@ def merge_kids_database(source_path: str | Path, destination_path: str | Path) -
                         updates["title"] = _bounded(row.get("title"), 500)
                     if _language(existing["language"]) == "unknown" and _language(row.get("language")) != "unknown":
                         updates["language"] = _language(row.get("language"))
+                    if (
+                        _content_kind(existing["content_kind"]) == "unknown"
+                        and _content_kind(row.get("content_kind")) != "unknown"
+                    ):
+                        updates["content_kind"] = _content_kind(row.get("content_kind"))
                     if updates:
                         assignments = ", ".join(f"{key}=?" for key in updates)
                         destination.execute(
@@ -315,16 +326,17 @@ def merge_kids_database(source_path: str | Path, destination_path: str | Path) -
                 cursor = destination.execute(
                     """
                     INSERT INTO catalog_sources(
-                        kind,reference,title,language,safety_verdict,safety_reason,
+                        kind,reference,title,language,content_kind,safety_verdict,safety_reason,
                         safety_checked_at,safety_policy_version,safety_evidence_json,
                         safety_sample_count,state,actor,changed_at,reason,revision,correlation_id
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         _bounded(row.get("kind"), 32) if _iso(row.get("kind")) in {"channel", "playlist"} else "channel",
                         reference,
                         _bounded(row.get("title"), 500),
                         _language(row.get("language")),
+                        _content_kind(row.get("content_kind")),
                         _verdict(row.get("safety_verdict")),
                         _bounded(row.get("safety_reason"), 1000),
                         _iso(row.get("safety_checked_at")) or None,

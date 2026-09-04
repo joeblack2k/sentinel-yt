@@ -942,6 +942,7 @@ class BlocklistedBrowser:
 class FakeClassifier:
     verdict: str
     language: str = "unknown"
+    content_kind: str = "unknown"
     calls: list[dict] = None
 
     def __post_init__(self):
@@ -949,7 +950,12 @@ class FakeClassifier:
 
     async def classify(self, metadata):
         self.calls.append(metadata)
-        return {"verdict": self.verdict, "language": self.language, "reason": "test"}
+        return {
+            "verdict": self.verdict,
+            "language": self.language,
+            "content_kind": self.content_kind,
+            "reason": "test",
+        }
 
 
 @pytest.mark.asyncio
@@ -1021,7 +1027,7 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
             "correlation_id": "approve-source",
         },
     )
-    classifier = FakeClassifier("SAFE", "en")
+    classifier = FakeClassifier("SAFE", "en", "learning")
     report = await ingest_once(db, FakeBrowser(), classifier)
     assert report.approved == 1
     assert len(classifier.calls) == 1
@@ -1033,8 +1039,9 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
     assert items[0]["channel_id"] == "UC123"
     assert items[0]["channel_title"] == "Kids Channel"
     checked_source = await db.catalog_get("source", source["id"])
-    assert checked_source["safety_policy_version"] == "sampled-channel-v1"
+    assert checked_source["safety_policy_version"] == "sampled-channel-v2-content-kind"
     assert checked_source["language"] == "en"
+    assert checked_source["content_kind"] == "learning"
     assert checked_source["safety_sample_count"] == 1
     assert json.loads(checked_source["safety_evidence_json"])[0]["video_id"] == "abcdefghijk"
 
@@ -1050,6 +1057,44 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
     )
     report = await ingest_once(db, FakeBrowser(), FakeClassifier("SAFE"))
     assert report.skipped == 1
+    assert await db.catalog_items_list() == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_fails_closed_for_invalid_content_kind(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": "UC123",
+            "title": "Invalid kind channel",
+            "correlation_id": "invalid-kind-source",
+        },
+    )
+    await db.catalog_transition(
+        "source",
+        source["id"],
+        {
+            "state": "approved",
+            "actor": "parent",
+            "reason": "test",
+            "correlation_id": "invalid-kind-approve",
+        },
+    )
+
+    report = await ingest_once(
+        db,
+        FakeBrowser(),
+        FakeClassifier("SAFE", "nl", "not-a-kind"),
+    )
+
+    assert report.uncertain == 1
+    stored = await db.catalog_get("source", source["id"])
+    assert stored["safety_verdict"] == "UNCERTAIN"
+    assert stored["language"] == "unknown"
+    assert stored["content_kind"] == "unknown"
     assert await db.catalog_items_list() == []
 
 

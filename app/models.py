@@ -17,6 +17,7 @@ class CatalogSourceRequest(BaseModel):
     reference: str = Field(min_length=1, max_length=256)
     title: str = Field(default="", max_length=500)
     language: Literal["nl", "en", "mixed", "unknown"] = "unknown"
+    content_kind: Literal["learning", "entertainment", "mixed", "unknown"] = "unknown"
     profile_slugs: list[str] = Field(default_factory=lambda: ["noah"], max_length=2)
 
 
@@ -40,6 +41,14 @@ class KidsSourceProfilesRequest(BaseModel):
     profile_slugs: list[str] = Field(default_factory=list, max_length=2)
     actor: str = Field(default="parent-ui", min_length=1, max_length=128)
     reason: str = Field(default="Parent profile assignment", max_length=1000)
+    correlation_id: str = Field(min_length=1, max_length=128)
+
+
+class KidsSourceClassificationRequest(BaseModel):
+    language: Literal["nl", "en", "mixed", "unknown"]
+    content_kind: Literal["learning", "entertainment", "mixed", "unknown"]
+    actor: str = Field(default="parent-ui", min_length=1, max_length=128)
+    reason: str = Field(default="Parent source classification", max_length=1000)
     correlation_id: str = Field(min_length=1, max_length=128)
 
 

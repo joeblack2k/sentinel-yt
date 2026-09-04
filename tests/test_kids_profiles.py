@@ -118,6 +118,39 @@ def test_source_api_exposes_profiles_and_assignment_endpoint(tmp_path, monkeypat
         assert [row["reference"] for row in rows] == ["UC-profile-api"]
 
 
+def test_parent_can_correct_source_language_and_content_kind(tmp_path, monkeypatch):
+    monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
+    monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))
+    module = importlib.reload(importlib.import_module("app.main"))
+
+    with TestClient(module.app) as client:
+        source = client.post(
+            "/api/kids/sources",
+            json={
+                "kind": "channel",
+                "reference": "UC-classification-api",
+                "title": "Classification API",
+            },
+        ).json()
+        changed = client.put(
+            f"/api/kids/sources/{source['id']}/classification",
+            json={
+                "language": "en",
+                "content_kind": "entertainment",
+                "actor": "parent-test",
+                "reason": "English cartoons",
+                "correlation_id": "classification-api",
+            },
+        )
+
+        assert changed.status_code == 200
+        assert changed.json()["language"] == "en"
+        assert changed.json()["content_kind"] == "entertainment"
+        audit = client.get("/api/kids/audit").json()["events"][0]
+        assert audit["event"] == "source_classification_changed"
+        assert "en/entertainment" in audit["reason"]
+
+
 def test_profile_avatar_can_be_uploaded_read_replaced_and_deleted(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_DB_PATH", str(tmp_path / "sentinel.db"))
     monkeypatch.setenv("SENTINEL_DATA_DIR", str(tmp_path / "data"))

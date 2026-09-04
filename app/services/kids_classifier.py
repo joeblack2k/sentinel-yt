@@ -78,9 +78,13 @@ class OpenCodexKidsClassifier:
                                 "low-value content UNSAFE. Calm animals, nature, building, LEGO-style creativity, stories, "
                                 "and age-appropriate learning may be SAFE. "
                                 "Return only strict JSON with verdict SAFE, UNSAFE, or UNCERTAIN, "
-                                "language exactly one of nl, en, mixed, or unknown, a short reason, and confidence 0-100. "
+                                "language exactly one of nl, en, mixed, or unknown, "
+                                "content_kind exactly one of learning, entertainment, mixed, or unknown, "
+                                "a short reason, and confidence 0-100. "
                                 "Always include the language field: use nl for Dutch, en for English, mixed for both, "
                                 "and unknown when language evidence is incomplete. "
+                                "Always include the content_kind field: use learning for educational content, "
+                                "entertainment for fun content, mixed when both are central, and unknown when evidence is incomplete. "
                                 "Choose UNCERTAIN whenever evidence is incomplete."
                             ),
                         },
@@ -97,12 +101,21 @@ class OpenCodexKidsClassifier:
             language = result.get("language", "unknown")
             if not isinstance(language, str) or language not in {"nl", "en", "mixed", "unknown"}:
                 raise ValueError("invalid language")
+            content_kind = result.get("content_kind")
+            if not isinstance(content_kind, str) or content_kind not in {
+                "learning",
+                "entertainment",
+                "mixed",
+                "unknown",
+            }:
+                raise ValueError("invalid content kind")
             confidence = int(result.get("confidence", 0))
             if not 0 <= confidence <= 100:
                 raise ValueError("invalid confidence")
             return {
                 "verdict": verdict,
                 "language": language,
+                "content_kind": content_kind,
                 "reason": str(result.get("reason", ""))[:1000],
                 "confidence": confidence,
             }

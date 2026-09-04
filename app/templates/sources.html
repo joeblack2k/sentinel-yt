@@ -166,6 +166,7 @@
           <th style="width:75px;">Type</th>
           <th>Source Name &amp; Safe Links</th>
           <th style="width:170px;">Profile Assignment</th>
+          <th style="width:140px;">Classificatie</th>
           <th style="width:190px;">Guardian check</th>
           <th style="width:120px;">Catalog Items</th>
           <th style="width:90px;">State</th>
@@ -264,6 +265,29 @@
                 {% endfor %}
               </div>
               <div class="profile-saved-msg" id="prof-msg-{{ source.id }}"></div>
+            </div>
+            {% endif %}
+          </td>
+          <td>
+            {% if is_system_source %}
+              <span class="muted" style="font-size:12px;">-</span>
+            {% else %}
+            <div class="classification-group" data-source-id="{{ source.id }}">
+              <div class="classification-controls">
+                <select class="source-lang-sel classification-select" data-source-id="{{ source.id }}" aria-label="Taal">
+                  <option value="unknown" {% if source.language == 'unknown' or not source.language %}selected{% endif %}>❓ Onbekend (Taal)</option>
+                  <option value="nl" {% if source.language == 'nl' %}selected{% endif %}>🇳🇱 Nederlands</option>
+                  <option value="en" {% if source.language == 'en' %}selected{% endif %}>🇬🇧 Engels</option>
+                  <option value="mixed" {% if source.language == 'mixed' %}selected{% endif %}>🌍 Gemengd</option>
+                </select>
+                <select class="source-kind-sel classification-select" data-source-id="{{ source.id }}" aria-label="Inhoud">
+                  <option value="unknown" {% if source.content_kind == 'unknown' or not source.content_kind %}selected{% endif %}>❓ Onbekend (Inhoud)</option>
+                  <option value="learning" {% if source.content_kind == 'learning' %}selected{% endif %}>🧠 Educatief</option>
+                  <option value="entertainment" {% if source.content_kind == 'entertainment' %}selected{% endif %}>🎈 Vermaak</option>
+                  <option value="mixed" {% if source.content_kind == 'mixed' %}selected{% endif %}>🧩 Gemengd</option>
+                </select>
+              </div>
+              <div class="class-saved-msg" id="class-msg-{{ source.id }}" ></div>
             </div>
             {% endif %}
           </td>
@@ -585,6 +609,47 @@ document.getElementById('kids-source-form').addEventListener('submit', async (ev
     btn.disabled = false;
   }
 });
+
+
+// Classification updates via PUT /api/kids/sources/{source_id}/classification
+document.querySelectorAll('.source-lang-sel, .source-kind-sel').forEach((sel) => {
+  sel.addEventListener('change', async (e) => {
+    const sourceId = sel.dataset.sourceId;
+    const group = sel.closest('.classification-group');
+    const msgEl = document.getElementById(`class-msg-${sourceId}`);
+    const lang = group.querySelector('.source-lang-sel').value;
+    const kind = group.querySelector('.source-kind-sel').value;
+
+    if (msgEl) {
+      msgEl.textContent = 'Opslaan...';
+      msgEl.style.color = '#5f6d6f';
+    }
+
+    const correlationID = correlation();
+    try {
+      const res = await fetch(`/api/kids/sources/${encodeURIComponent(sourceId)}/classification`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Correlation-ID': correlationID
+        },
+        body: JSON.stringify({ language: lang, content_kind: kind, correlation_id: correlationID })
+      });
+      if (!res.ok) throw new Error('Network response was not ok');
+      if (msgEl) {
+        msgEl.textContent = 'Opgeslagen';
+        msgEl.style.color = '#0d8c67';
+        setTimeout(() => { if (msgEl.textContent === 'Opgeslagen') msgEl.textContent = ''; }, 2000);
+      }
+    } catch (err) {
+      if (msgEl) {
+        msgEl.textContent = 'Fout bij opslaan';
+        msgEl.style.color = '#b91c1c';
+      }
+    }
+  });
+});
+
 
 // Profile Assignment updates via PUT /api/kids/sources/{source_id}/profiles
 document.querySelectorAll('.source-prof-cb').forEach((checkbox) => {

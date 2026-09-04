@@ -98,3 +98,14 @@ def test_sources_template_has_single_filter_initialization_path_and_responsive_p
     assert ".poster-dialog:not([open])" in css
     assert ".poster-option" in css
     assert "@media (max-width: 700px)" in css
+
+def test_sources_template_includes_classification_controls_and_api_contract():
+    html = render_sources([source_row(1, "UC-real")])
+    assert 'class="classification-group"' in html
+    assert 'source-lang-sel' in html
+    assert 'source-kind-sel' in html
+    assert '/api/kids/sources/${encodeURIComponent(sourceId)}/classification' in html
+    assert "method: 'PUT'" in html
+    assert 'correlation_id: correlationID' in html
+    assert 'language: lang' in html
+    assert 'content_kind: kind' in html

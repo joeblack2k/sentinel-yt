@@ -766,7 +766,7 @@ async def ingest_once(
     classifier: OpenCodexKidsClassifier,
     *,
     max_cards_per_source: int = 48,
-    channel_policy_version: str = "sampled-channel-v1",
+    channel_policy_version: str = "sampled-channel-v2-content-kind",
     channel_recheck_seconds: int = 604800,
     channel_sample_size: int = 8,
     source_batch_size: int | None = None,
@@ -933,6 +933,8 @@ async def ingest_once(
             if not evidence:
                 decision = {
                     "verdict": "UNCERTAIN",
+                    "language": "unknown",
+                    "content_kind": "unknown",
                     "reason": "No usable channel video samples were available",
                 }
             else:
@@ -950,12 +952,14 @@ async def ingest_once(
                     decision = {
                         "verdict": "UNCERTAIN",
                         "language": "unknown",
+                        "content_kind": "unknown",
                         "reason": "OpenCodex unavailable",
                     }
                 except Exception:
                     decision = {
                         "verdict": "UNCERTAIN",
                         "language": "unknown",
+                        "content_kind": "unknown",
                         "reason": "classifier failure",
                     }
             verdict = str(decision.get("verdict", "UNCERTAIN")).upper()
@@ -964,11 +968,29 @@ async def ingest_once(
             language = str(decision.get("language", "unknown")).lower()
             if language not in {"nl", "en", "mixed", "unknown"}:
                 language = "unknown"
-            reason = str(decision.get("reason", ""))[:1000] or "Sampled channel safety classification"
+            raw_content_kind = decision.get("content_kind")
+            content_kind = (
+                raw_content_kind.strip().lower()
+                if isinstance(raw_content_kind, str)
+                else ""
+            )
+            if content_kind not in {
+                "learning",
+                "entertainment",
+                "mixed",
+                "unknown",
+            }:
+                verdict = "UNCERTAIN"
+                language = "unknown"
+                content_kind = "unknown"
+                reason = "Classifier returned an invalid content kind"
+            else:
+                reason = str(decision.get("reason", ""))[:1000] or "Sampled channel safety classification"
             updated_source = await db.catalog_source_safety_update(
                 int(source["id"]),
                 verdict=verdict,
                 language=language,
+                content_kind=content_kind,
                 reason=reason,
                 actor="kids-channel-guardian",
                 correlation_id=f"kids-channel-classify-{source['id']}",

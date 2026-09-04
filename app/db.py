@@ -63,6 +63,8 @@ class Database(KidsDatabaseMixin):
                     poster_item_id INTEGER,
                     language TEXT NOT NULL DEFAULT 'unknown'
                         CHECK(language IN ('nl', 'en', 'mixed', 'unknown')),
+                    content_kind TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(content_kind IN ('learning', 'entertainment', 'mixed', 'unknown')),
                     safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN',
                     safety_reason TEXT NOT NULL DEFAULT '',
                     safety_checked_at TEXT,
@@ -178,6 +180,15 @@ class Database(KidsDatabaseMixin):
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 ) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS kids_daily_library (
+                    day TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    shelf TEXT NOT NULL CHECK(shelf IN ('learning', 'fun', 'again')),
+                    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                    item_id INTEGER REFERENCES catalog_items(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(day, profile, shelf, ordinal)
+                ) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS feed_session_items (
                     feed_session_id TEXT NOT NULL REFERENCES feed_sessions(id) ON DELETE CASCADE,
                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
@@ -258,6 +269,14 @@ class Database(KidsDatabaseMixin):
                     ALTER TABLE catalog_sources
                     ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'
                         CHECK(language IN ('nl', 'en', 'mixed', 'unknown'))
+                    """
+                )
+            if "content_kind" not in source_cols:
+                await db.execute(
+                    """
+                    ALTER TABLE catalog_sources
+                    ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(content_kind IN ('learning', 'entertainment', 'mixed', 'unknown'))
                     """
                 )
             if "avatar_url" not in source_cols:

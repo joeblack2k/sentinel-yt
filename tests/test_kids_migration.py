@@ -19,7 +19,8 @@ def _source_database(path):
             safety_verdict TEXT, safety_reason TEXT, safety_checked_at TEXT,
             safety_policy_version TEXT, safety_evidence_json TEXT,
             safety_sample_count INTEGER, state TEXT, actor TEXT, changed_at TEXT,
-            reason TEXT, revision INTEGER, correlation_id TEXT, language TEXT
+            reason TEXT, revision INTEGER, correlation_id TEXT, language TEXT,
+            content_kind TEXT
         );
         CREATE TABLE catalog_items(
             id INTEGER PRIMARY KEY, video_id TEXT, title TEXT, source_id INTEGER,
@@ -69,12 +70,12 @@ def _source_database(path):
     }
     connection.execute("INSERT INTO catalog_meta VALUES('revision', 10)")
     connection.executemany(
-        "INSERT INTO catalog_sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO catalog_sources VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
             (1, "channel", "UC-safe", "Safe", "SAFE", "", "now", "v1", "[]", 4,
-             "approved", "donor", "now", "safe", 10, "source-safe", "en"),
+             "approved", "donor", "now", "safe", 10, "source-safe", "en", "learning"),
             (2, "channel", "UC-blocked", "Blocked", "SAFE", "", "now", "v1", "[]", 4,
-             "approved", "donor", "now", "safe", 10, "source-blocked", "en"),
+             "approved", "donor", "now", "safe", 10, "source-blocked", "en", "entertainment"),
         ],
     )
     connection.executemany(
@@ -139,9 +140,12 @@ def test_merge_is_idempotent_preserves_target_decisions_and_excludes_ephemeral_s
     with sqlite3.connect(target) as connection:
         connection.row_factory = sqlite3.Row
         blocked = connection.execute(
-            "SELECT state,safety_verdict,title FROM catalog_sources WHERE reference='UC-blocked'"
+            "SELECT state,safety_verdict,title,content_kind FROM catalog_sources WHERE reference='UC-blocked'"
         ).fetchone()
-        assert tuple(blocked) == ("blocked", "UNSAFE", "Parent decision")
+        assert tuple(blocked) == ("blocked", "UNSAFE", "Parent decision", "entertainment")
+        assert connection.execute(
+            "SELECT content_kind FROM catalog_sources WHERE reference='UC-safe'"
+        ).fetchone()[0] == "learning"
         profile = connection.execute(
             "SELECT value FROM settings WHERE key='kids_profile_max_age'"
         ).fetchone()

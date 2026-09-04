@@ -15,6 +15,7 @@ async def _approved_source_and_item(db: Database, suffix: str = "schema") -> tup
             "reference": channel_id,
             "title": "Schema channel",
             "language": "nl",
+            "content_kind": "learning",
             "correlation_id": f"source-{suffix}",
         },
     )
@@ -22,6 +23,7 @@ async def _approved_source_and_item(db: Database, suffix: str = "schema") -> tup
         source["id"],
         verdict="SAFE",
         language="nl",
+        content_kind="learning",
         reason="schema setup",
         actor="test",
         correlation_id=f"safety-{suffix}",
@@ -133,7 +135,7 @@ async def test_kids_schema_init_is_idempotent_with_language_and_defaults(tmp_pat
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-    assert {"language", "poster_item_id"} <= source_columns
+    assert {"language", "content_kind", "poster_item_id"} <= source_columns
     assert "source_id" in feed_session_columns
     assert {"feed_sessions", "feed_session_items", "relay_leases"} <= tables
 
@@ -189,6 +191,7 @@ async def test_kids_schema_migrates_feed_source_columns_without_backfill(tmp_pat
 
     with sqlite3.connect(db.db_path) as connection:
         connection.execute("ALTER TABLE catalog_sources DROP COLUMN poster_item_id")
+        connection.execute("ALTER TABLE catalog_sources DROP COLUMN content_kind")
         connection.execute("ALTER TABLE feed_sessions DROP COLUMN source_id")
         connection.execute(
             """
@@ -211,7 +214,7 @@ async def test_kids_schema_migrates_feed_source_columns_without_backfill(tmp_pat
         source_id = connection.execute(
             "SELECT source_id FROM feed_sessions WHERE id='legacy-feed'"
         ).fetchone()[0]
-    assert "poster_item_id" in source_columns
+    assert {"content_kind", "poster_item_id"} <= source_columns
     assert "source_id" in feed_session_columns
     assert source_id is None
 
@@ -317,6 +320,15 @@ async def test_source_language_is_validated_and_revoke_revokes_active_leases(tmp
             reason="invalid test language",
             actor="test",
             correlation_id="invalid-language",
+        )
+    with pytest.raises(ValueError, match="invalid source content kind"):
+        await db.catalog_source_safety_update(
+            source["id"],
+            verdict="SAFE",
+            content_kind="not-a-kind",
+            reason="invalid test content kind",
+            actor="test",
+            correlation_id="invalid-content-kind",
         )
 
     _insert_feed_item_and_lease(

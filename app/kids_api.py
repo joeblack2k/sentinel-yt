@@ -5,10 +5,11 @@ import hashlib
 import json
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator
 from urllib.parse import quote, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -21,6 +22,7 @@ from .models import (
     KidsDataplaneEventRequest,
     KidsKillSwitchRequest,
     KidsPlaybackSessionRequest,
+    KidsSourceClassificationRequest,
     KidsSourcePosterRequest,
     KidsSourceProfilesRequest,
     KidsWatchEventRequest,
@@ -28,14 +30,22 @@ from .models import (
 from .services.kids_classifier import OpenCodexKidsClassifier
 from .services.kids_database import (
     KIDS_CHANNEL_ART_HOSTS,
+    KIDS_SHELF_NAMES,
     KIDS_VIDEO_THUMBNAIL_HOSTS,
     _kids_channel_avatar_is_proxyable,
 )
+from .services.kids_catalog import _parse_utc
 
 
 KIDS_DATAPLANE_POLICY_VERSION = "sentinel-kids-v1"
 KIDS_PROFILE_AVATAR_MAX_BYTES = 10 * 1024 * 1024
 KIDS_CHANNEL_ART_MAX_BYTES = 8 * 1024 * 1024
+KIDS_SHELF_ICONS = {
+    "learning": "book.fill",
+    "fun": "star.fill",
+    "again": "arrow.counterclockwise",
+}
+KIDS_SHELF_COOLDOWN = timedelta(days=7)
 router = APIRouter()
 
 
@@ -156,6 +166,150 @@ async def _kids_profile(request: Request, profile: str, *, require_enabled: bool
 def _kids_channel_opaque_id(channel: dict[str, Any]) -> str:
     identity = f"{channel.get('kind', '')}\x00{channel.get('reference', '')}"
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _kids_shelf_limit(profile: str) -> int:
+    return 5 if profile == "felix" else 7
+
+
+def _kids_shelf_language_rank(profile: str, shelf: str, language: str) -> int | None:
+    if shelf == "again":
+        return 0
+    if profile == "felix":
+        return {"nl": 0, "mixed": 1}.get(language)
+    if shelf == "learning":
+        return {"nl": 0, "mixed": 1}.get(language)
+    return {"en": 0, "mixed": 1}.get(language)
+
+
+def _kids_shelf_daily_key(day: str, profile: str, shelf: str, item_id: int) -> str:
+    return hashlib.sha256(
+        f"{day}\x00{profile}\x00{shelf}\x00{item_id}".encode("utf-8")
+    ).hexdigest()
+
+
+def _kids_shelf_candidate_allowed(
+    item: dict[str, Any],
+    *,
+    profile: str,
+    shelf: str,
+    cooldown_after: datetime,
+) -> bool:
+    if shelf == "again":
+        return _parse_utc(item.get("_profile_history_at")) is not None
+    raw_completed_at = item.get("_profile_completed_at")
+    completed_at = _parse_utc(raw_completed_at)
+    if str(raw_completed_at or "").strip() and (
+        completed_at is None or completed_at > cooldown_after
+    ):
+        return False
+    content_kind = str(item.get("_source_content_kind") or "unknown").strip().lower()
+    if shelf == "learning" and content_kind not in {"learning", "mixed"}:
+        return False
+    if shelf == "fun" and content_kind not in {"entertainment", "mixed"}:
+        return False
+    return (
+        _kids_shelf_language_rank(
+            profile,
+            shelf,
+            str(item.get("_source_language") or "unknown").strip().lower(),
+        )
+        is not None
+    )
+
+
+def _select_kids_shelves(
+    items: list[dict[str, Any]],
+    *,
+    profile: str,
+    day: str,
+    now: datetime | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    cooldown_after = now - KIDS_SHELF_COOLDOWN
+    selected = {shelf: [] for shelf in KIDS_SHELF_NAMES}
+    selected_sources = {shelf: set() for shelf in KIDS_SHELF_NAMES}
+    source_totals: dict[int, int] = {}
+    shelf_limit = _kids_shelf_limit(profile)
+
+    for shelf in KIDS_SHELF_NAMES:
+        candidates: list[tuple[tuple[Any, ...], dict[str, Any], int, int]] = []
+        for item in items:
+            try:
+                item_id = int(item["id"])
+                source_id = int(item["source_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not _kids_shelf_candidate_allowed(
+                item,
+                profile=profile,
+                shelf=shelf,
+                cooldown_after=cooldown_after,
+            ):
+                continue
+            if shelf == "again":
+                history_at = _parse_utc(item.get("_profile_history_at"))
+                if history_at is None:
+                    continue
+                sort_key = (
+                    -history_at.timestamp(),
+                    _kids_shelf_daily_key(day, profile, shelf, item_id),
+                    item_id,
+                )
+            else:
+                content_kind = str(
+                    item.get("_source_content_kind") or "unknown"
+                ).strip().lower()
+                language_rank = _kids_shelf_language_rank(
+                    profile,
+                    shelf,
+                    str(item.get("_source_language") or "unknown").strip().lower(),
+                )
+                if language_rank is None:
+                    continue
+                content_rank = 0 if (
+                    content_kind
+                    == ("learning" if shelf == "learning" else "entertainment")
+                ) else 1
+                sort_key = (
+                    language_rank,
+                    content_rank,
+                    _kids_shelf_daily_key(day, profile, shelf, item_id),
+                    item_id,
+                )
+            candidates.append((sort_key, item, item_id, source_id))
+
+        candidates.sort(key=lambda candidate: candidate[0])
+        for _sort_key, item, item_id, source_id in candidates:
+            if len(selected[shelf]) >= shelf_limit:
+                break
+            if source_totals.get(source_id, 0) >= 2:
+                continue
+            if source_id in selected_sources[shelf]:
+                continue
+            selected[shelf].append(item)
+            selected_sources[shelf].add(source_id)
+            source_totals[source_id] = source_totals.get(source_id, 0) + 1
+    return selected
+
+
+async def _kids_shelf_context(runtime: Any) -> tuple[str, datetime]:
+    settings = await runtime.db.all_settings()
+    timezone_name = str(settings.get("timezone") or "UTC")
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = timezone.utc
+    local_now = datetime.now(timezone.utc).astimezone(zone)
+    local_midnight = datetime.combine(
+        local_now.date(),
+        datetime.min.time(),
+        tzinfo=zone,
+    )
+    return local_now.date().isoformat(), local_midnight.astimezone(timezone.utc)
 
 
 def _kids_channel_accessibility_label(channel: dict[str, Any]) -> str:
@@ -412,6 +566,114 @@ async def kids_channels(
         "catalog_revision": str(revision),
         "retry_after_seconds": 30,
         "channels": response_channels,
+    }
+
+
+@router.get("/v1/kids/shelves")
+async def kids_shelves(
+    request: Request,
+    profile: str = Query(default="noah", min_length=1, max_length=64),
+) -> dict[str, Any]:
+    runtime: Any = request.app.state.runtime
+    profile_row = await _kids_profile(request, profile)
+    await runtime.reconcile_kids_catalog_policy()
+    state = await runtime.kids_policy_state()
+    revision = await runtime.db.catalog_revision()
+    empty_shelves = [
+        {"id": shelf, "icon": KIDS_SHELF_ICONS[shelf], "items": []}
+        for shelf in KIDS_SHELF_NAMES
+    ]
+    if state != "ready":
+        return {
+            "state": state,
+            "catalog_revision": str(revision),
+            "retry_after_seconds": 30,
+            "shelves": empty_shelves,
+        }
+
+    candidates = await runtime.db.kids_eligible_feed_list(
+        runtime.settings.kids_playback_min_remaining_seconds,
+        runtime.settings.kids_resolver_min_quality_height,
+        profile=profile_row["slug"],
+        include_shelf_metadata=True,
+    )
+    day, day_boundary = await _kids_shelf_context(runtime)
+    selected = _select_kids_shelves(
+        candidates,
+        profile=profile_row["slug"],
+        day=day,
+        now=day_boundary,
+    )
+    daily_slots = await runtime.db.kids_daily_library_get_or_create(
+        day=day,
+        profile=profile_row["slug"],
+        shelf_limit=_kids_shelf_limit(profile_row["slug"]),
+        proposed_item_ids={
+            shelf: [int(item["id"]) for item in selected[shelf]]
+            for shelf in KIDS_SHELF_NAMES
+        },
+    )
+    candidates_by_id = {int(item["id"]): item for item in candidates}
+    cooldown_after = day_boundary - KIDS_SHELF_COOLDOWN
+    base_url = str(request.base_url).rstrip("/")
+    shelf_items_by_name = {
+        shelf: [
+            item
+            for item_id in daily_slots[shelf]
+            if item_id is not None
+            and (item := candidates_by_id.get(int(item_id))) is not None
+            and _kids_shelf_candidate_allowed(
+                item,
+                profile=profile_row["slug"],
+                shelf=shelf,
+                cooldown_after=cooldown_after,
+            )
+        ]
+        for shelf in KIDS_SHELF_NAMES
+    }
+    item_ids = list(
+        dict.fromkeys(
+            int(item["id"])
+            for shelf in KIDS_SHELF_NAMES
+            for item in shelf_items_by_name[shelf]
+        )
+    )
+    assets_by_item_id: dict[int, dict[str, Any]] = {}
+    if item_ids:
+        session = await runtime.db.kids_feed_session_create(
+            profile=profile_row["slug"],
+            policy_version=KIDS_DATAPLANE_POLICY_VERSION,
+            minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+            minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+            ordered_item_ids=item_ids,
+        )
+        assets_by_item_id = {
+            int(item["item_id"]): item for item in session["items"]
+        }
+    response_shelves = []
+    for shelf in KIDS_SHELF_NAMES:
+        shelf_items = shelf_items_by_name[shelf]
+        response_shelves.append(
+            {
+                "id": shelf,
+                "icon": KIDS_SHELF_ICONS[shelf],
+                "items": [
+                    {
+                        "id": asset["asset_id"],
+                        "thumbnail_url": f"{base_url}/v1/kids/thumbnails/{asset['asset_id']}",
+                        "duration_seconds": asset["duration_seconds"],
+                        "visual_category": asset["visual_category"],
+                    }
+                    for item in shelf_items
+                    if (asset := assets_by_item_id.get(int(item["id"]))) is not None
+                ],
+            }
+        )
+    return {
+        "state": state,
+        "catalog_revision": str(await runtime.db.catalog_revision()),
+        "retry_after_seconds": 30,
+        "shelves": response_shelves,
     }
 
 
@@ -867,6 +1129,25 @@ async def api_kids_source_poster(
     if result is None:
         raise HTTPException(status_code=404, detail="catalog source not found")
     return _kids_source_poster_response(result)
+
+
+@router.put("/api/kids/sources/{source_id}/classification")
+async def api_kids_source_classification(
+    source_id: int,
+    payload: KidsSourceClassificationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    result = await request.app.state.runtime.db.catalog_source_classification_update(
+        source_id,
+        language=payload.language,
+        content_kind=payload.content_kind,
+        actor=payload.actor,
+        reason=payload.reason,
+        correlation_id=payload.correlation_id,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="catalog source not found")
+    return result
 
 
 @router.post("/api/kids/sources")

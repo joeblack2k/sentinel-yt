@@ -55,7 +55,7 @@ class Settings:
     )
     kids_ready_minimum: int = field(default_factory=lambda: int(os.getenv("KIDS_READY_MINIMUM", "18")))
     kids_channel_policy_version: str = field(
-        default_factory=lambda: os.getenv("KIDS_CHANNEL_POLICY_VERSION", "sampled-channel-v1").strip()
+        default_factory=lambda: os.getenv("KIDS_CHANNEL_POLICY_VERSION", "sampled-channel-v2-content-kind").strip()
     )
     kids_channel_recheck_seconds: int = field(
         default_factory=lambda: int(os.getenv("KIDS_CHANNEL_RECHECK_SECONDS", "604800"))

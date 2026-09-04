@@ -35,6 +35,7 @@ KIDS_CHANNEL_ART_HOSTS = frozenset(
     }
 )
 KIDS_VIDEO_THUMBNAIL_HOSTS = frozenset({"i.ytimg.com"})
+KIDS_SHELF_NAMES = ("learning", "fun", "again")
 
 
 def _profile_slugs(value: Any) -> list[str]:
@@ -398,15 +399,18 @@ class KidsDatabaseMixin:
                 raise ValueError("unknown Kids profile")
             if str(values["reference"]).strip() == KIDS_HOME_SOURCE_REFERENCE:
                 requested_profiles = []
+            content_kind = str(values.get("content_kind", "unknown") or "").strip().lower()
+            if content_kind not in {"learning", "entertainment", "mixed", "unknown"}:
+                raise ValueError("invalid source content kind")
         async with aiosqlite.connect(self.db_path) as db:
             revision = await self._catalog_revision(db)
             if entity == "source":
                 cur = await db.execute(
                     """
                     INSERT INTO catalog_sources(
-                        kind,reference,title,avatar_url,language,
+                        kind,reference,title,avatar_url,language,content_kind,
                         actor,changed_at,reason,revision,correlation_id
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         values["kind"],
@@ -414,6 +418,7 @@ class KidsDatabaseMixin:
                         values.get("title", "").strip(),
                         str(values.get("avatar_url", "") or "").strip()[:2000],
                         values.get("language", "unknown"),
+                        content_kind,
                         "system",
                         now,
                         "candidate created",
@@ -919,6 +924,7 @@ class KidsDatabaseMixin:
         actor: str,
         correlation_id: str,
         language: str = "unknown",
+        content_kind: str | None = None,
         policy_version: str = "",
         evidence: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
@@ -927,6 +933,12 @@ class KidsDatabaseMixin:
         language = language.strip().lower()
         if language not in {"nl", "en", "mixed", "unknown"}:
             raise ValueError("invalid source language")
+        if content_kind is not None:
+            if not isinstance(content_kind, str):
+                raise ValueError("invalid source content kind")
+            content_kind = content_kind.strip().lower()
+            if content_kind not in {"learning", "entertainment", "mixed", "unknown"}:
+                raise ValueError("invalid source content kind")
         verdict = verdict.strip().upper()
         if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
             raise ValueError("invalid source safety verdict")
@@ -935,22 +947,35 @@ class KidsDatabaseMixin:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 row = await (
-                    await db.execute("SELECT id FROM catalog_sources WHERE id=?", (source_id,))
+                    await db.execute(
+                        "SELECT id,content_kind FROM catalog_sources WHERE id=?",
+                        (source_id,),
+                    )
                 ).fetchone()
                 if not row:
                     await db.rollback()
                     return None
+                if content_kind is None:
+                    content_kind = str(row[1] or "unknown").strip().lower()
+                    if content_kind not in {
+                        "learning",
+                        "entertainment",
+                        "mixed",
+                        "unknown",
+                    }:
+                        content_kind = "unknown"
                 revision = await self._catalog_revision(db)
                 await db.execute(
                     """
                     UPDATE catalog_sources
-                    SET language=?, safety_verdict=?, safety_reason=?, safety_checked_at=?,
+                    SET language=?, content_kind=?, safety_verdict=?, safety_reason=?, safety_checked_at=?,
                         safety_policy_version=?, safety_evidence_json=?, safety_sample_count=?,
                         actor=?, changed_at=?, reason=?, revision=?, correlation_id=?
                     WHERE id=?
                     """,
                     (
                         language,
+                        content_kind,
                         verdict,
                         reason[:1000],
                         now,
@@ -999,6 +1024,74 @@ class KidsDatabaseMixin:
                 await db.rollback()
                 raise
         await self.kids_resolve_sync_backlog()
+        return await self.catalog_get("source", source_id)
+
+    async def catalog_source_classification_update(
+        self,
+        source_id: int,
+        *,
+        language: str,
+        content_kind: str,
+        actor: str,
+        reason: str,
+        correlation_id: str,
+    ) -> dict[str, Any] | None:
+        language = str(language).strip().lower()
+        content_kind = str(content_kind).strip().lower()
+        if language not in {"nl", "en", "mixed", "unknown"}:
+            raise ValueError("invalid source language")
+        if content_kind not in {"learning", "entertainment", "mixed", "unknown"}:
+            raise ValueError("invalid source content kind")
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute(
+                    "SELECT id FROM catalog_sources WHERE id=?",
+                    (source_id,),
+                )
+            ).fetchone()
+            if not row:
+                await db.rollback()
+                return None
+            revision = await self._catalog_revision(db)
+            await db.execute(
+                """
+                UPDATE catalog_sources
+                SET language=?,content_kind=?,actor=?,changed_at=?,reason=?,
+                    revision=?,correlation_id=?
+                WHERE id=?
+                """,
+                (
+                    language,
+                    content_kind,
+                    actor[:128],
+                    now,
+                    reason[:1000],
+                    revision,
+                    correlation_id[:128],
+                    source_id,
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO kids_audit_events(
+                    event,entity_type,entity_id,actor,reason,revision,
+                    correlation_id,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "source_classification_changed",
+                    "source",
+                    source_id,
+                    actor[:128],
+                    f"{language}/{content_kind}: {reason[:1000]}",
+                    revision,
+                    correlation_id[:128],
+                    now,
+                ),
+            )
+            await db.commit()
         return await self.catalog_get("source", source_id)
 
     async def catalog_item_refresh(
@@ -1110,14 +1203,31 @@ class KidsDatabaseMixin:
         minimum_remaining_seconds: int,
         minimum_quality_height: int = 720,
         profile: str = "noah",
+        *,
+        include_shelf_metadata: bool = False,
     ) -> list[dict[str, Any]]:
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 """
-                SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
+                SELECT i.*,
+                       (SELECT MAX(w.created_at)
+                        FROM kids_watch_events w
+                        WHERE w.video_id=i.video_id
+                          AND w.profile=?
+                          AND w.event='completed'
+                       ) AS _profile_completed_at,
+                       (SELECT MAX(w.created_at)
+                        FROM kids_watch_events w
+                        WHERE w.video_id=i.video_id
+                          AND w.profile=?
+                          AND w.event IN ('started', 'completed')
+                       ) AS _profile_history_at,
+                       s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
                        s.safety_verdict AS _source_safety_verdict,
+                       s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
                        b.candidate_json AS _candidate_json,b.quality_height AS _backlog_quality_height
                 FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
                 JOIN catalog_source_profiles ps
@@ -1135,6 +1245,8 @@ class KidsDatabaseMixin:
                 """,
                 (
                     profile,
+                    profile,
+                    profile,
                     KIDS_HOME_SOURCE_REFERENCE,
                     minimum_quality_height,
                     (datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat(),
@@ -1146,6 +1258,10 @@ class KidsDatabaseMixin:
         for row in rows:
             item, source, candidate_json = _catalog_row_context(row, cols)
             quality_height = item.pop("_backlog_quality_height", None)
+            profile_completed_at = item.pop("_profile_completed_at", None)
+            profile_history_at = item.pop("_profile_history_at", None)
+            source_language = item.pop("_source_language", None)
+            source_content_kind = item.pop("_source_content_kind", None)
             if (
                 _catalog_item_is_authorized(item, source)
                 and _stored_candidate_meets_policy(
@@ -1154,7 +1270,82 @@ class KidsDatabaseMixin:
                     minimum_quality_height,
                 )
             ):
+                if include_shelf_metadata:
+                    item["_source_language"] = source_language or "unknown"
+                    item["_source_content_kind"] = source_content_kind or "unknown"
+                    item["_profile_completed_at"] = profile_completed_at
+                    item["_profile_history_at"] = profile_history_at
                 result.append(item)
+        return result
+
+    async def kids_daily_library_get_or_create(
+        self,
+        *,
+        day: str,
+        profile: str,
+        shelf_limit: int,
+        proposed_item_ids: dict[str, list[int]],
+    ) -> dict[str, list[int | None]]:
+        limit = max(0, int(shelf_limit))
+        proposed = {
+            shelf: list(
+                dict.fromkeys(
+                    int(item_id) for item_id in proposed_item_ids.get(shelf, [])
+                )
+            )[:limit]
+            for shelf in KIDS_SHELF_NAMES
+        }
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                """
+                SELECT shelf,ordinal,item_id
+                FROM kids_daily_library
+                WHERE day=? AND profile=?
+                ORDER BY shelf ASC,ordinal ASC
+                """,
+                (day, profile),
+            )
+            existing: dict[str, list[int | None]] = {
+                shelf: [] for shelf in KIDS_SHELF_NAMES
+            }
+            for shelf, _ordinal, item_id in await cur.fetchall():
+                if shelf in existing:
+                    existing[shelf].append(
+                        int(item_id) if item_id is not None else None
+                    )
+            if all(
+                len(existing[shelf]) == limit
+                for shelf in KIDS_SHELF_NAMES
+            ):
+                result = existing
+            else:
+                await db.execute(
+                    "DELETE FROM kids_daily_library WHERE day=? AND profile=?",
+                    (day, profile),
+                )
+                for shelf in KIDS_SHELF_NAMES:
+                    await db.executemany(
+                        """
+                        INSERT INTO kids_daily_library(
+                            day,profile,shelf,ordinal,item_id,created_at
+                        ) VALUES(?,?,?,?,?,?)
+                        """,
+                        [
+                            (day, profile, shelf, ordinal, item_id, now)
+                            for ordinal, item_id in enumerate(
+                                proposed[shelf]
+                                + [None] * (limit - len(proposed[shelf]))
+                            )
+                        ],
+                    )
+                result = {
+                    shelf: proposed[shelf]
+                    + [None] * (limit - len(proposed[shelf]))
+                    for shelf in KIDS_SHELF_NAMES
+                }
+            await db.commit()
         return result
 
     async def kids_feed_session_create(
@@ -1167,6 +1358,7 @@ class KidsDatabaseMixin:
         expires_in_seconds: int = 4 * 60 * 60,
         include_items: bool = True,
         source_id: int | None = None,
+        ordered_item_ids: list[int] | None = None,
     ) -> dict[str, Any]:
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         now = datetime.now(timezone.utc)
@@ -1196,6 +1388,20 @@ class KidsDatabaseMixin:
                 if source_id is not None:
                     source_filter = " AND s.id=?"
                     source_args = (source_id,)
+                ordered_ids = (
+                    list(dict.fromkeys(int(item_id) for item_id in ordered_item_ids))
+                    if ordered_item_ids is not None
+                    else None
+                )
+                item_filter = ""
+                if ordered_ids is not None:
+                    item_filter = (
+                        " AND i.id IN ("
+                        + ",".join("?" for _ in ordered_ids)
+                        + ")"
+                        if ordered_ids
+                        else " AND 1=0"
+                    )
                 cur = await db.execute(
                     f"""
                     SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
@@ -1210,6 +1416,7 @@ class KidsDatabaseMixin:
                     WHERE i.state='approved' AND s.state='approved'
                       AND s.safety_verdict='SAFE' AND s.reference!=?
                       {source_filter}
+                      {item_filter}
                       AND b.status='ready' AND b.quality_height>=? AND b.expires_at>?
                     ORDER BY
                         ROW_NUMBER() OVER (
@@ -1222,13 +1429,24 @@ class KidsDatabaseMixin:
                         profile,
                         KIDS_HOME_SOURCE_REFERENCE,
                         *source_args,
+                        *(ordered_ids or ()),
                         minimum_quality_height,
                         expires_after,
                     ),
                 )
                 rows = await cur.fetchall()
                 columns = [description[0] for description in cur.description]
+                if ordered_ids is not None:
+                    item_order = {
+                        item_id: index for index, item_id in enumerate(ordered_ids)
+                    }
+                    rows.sort(
+                        key=lambda row: item_order.get(
+                            int(row[0]), len(item_order)
+                        )
+                    )
                 ordinal = 0
+                asset_items: list[dict[str, Any]] = []
                 for row in rows:
                     item, source, candidate_json = _catalog_row_context(row, columns)
                     quality_height = item.pop("_backlog_quality_height", None)
@@ -1241,15 +1459,30 @@ class KidsDatabaseMixin:
                         )
                     ):
                         continue
+                    asset_id = secrets.token_urlsafe(24)
                     await db.execute(
                         """
                         INSERT INTO feed_session_items(
                             feed_session_id,ordinal,item_id,asset_id
                         ) VALUES(?,?,?,?)
                         """,
-                        (session_id, ordinal, item["id"], secrets.token_urlsafe(24)),
+                        (session_id, ordinal, item["id"], asset_id),
+                    )
+                    asset_items.append(
+                        {
+                            "item_id": int(item["id"]),
+                            "asset_id": asset_id,
+                            "duration_seconds": max(
+                                0, int(item.get("duration_seconds", 0) or 0)
+                            ),
+                            "visual_category": str(
+                                item.get("visual_category") or "general"
+                            ),
+                        }
                     )
                     ordinal += 1
+            else:
+                asset_items = []
             await db.commit()
         return {
             "id": session_id,
@@ -1258,6 +1491,7 @@ class KidsDatabaseMixin:
             "policy_version": policy_version,
             "created_at": now_iso,
             "expires_at": expires_at,
+            "items": asset_items,
         }
 
     async def kids_feed_session_binding(self, session_id: str) -> dict[str, Any] | None:
