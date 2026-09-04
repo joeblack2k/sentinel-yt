@@ -2268,7 +2268,8 @@ class KidsDatabaseMixin:
     async def kids_resolve_sync_backlog(self, *, minimum_quality_height: int = 720) -> None:
         """Make eligibility changes immediately remove technical playback authority."""
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
-        now = utc_now_iso()
+        now_datetime = datetime.now(timezone.utc)
+        now = now_datetime.isoformat()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
@@ -2288,7 +2289,10 @@ class KidsDatabaseMixin:
             )
             cur = await db.execute(
                 """
-                SELECT b.item_id,b.status,b.candidate_json,b.quality_height AS _backlog_quality_height,
+                SELECT b.item_id,b.status,b.candidate_json,
+                       b.quality_height AS _backlog_quality_height,
+                       b.resolved_at AS _backlog_resolved_at,
+                       b.expires_at AS _backlog_expires_at,
                        i.*,s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
                        s.safety_verdict AS _source_safety_verdict
@@ -2305,9 +2309,11 @@ class KidsDatabaseMixin:
                 status = values["status"]
                 candidate_json = values["_candidate_json"] if "_candidate_json" in values else values["candidate_json"]
                 quality_height = values["_backlog_quality_height"]
+                resolved_at = _parse_utc(values["_backlog_resolved_at"])
                 item = {key: value for key, value in values.items() if key not in {
                     "item_id", "status", "candidate_json", "_candidate_json",
-                    "_backlog_quality_height",
+                    "_backlog_quality_height", "_backlog_resolved_at",
+                    "_backlog_expires_at",
                 }}
                 source = {
                     "kind": values.get("_source_kind"),
@@ -2340,21 +2346,47 @@ class KidsDatabaseMixin:
                         """,
                         (now, item_id),
                     )
-                elif status == "ready" and not _stored_candidate_meets_policy(
-                    candidate_json,
-                    quality_height,
-                    minimum_quality_height,
-                ):
-                    await db.execute(
-                        """
-                        UPDATE kids_resolve_backlog
-                        SET status='pending',candidate_json='',quality_height=NULL,codec='',
-                            resolved_at=NULL,expires_at=NULL,next_attempt_at=NULL,
-                            last_error_code='quality_below_policy',updated_at=?
-                        WHERE item_id=?
-                        """,
-                        (now, item_id),
+                elif status == "ready":
+                    try:
+                        candidate = json.loads(str(candidate_json))
+                    except (TypeError, json.JSONDecodeError):
+                        candidate = None
+                    usable_until = (
+                        kids_candidate_usable_until(
+                            candidate,
+                            now=now_datetime,
+                            resolved_at=resolved_at,
+                        )
+                        if resolved_at is not None
+                        else None
                     )
+                    if (
+                        usable_until is None
+                        or not _stored_candidate_meets_policy(
+                            candidate_json,
+                            quality_height,
+                            minimum_quality_height,
+                        )
+                    ):
+                        await db.execute(
+                            """
+                            UPDATE kids_resolve_backlog
+                            SET status='pending',candidate_json='',quality_height=NULL,codec='',
+                                resolved_at=NULL,expires_at=NULL,next_attempt_at=NULL,
+                                last_error_code='quality_below_policy',updated_at=?
+                            WHERE item_id=?
+                            """,
+                            (now, item_id),
+                        )
+                    elif _parse_utc(values["_backlog_expires_at"]) != usable_until:
+                        await db.execute(
+                            """
+                            UPDATE kids_resolve_backlog
+                            SET expires_at=?,updated_at=?
+                            WHERE item_id=?
+                            """,
+                            (usable_until.isoformat(), now, item_id),
+                        )
             await db.execute(
                 """
                 UPDATE relay_leases

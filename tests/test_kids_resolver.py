@@ -400,6 +400,46 @@ async def test_resolver_queue_persists_success_expiry_backoff_and_bounded_claim(
 
 
 @pytest.mark.asyncio
+async def test_backlog_sync_extends_legacy_ready_expiry_within_signed_limits(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    item = await eligible_item(db, "video-legacy-ttl")
+    resolved_at = datetime.now(timezone.utc)
+    signed_expiry = resolved_at + timedelta(hours=6)
+    candidate = {
+        "media_url": signed_url("video", signed_expiry),
+        "audio_url": signed_url("audio", signed_expiry),
+        "quality_height": 720,
+        "codec": "avc1.4d401f",
+        "video_headers": {},
+        "audio_headers": {},
+    }
+    await db.kids_resolve_success(
+        item_id=item["id"],
+        candidate=candidate,
+        quality_height=720,
+        codec="avc1.4d401f",
+        resolved_at=resolved_at.isoformat(),
+        expires_at=signed_expiry.isoformat(),
+    )
+    with sqlite3.connect(db.db_path) as connection:
+        connection.execute(
+            "UPDATE kids_resolve_backlog SET expires_at=? WHERE item_id=?",
+            ((resolved_at + timedelta(minutes=20)).isoformat(), item["id"]),
+        )
+        connection.commit()
+
+    await db.kids_resolve_sync_backlog(minimum_quality_height=720)
+
+    with sqlite3.connect(db.db_path) as connection:
+        stored_expiry = connection.execute(
+            "SELECT expires_at FROM kids_resolve_backlog WHERE item_id=?",
+            (item["id"],),
+        ).fetchone()[0]
+    assert datetime.fromisoformat(stored_expiry) == resolved_at + PRACTICAL_CANDIDATE_TTL
+
+
+@pytest.mark.asyncio
 async def test_resolver_claim_interleaves_unresolved_sources(tmp_path):
     db = Database(str(tmp_path / "sentinel.db"))
     await db.init()
