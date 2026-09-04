@@ -142,7 +142,7 @@ def _kids_lease_failure(result: dict[str, Any]) -> HTTPException:
     failure = result.get("status", "ineligible")
     if failure == "not_found":
         status_code = 404
-    elif failure in {"expired", "policy_mismatch", "stale_revision"}:
+    elif failure in {"expired", "policy_mismatch"}:
         status_code = 409
     else:
         status_code = 403

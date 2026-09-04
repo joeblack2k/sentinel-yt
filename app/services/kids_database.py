@@ -1924,8 +1924,7 @@ class KidsDatabaseMixin:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
                 """
-                SELECT f.feed_session_id,fs.profile,fs.catalog_revision,
-                       fs.policy_version,fs.expires_at,
+                SELECT f.feed_session_id,fs.profile,fs.policy_version,fs.expires_at,
                        i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,i.state,
                        s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
@@ -1957,13 +1956,6 @@ class KidsDatabaseMixin:
             if values["policy_version"] != policy_version:
                 await db.rollback()
                 return {"status": "policy_mismatch"}
-            revision_row = await (
-                await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")
-            ).fetchone()
-            revision = int(revision_row[0]) if revision_row else 0
-            if int(values["catalog_revision"]) != revision:
-                await db.rollback()
-                return {"status": "stale_revision"}
             kill_switch = await (
                 await db.execute(
                     "SELECT value FROM settings WHERE key='kids_kill_switch'"
