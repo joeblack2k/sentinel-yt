@@ -1320,6 +1320,27 @@ class KidsDatabaseMixin:
                 for shelf in KIDS_SHELF_NAMES
             ):
                 result = existing
+                for shelf in KIDS_SHELF_NAMES:
+                    unused = iter(
+                        item_id
+                        for item_id in proposed[shelf]
+                        if item_id not in result[shelf]
+                    )
+                    for ordinal, item_id in enumerate(result[shelf]):
+                        if item_id is not None:
+                            continue
+                        replacement = next(unused, None)
+                        if replacement is None:
+                            break
+                        result[shelf][ordinal] = replacement
+                        await db.execute(
+                            """
+                            UPDATE kids_daily_library
+                            SET item_id=?
+                            WHERE day=? AND profile=? AND shelf=? AND ordinal=?
+                            """,
+                            (replacement, day, profile, shelf, ordinal),
+                        )
             else:
                 await db.execute(
                     "DELETE FROM kids_daily_library WHERE day=? AND profile=?",

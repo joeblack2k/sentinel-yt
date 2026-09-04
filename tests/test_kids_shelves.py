@@ -536,6 +536,48 @@ def test_again_history_is_profile_bound_and_accepts_started(tmp_path, monkeypatc
         assert _asset_item_ids(db_path, felix.json())["again"] == []
 
 
+def test_shelves_fill_initially_empty_daily_slots_without_reordering(tmp_path, monkeypatch):
+    db_path = tmp_path / "sentinel.db"
+    db = asyncio.run(_seed_shelf_catalog(db_path, []))
+    module = _load_app(tmp_path, monkeypatch)
+    _mock_upstream(monkeypatch, module, [])
+
+    with TestClient(module.app) as client:
+        empty = client.get("/v1/kids/shelves", params={"profile": "noah"})
+        assert empty.status_code == 200
+        assert _asset_item_ids(db_path, empty.json())["learning"] == []
+
+        first_items = [
+            asyncio.run(
+                _ready_item(
+                    db,
+                    index,
+                    language="nl",
+                    content_kind="learning",
+                    profile_slugs=["noah"],
+                )
+            )[1]
+            for index in range(1, 4)
+        ]
+        filled = client.get("/v1/kids/shelves", params={"profile": "noah"})
+        filled_ids = _asset_item_ids(db_path, filled.json())["learning"]
+        assert set(filled_ids) == {item["id"] for item in first_items}
+
+        asyncio.run(
+            _ready_item(
+                db,
+                4,
+                language="nl",
+                content_kind="learning",
+                profile_slugs=["noah"],
+            )
+        )
+        extended = client.get("/v1/kids/shelves", params={"profile": "noah"})
+        extended_ids = _asset_item_ids(db_path, extended.json())["learning"]
+        assert extended_ids[: len(filled_ids)] == filled_ids
+        assert len(extended_ids) == len(filled_ids) + 1
+
+
 def test_shelves_keep_materialized_gaps_after_revoke_and_block(tmp_path, monkeypatch):
     db_path = tmp_path / "sentinel.db"
     specs = [
