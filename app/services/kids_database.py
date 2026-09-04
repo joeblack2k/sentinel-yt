@@ -726,6 +726,88 @@ class KidsDatabaseMixin:
                 raise
         return await self.kids_source_poster_state(source_id)
 
+    async def catalog_source_avatar_update(
+        self,
+        source_id: int,
+        avatar_url: str,
+        *,
+        actor: str,
+        reason: str,
+        correlation_id: str,
+    ) -> dict[str, Any] | None:
+        avatar_url = str(avatar_url or "").strip()
+        if not _kids_channel_avatar_is_proxyable(avatar_url):
+            raise ValueError("channel avatar URL is not trusted")
+        if len(avatar_url) > 2000:
+            raise ValueError("channel avatar URL is too long")
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                row = await (
+                    await db.execute(
+                        """
+                        SELECT kind,reference,state,avatar_url
+                        FROM catalog_sources WHERE id=?
+                        """,
+                        (source_id,),
+                    )
+                ).fetchone()
+                if row is None:
+                    await db.rollback()
+                    return None
+                kind, reference, state, current_avatar_url = row
+                if (
+                    kind != "channel"
+                    or reference == KIDS_HOME_SOURCE_REFERENCE
+                    or state not in {"candidate", "approved"}
+                ):
+                    raise ValueError("catalog source is not eligible for avatar recovery")
+                if str(current_avatar_url or "").strip() == avatar_url:
+                    await db.rollback()
+                else:
+                    revision = await self._catalog_revision(db)
+                    await db.execute(
+                        """
+                        UPDATE catalog_sources
+                        SET avatar_url=?,actor=?,changed_at=?,reason=?,
+                            revision=?,correlation_id=?
+                        WHERE id=?
+                        """,
+                        (
+                            avatar_url,
+                            actor,
+                            now,
+                            reason[:1000],
+                            revision,
+                            correlation_id,
+                            source_id,
+                        ),
+                    )
+                    await db.execute(
+                        """
+                        INSERT INTO kids_audit_events(
+                            event,entity_type,entity_id,actor,reason,revision,
+                            correlation_id,created_at
+                        ) VALUES(?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            "source_avatar_changed",
+                            "source",
+                            source_id,
+                            actor,
+                            reason[:1000],
+                            revision,
+                            correlation_id,
+                            now,
+                        ),
+                    )
+                    await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return await self.catalog_get("source", source_id)
+
     async def catalog_transition(
         self,
         entity: str,
@@ -1256,6 +1338,8 @@ class KidsDatabaseMixin:
                 backlog_quality_height,
                 backlog_expires_at,
             ) = row
+            if not _kids_channel_avatar_is_proxyable(avatar_url):
+                continue
             item = {
                 "id": item_id,
                 "state": item_state,

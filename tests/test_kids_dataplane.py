@@ -12,6 +12,7 @@ from app.db import Database
 
 CHANNEL_ID = f"UC{'a' * 22}"
 SECONDARY_CHANNEL_ID = f"UC{'b' * 22}"
+GENUINE_AVATAR = "https://yt3.ggpht.com/channel/avatar=s176-c-k-c0x00ffffff-no-rj"
 
 
 def signed_url(kind: str, expires_at: datetime) -> str:
@@ -41,6 +42,7 @@ async def seed_catalog(db_path, *, qualities=(720, 1080)) -> Database:
             "kind": "channel",
             "reference": CHANNEL_ID,
             "title": "Sentinel test source",
+            "avatar_url": GENUINE_AVATAR,
             "correlation_id": "dataplane-source",
         },
     )
@@ -125,6 +127,7 @@ async def add_ready_source_item(
             "kind": kind,
             "reference": reference,
             "title": f"Secondary {suffix}",
+            "avatar_url": GENUINE_AVATAR,
             "correlation_id": f"secondary-source-{suffix}",
         },
     )
@@ -441,7 +444,7 @@ def test_channels_are_sanitized_and_isolated_by_profile(tmp_path, monkeypatch):
         noah_channel = noah.json()["channels"]
         felix_channel = felix.json()["channels"]
         assert len(noah_channel) == 1
-        assert len(felix_channel) == 1
+        assert felix_channel == []
         assert set(noah_channel[0]) == {
             "id",
             "poster_background_url",
@@ -456,14 +459,6 @@ def test_channels_are_sanitized_and_isolated_by_profile(tmp_path, monkeypatch):
             "http://testserver/v1/kids/channels/"
         )
         assert "?profile=noah&v=" in noah_channel[0]["poster_background_url"]
-        assert felix_channel[0]["avatar_url"] is None
-        assert (
-            client.get(
-                felix_channel[0]["poster_background_url"],
-                params={"profile": "felix"},
-            ).status_code
-            == 200
-        )
 
 
 def test_fresh_channel_responses_shuffle_the_eligible_order(tmp_path, monkeypatch):
@@ -485,7 +480,7 @@ def test_fresh_channel_responses_shuffle_the_eligible_order(tmp_path, monkeypatc
     assert len(observed_orders) > 1
 
 
-def test_channels_exclude_unready_sources_and_reject_untrusted_avatar(tmp_path, monkeypatch):
+def test_channels_omit_missing_genuine_avatar_without_video_fallback(tmp_path, monkeypatch):
     db_path = tmp_path / "sentinel.db"
     db = asyncio.run(seed_catalog(db_path, qualities=(720,)))
     unsafe_source = asyncio.run(
@@ -554,7 +549,7 @@ def test_channels_exclude_unready_sources_and_reject_untrusted_avatar(tmp_path, 
     with sqlite3.connect(db_path) as connection:
         connection.execute(
             "UPDATE catalog_sources SET avatar_url=? WHERE id=?",
-            ("https://not-google.example/avatar.jpg", primary_source["id"]),
+            ("", primary_source["id"]),
         )
         connection.commit()
     module = load_app(tmp_path, monkeypatch)
@@ -563,16 +558,7 @@ def test_channels_exclude_unready_sources_and_reject_untrusted_avatar(tmp_path, 
     with TestClient(module.app) as client:
         payload = client.get("/v1/kids/channels", params={"profile": "noah"}).json()
         assert payload["state"] == "ready"
-        assert len(payload["channels"]) == 1
-        assert payload["channels"][0]["avatar_url"] is None
-        assert (
-            client.get(
-                f"{payload['channels'][0]['poster_background_url']}"
-                .replace("/artwork/background", "/artwork/avatar"),
-                params={"profile": "noah"},
-            ).status_code
-            == 404
-        )
+        assert payload["channels"] == []
     assert unsafe_source["id"] != primary_source["id"]
 
 

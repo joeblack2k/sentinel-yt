@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sys
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -17,6 +18,7 @@ from ..config import Settings
 from ..db import Database, utc_now_iso
 from .blocklists import BlocklistService
 from .kids_classifier import KidsClassificationError, OpenCodexKidsClassifier
+from .kids_database import _kids_channel_avatar_is_proxyable
 from .judge import JudgeService
 
 logger = logging.getLogger("sentinel.kids_ingest")
@@ -31,6 +33,8 @@ _CHANNEL_FROM_LABEL = re.compile(r"\sby\s(.+?)(?:\s[\d,]+ views|\s\d+ views|\s*$
 _MAX_COLLECTED_CARDS = 160
 _MAX_CARDS_PER_DISCOVERY_BUCKET = _MAX_COLLECTED_CARDS // 4
 _MAX_SCROLL_STEPS = 12
+_MAX_AVATAR_BACKFILL_ATTEMPTS = 8
+_CHANNEL_AVATAR_TIMEOUT_SECONDS = 12.0
 _SEARCH_TERMS = (
     "animals",
     "dieren",
@@ -131,6 +135,164 @@ def channel_id_from_reference(reference: str) -> str:
         if len(parts) == 2 and parts[0] == "channel":
             return parts[1]
     return raw
+
+
+def extract_channel_avatar_url(metadata: dict[str, Any], channel_id: str) -> str | None:
+    if not isinstance(channel_id, str) or not _CHANNEL_ID.fullmatch(channel_id):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    returned_ids = {
+        str(metadata.get(key) or "").strip()
+        for key in ("channel_id", "id")
+    }
+    if channel_id not in returned_ids:
+        return None
+    thumbnails = metadata.get("thumbnails")
+    if not isinstance(thumbnails, list):
+        return None
+    candidates: list[tuple[int, str]] = []
+    for thumbnail in thumbnails:
+        if not isinstance(thumbnail, dict):
+            continue
+        width = thumbnail.get("width")
+        height = thumbnail.get("height")
+        url = str(thumbnail.get("url") or "").strip()
+        if (
+            type(width) is not int
+            or type(height) is not int
+            or width <= 0
+            or width != height
+            or not _kids_channel_avatar_is_proxyable(url)
+        ):
+            continue
+        candidates.append((width, url))
+    return max(candidates, default=(0, ""), key=lambda item: (item[0], item[1]))[1] or None
+
+
+async def fetch_channel_avatar_url(
+    channel_id: str,
+    *,
+    timeout_seconds: float = _CHANNEL_AVATAR_TIMEOUT_SECONDS,
+) -> str | None:
+    if not isinstance(channel_id, str) or not _CHANNEL_ID.fullmatch(channel_id):
+        return None
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--flat-playlist",
+        "--playlist-end",
+        "1",
+        "--dump-single-json",
+        "--skip-download",
+        "--no-warnings",
+        f"https://www.youtube.com/channel/{urllib.parse.quote(channel_id, safe='')}",
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=max(0.001, float(timeout_seconds)),
+        )
+        if process.returncode:
+            return None
+        for line in stdout.decode(errors="replace").splitlines():
+            try:
+                metadata = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(metadata, dict):
+                return extract_channel_avatar_url(metadata, channel_id)
+        return None
+    finally:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await process.wait()
+            except ProcessLookupError:
+                pass
+
+
+def _missing_avatar_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            source
+            for source in sources
+            if source.get("reference") != HOME_SOURCE_REFERENCE
+            and source.get("state") == "approved"
+            and source.get("safety_verdict") == "SAFE"
+            and not _kids_channel_avatar_is_proxyable(source.get("genuine_avatar_url"))
+            and _CHANNEL_ID.fullmatch(
+                channel_id_from_reference(str(source.get("reference") or ""))
+            )
+        ),
+        key=lambda source: int(source["id"]),
+    )
+
+
+async def backfill_channel_avatars(
+    db: Database,
+    *,
+    limit: int = _MAX_AVATAR_BACKFILL_ATTEMPTS,
+) -> int:
+    sources = _missing_avatar_sources(
+        await db.catalog_sources_list(kind="channel", sort="id-asc")
+    )
+    if not sources:
+        return 0
+    try:
+        offset = max(0, int((await db.get_setting("kids_avatar_backfill_offset")) or "0"))
+    except (TypeError, ValueError):
+        offset = 0
+    offset %= len(sources)
+    batch_size = max(0, min(int(limit), _MAX_AVATAR_BACKFILL_ATTEMPTS))
+    batch = (sources[offset:] + sources[:offset])[:batch_size]
+    attempts = 0
+    for source in batch:
+        attempts += 1
+        try:
+            avatar_url = await fetch_channel_avatar_url(
+                channel_id_from_reference(str(source["reference"]))
+            )
+            if avatar_url:
+                await db.catalog_source_avatar_update(
+                    int(source["id"]),
+                    avatar_url,
+                    actor="kids-ingest",
+                    reason="Recovered trusted channel avatar",
+                    correlation_id=f"kids-channel-avatar-{source['id']}",
+                )
+        except Exception:
+            logger.warning(
+                "Could not recover channel avatar source_id=%s",
+                source.get("id"),
+                exc_info=True,
+            )
+    remaining = _missing_avatar_sources(
+        await db.catalog_sources_list(kind="channel", sort="id-asc")
+    )
+    last_source_id = int(batch[-1]["id"]) if batch else 0
+    next_offset = next(
+        (
+            index
+            for index, source in enumerate(remaining)
+            if int(source["id"]) > last_source_id
+        ),
+        0,
+    )
+    await db.set_setting(
+        "kids_avatar_backfill_offset",
+        str(next_offset),
+    )
+    return attempts
 
 
 def channel_evidence(cards: list[dict[str, Any]], *, channel_id: str, limit: int) -> list[dict[str, Any]]:
@@ -608,6 +770,7 @@ async def ingest_once(
     channel_recheck_seconds: int = 604800,
     channel_sample_size: int = 8,
     source_batch_size: int | None = None,
+    avatar_backfill_limit: int = _MAX_AVATAR_BACKFILL_ATTEMPTS,
     judge: JudgeService | None = None,
 ) -> IngestReport:
     report = IngestReport()
@@ -635,6 +798,7 @@ async def ingest_once(
                 "correlation_id": "kids-home-approved",
             },
         )
+    await backfill_channel_avatars(db, limit=avatar_backfill_limit)
     raw_cards: list[dict[str, Any]] = []
     if home_source.get("state") == "approved":
         try:
@@ -993,6 +1157,10 @@ async def _main() -> None:
             channel_recheck_seconds=settings.kids_channel_recheck_seconds,
             channel_sample_size=settings.kids_channel_sample_size,
             source_batch_size=max(1, int(os.getenv("KIDS_INGEST_SOURCE_BATCH_SIZE", "12"))),
+            avatar_backfill_limit=max(
+                0,
+                min(_MAX_AVATAR_BACKFILL_ATTEMPTS, int(os.getenv("KIDS_INGEST_AVATAR_BATCH_SIZE", "8"))),
+            ),
             judge=judge,
         )
         if report.errors == 0:

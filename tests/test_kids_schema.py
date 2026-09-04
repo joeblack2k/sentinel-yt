@@ -142,6 +142,47 @@ async def test_kids_schema_init_is_idempotent_with_language_and_defaults(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_catalog_source_avatar_update_persists_revision_and_audit(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": "UC" + "a" * 22,
+            "title": "Avatar source",
+            "correlation_id": "avatar-source",
+        },
+    )
+    before_revision = await db.catalog_revision()
+    avatar_url = "https://yt4.googleusercontent.com/channel/avatar=s176-c-k-c0x00ffffff-no-rj"
+    updated = await db.catalog_source_avatar_update(
+        source["id"],
+        avatar_url,
+        actor="kids-ingest",
+        reason="Recovered trusted channel avatar",
+        correlation_id="avatar-update-1",
+    )
+
+    assert updated["avatar_url"] == avatar_url
+    assert updated["revision"] == before_revision + 1
+    event = next(event for event in await db.kids_audit_events() if event["event"] == "source_avatar_changed")
+    assert event["entity_id"] == source["id"]
+    assert event["revision"] == before_revision + 1
+    assert event["actor"] == "kids-ingest"
+    assert event["correlation_id"] == "avatar-update-1"
+
+    with pytest.raises(ValueError, match="trusted"):
+        await db.catalog_source_avatar_update(
+            source["id"],
+            "https://example.test/avatar.jpg",
+            actor="kids-ingest",
+            reason="Reject untrusted artwork",
+            correlation_id="avatar-invalid",
+        )
+
+
+@pytest.mark.asyncio
 async def test_kids_schema_migrates_feed_source_columns_without_backfill(tmp_path):
     db = Database(str(tmp_path / "sentinel.db"))
     await db.init()

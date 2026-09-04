@@ -1,10 +1,12 @@
 import asyncio
 import json
 import sqlite3
+import sys
 from dataclasses import dataclass
 
 import pytest
 
+import app.services.kids_ingest as kids_ingest
 from app.config import Settings
 from app.db import Database
 from app.services.blocklists import BlocklistService
@@ -13,6 +15,9 @@ from app.services.kids_ingest import (
     HOME_SOURCE_REFERENCE,
     KidsBrowserSetupRequired,
     YouTubeKidsCDP,
+    backfill_channel_avatars,
+    extract_channel_avatar_url,
+    fetch_channel_avatar_url,
     ingest_once,
     parse_cards,
     source_url,
@@ -39,6 +44,68 @@ def test_channel_reference_normalization_and_discovery_id_validation():
         f"https://www.youtubekids.com/channel/{channel_id}"
     ) == channel_id
     assert not _CHANNEL_ID.fullmatch("UC123")
+
+
+def test_extract_channel_avatar_url_requires_matching_identity_and_trusted_square_thumbnail():
+    channel_id = "UC" + "a" * 22
+    trusted_small = "https://yt3.ggpht.com/avatar=s88"
+    trusted_large = "https://yt4.googleusercontent.com/avatar=s176"
+    metadata = {
+        "channel_id": channel_id,
+        "thumbnails": [
+            {"url": trusted_small, "width": 88, "height": 88},
+            {"url": trusted_large, "width": 176, "height": 176},
+            {"url": "https://example.test/avatar=s2048", "width": 2048, "height": 2048},
+            {"url": trusted_large, "width": 176, "height": 88},
+        ],
+    }
+
+    assert extract_channel_avatar_url(metadata, channel_id) == trusted_large
+    assert extract_channel_avatar_url({**metadata, "channel_id": "UC" + "b" * 22}, channel_id) is None
+    assert extract_channel_avatar_url(metadata, "UC123") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_avatar_url_uses_bounded_ytdlp_channel_metadata_command(monkeypatch):
+    channel_id = "UC" + "c" * 22
+    avatar_url = "https://yt3.ggpht.com/channel/avatar=s176-c-k-c0x00ffffff-no-rj"
+    commands: list[tuple[str, ...]] = []
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            return json.dumps(
+                {
+                    "channel_id": channel_id,
+                    "thumbnails": [{"url": avatar_url, "width": 176, "height": 176}],
+                }
+            ).encode(), b""
+
+        async def wait(self):
+            return None
+
+    async def create_process(*command, **kwargs):
+        assert kwargs["stdout"] is asyncio.subprocess.PIPE
+        assert kwargs["stderr"] is asyncio.subprocess.PIPE
+        commands.append(command)
+        return Process()
+
+    monkeypatch.setattr(kids_ingest.asyncio, "create_subprocess_exec", create_process)
+
+    assert await fetch_channel_avatar_url(channel_id, timeout_seconds=0.1) == avatar_url
+    assert commands[0][:9] == (
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--flat-playlist",
+        "--playlist-end",
+        "1",
+        "--dump-single-json",
+        "--skip-download",
+        "--no-warnings",
+    )
+    assert commands[0][-1] == f"https://www.youtube.com/channel/{channel_id}"
 
 
 def test_parse_cards_rejects_shorts_bad_host_and_missing_duration():
@@ -886,6 +953,52 @@ class FakeClassifier:
 
 
 @pytest.mark.asyncio
+async def test_backfill_channel_avatars_is_bounded_and_only_processes_safe_approved(monkeypatch):
+    avatar_url = "https://yt3.ggpht.com/avatar=s88-c-k-c0x00ffffff-no-rj"
+    channel_ids = [f"UC{index:022d}" for index in range(1, 12)]
+    sources = [
+        {
+            "id": index,
+            "kind": "channel",
+            "reference": channel_id,
+            "state": "approved" if index <= 10 else "candidate",
+            "safety_verdict": "SAFE" if index <= 10 else "UNCERTAIN",
+            "genuine_avatar_url": "",
+        }
+        for index, channel_id in enumerate(channel_ids, 1)
+    ]
+    calls: list[str] = []
+
+    async def fake_fetch(channel_id):
+        calls.append(channel_id)
+        return avatar_url
+
+    class FakeDB:
+        offset = None
+
+        async def catalog_sources_list(self, **_kwargs):
+            return sources
+
+        async def catalog_source_avatar_update(self, source_id, *_args, **_kwargs):
+            sources[source_id - 1]["genuine_avatar_url"] = avatar_url
+
+        async def get_setting(self, _key):
+            return self.offset
+
+        async def set_setting(self, _key, value):
+            self.offset = value
+
+    monkeypatch.setattr(kids_ingest, "fetch_channel_avatar_url", fake_fetch)
+
+    db = FakeDB()
+    assert await backfill_channel_avatars(db, limit=99) == 8
+    assert db.offset == "0"
+    assert await backfill_channel_avatars(db, limit=99) == 2
+    assert calls == channel_ids[:10]
+    assert sources[-1]["genuine_avatar_url"] == ""
+
+
+@pytest.mark.asyncio
 async def test_ingest_only_publishes_safe_decisions(tmp_path):
     db = Database(str(tmp_path / "sentinel.db"))
     await db.init()
@@ -937,6 +1050,75 @@ async def test_ingest_only_publishes_safe_decisions(tmp_path):
     )
     report = await ingest_once(db, FakeBrowser(), FakeClassifier("SAFE"))
     assert report.skipped == 1
+    assert await db.catalog_items_list() == []
+
+
+@pytest.mark.asyncio
+async def test_artwork_failure_is_fail_open_but_uncertain_safety_stays_hidden(
+    tmp_path, monkeypatch
+):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    channel_id = "UC" + "e" * 22
+    source = await db.catalog_create(
+        "source",
+        {
+            "kind": "channel",
+            "reference": channel_id,
+            "title": "Candidate channel",
+            "correlation_id": "source-artwork-failure",
+        },
+    )
+    source = await db.catalog_source_safety_update(
+        source["id"],
+        verdict="SAFE",
+        reason="test",
+        actor="test",
+        correlation_id="source-artwork-safe",
+    )
+    source = await db.catalog_transition(
+        "source",
+        source["id"],
+        {
+            "state": "approved",
+            "actor": "test",
+            "reason": "test",
+            "correlation_id": "source-artwork-approved",
+        },
+    )
+    events: list[str] = []
+    cards = [
+        {
+            "href": "/watch?v=abcdefghijk",
+            "title": "Candidate video",
+            "label": "Candidate video by Candidate channel 10 views",
+            "duration": "5:00",
+            "thumbnail_url": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg",
+            "channel_id": channel_id,
+        }
+    ]
+
+    class Browser:
+        async def cards_for_source(self, _kind, reference):
+            events.append(f"browser:{reference}")
+            return [] if reference == HOME_SOURCE_REFERENCE else cards
+
+    async def failed_fetch(_channel_id):
+        events.append("artwork")
+        raise RuntimeError("artwork unavailable")
+
+    monkeypatch.setattr(kids_ingest, "fetch_channel_avatar_url", failed_fetch)
+
+    report = await ingest_once(
+        db,
+        Browser(),
+        FakeClassifier("UNKNOWN"),
+        avatar_backfill_limit=1,
+    )
+
+    assert report.errors == 0
+    assert events == ["artwork", f"browser:{HOME_SOURCE_REFERENCE}", f"browser:{channel_id}"]
+    assert (await db.catalog_get("source", source["id"]))["state"] == "approved"
     assert await db.catalog_items_list() == []
 
 
