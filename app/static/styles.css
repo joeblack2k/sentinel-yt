@@ -972,6 +972,9 @@ button:active, .btn:active { transform: translateY(1px); }
 .table-wrap {
   overflow-x: auto;
 }
+.table-wrap table {
+  min-width: 1300px;
+}
 
 .cell-wrap {
   overflow-wrap: anywhere;
@@ -1222,13 +1225,6 @@ button:active, .btn:active { transform: translateY(1px); }
   gap: 8px;
 }
 
-.source-row {
-  display: grid;
-  grid-template-columns: 100px 1fr 68px;
-  gap: 6px;
-  align-items: center;
-}
-
 .source-label {
   font-size: 12px;
   font-weight: 700;
@@ -1322,10 +1318,7 @@ button:active, .btn:active { transform: translateY(1px); }
     width: min(320px, 100%);
     max-height: 350px;
   }
-  .source-row {
-    grid-template-columns: 1fr;
-    gap: 4px;
-  }
+
   .source-meta {
     text-align: left;
   }
