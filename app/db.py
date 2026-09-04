@@ -183,7 +183,7 @@ class Database(KidsDatabaseMixin):
                 CREATE TABLE IF NOT EXISTS kids_daily_library (
                     day TEXT NOT NULL,
                     profile TEXT NOT NULL,
-                    shelf TEXT NOT NULL CHECK(shelf IN ('learning', 'fun', 'again')),
+                    shelf TEXT NOT NULL,
                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
                     item_id INTEGER REFERENCES catalog_items(id) ON DELETE SET NULL,
                     created_at TEXT NOT NULL,
@@ -362,6 +362,31 @@ class Database(KidsDatabaseMixin):
             feed_session_cols = {row[1] for row in await cur.fetchall()}
             if "source_id" not in feed_session_cols:
                 await db.execute("ALTER TABLE feed_sessions ADD COLUMN source_id INTEGER")
+
+            cur = await db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='kids_daily_library'"
+            )
+            daily_schema_row = await cur.fetchone()
+            daily_schema = str(daily_schema_row[0] or "").lower() if daily_schema_row else ""
+            if "shelf in ('learning', 'fun', 'again')" in daily_schema:
+                # Daily shelves are derived and their old names no longer map cleanly.
+                await db.execute(
+                    "ALTER TABLE kids_daily_library RENAME TO kids_daily_library_legacy"
+                )
+                await db.execute(
+                    """
+                    CREATE TABLE kids_daily_library (
+                        day TEXT NOT NULL,
+                        profile TEXT NOT NULL,
+                        shelf TEXT NOT NULL,
+                        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                        item_id INTEGER REFERENCES catalog_items(id) ON DELETE SET NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(day, profile, shelf, ordinal)
+                    ) WITHOUT ROWID
+                    """
+                )
+                await db.execute("DROP TABLE kids_daily_library_legacy")
 
             await db.commit()
 

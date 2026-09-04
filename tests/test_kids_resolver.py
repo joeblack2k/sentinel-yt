@@ -368,10 +368,10 @@ async def test_resolver_queue_persists_success_expiry_backoff_and_bounded_claim(
 
     claimed = await db.kids_resolve_claim_due(limit=2, refresh_margin_seconds=1800)
     assert [row["video_id"] for row in claimed] == ["video-one", "video-two"]
-    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
     candidate = {
-        "media_url": signed_url("video", datetime.now(timezone.utc) + timedelta(minutes=10)),
-        "audio_url": signed_url("audio", datetime.now(timezone.utc) + timedelta(minutes=10)),
+        "media_url": signed_url("video", datetime.now(timezone.utc) + timedelta(hours=6)),
+        "audio_url": signed_url("audio", datetime.now(timezone.utc) + timedelta(hours=6)),
         "quality_height": 720,
         "codec": "avc1.4d401f",
         "video_headers": {},
@@ -773,7 +773,7 @@ async def test_feed_orders_newly_probed_candidates_first(tmp_path):
     older = await eligible_item(db, "video-older")
     newer = await eligible_item(db, "video-newer")
     await db.kids_resolve_claim_due(limit=2, refresh_margin_seconds=300)
-    expiry = datetime.now(timezone.utc) + timedelta(minutes=15)
+    expiry = datetime.now(timezone.utc) + timedelta(hours=6)
     candidate = {
         "media_url": signed_url("video", expiry),
         "audio_url": signed_url("audio", expiry),

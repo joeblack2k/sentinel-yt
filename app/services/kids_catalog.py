@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse, urlsplit
 
 
 KIDS_HOME_SOURCE_REFERENCE = "__youtube_kids_home__"
+KIDS_PRACTICAL_CANDIDATE_TTL = timedelta(hours=5)
+KIDS_SIGNED_URL_MARGIN = timedelta(minutes=15)
+KIDS_MIN_RELAY_LIFETIME = timedelta(seconds=120)
 
 
 def _source_channel_id(kind: Any, reference: Any) -> str | None:
@@ -93,6 +96,14 @@ def _stored_candidate_meets_policy(
         return False
     media_url = candidate.get("media_url")
     audio_url = candidate.get("audio_url")
+    expiries = [_signed_stream_expiry(media_url), _signed_stream_expiry(audio_url)]
+    if any(expiry is None for expiry in expiries):
+        return False
+    usable_after = (
+        datetime.now(timezone.utc)
+        + KIDS_MIN_RELAY_LIFETIME
+        + KIDS_SIGNED_URL_MARGIN
+    )
     return (
         type(candidate.get("quality_height")) is int
         and candidate["quality_height"] == quality_height
@@ -101,6 +112,61 @@ def _stored_candidate_meets_policy(
         and isinstance(audio_url, str)
         and bool(audio_url)
         and media_url != audio_url
+        and all(expiry > usable_after for expiry in expiries if expiry is not None)
+    )
+
+
+def _signed_stream_expiry(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower()
+    query = parse_qs(parsed.query)
+    if (
+        parsed.scheme != "https"
+        or (host != "googlevideo.com" and not host.endswith(".googlevideo.com"))
+        or not query.get("expire")
+        or not any(query.get(key) for key in ("sig", "signature", "lsig"))
+    ):
+        return None
+    try:
+        return datetime.fromtimestamp(int(query["expire"][0]), timezone.utc)
+    except (KeyError, TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def kids_candidate_usable_until(
+    candidate: Any,
+    *,
+    now: datetime,
+    resolved_at: datetime,
+) -> datetime | None:
+    if not isinstance(candidate, dict):
+        return None
+    expiries = [
+        _signed_stream_expiry(candidate.get("media_url")),
+        _signed_stream_expiry(candidate.get("audio_url")),
+    ]
+    if any(expiry is None for expiry in expiries):
+        return None
+    current = (
+        now.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None
+        else now.astimezone(timezone.utc)
+    )
+    resolved = (
+        resolved_at.replace(tzinfo=timezone.utc)
+        if resolved_at.tzinfo is None
+        else resolved_at.astimezone(timezone.utc)
+    )
+    usable_until = min(
+        resolved + KIDS_PRACTICAL_CANDIDATE_TTL,
+        *(expiry - KIDS_SIGNED_URL_MARGIN for expiry in expiries if expiry is not None),
+    )
+    return (
+        usable_until
+        if usable_until >= current + KIDS_MIN_RELAY_LIFETIME
+        else None
     )
 
 

@@ -1081,7 +1081,7 @@ def test_lease_recheck_uses_current_quality_policy(tmp_path, monkeypatch):
     assert reason == "catalog_ineligible"
 
 
-def test_revision_change_invalidates_cursor_but_not_current_authorized_asset(
+def test_catalog_addition_keeps_cursor_and_current_authorized_asset_valid(
     tmp_path, monkeypatch
 ):
     db_path = tmp_path / "sentinel.db"
@@ -1105,11 +1105,12 @@ def test_revision_change_invalidates_cursor_but_not_current_authorized_asset(
                 },
             )
         )
-        stale = client.get(
+        continued = client.get(
             "/v1/kids/feed",
             params={"cursor": first["next_cursor"], "limit": 1},
         )
-        assert stale.status_code == 409
+        assert continued.status_code == 200
+        assert client.get(first["items"][0]["thumbnail_url"]).status_code == 200
         assert client.post(
             "/v1/kids/playback-sessions",
             json={"asset_id": first["items"][0]["id"]},

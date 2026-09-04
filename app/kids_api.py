@@ -31,7 +31,6 @@ from .models import (
 from .services.kids_classifier import OpenCodexKidsClassifier
 from .services.kids_database import (
     KIDS_CHANNEL_ART_HOSTS,
-    KIDS_SHELF_NAMES,
     KIDS_VIDEO_THUMBNAIL_HOSTS,
     _kids_channel_avatar_is_proxyable,
 )
@@ -42,10 +41,19 @@ KIDS_DATAPLANE_POLICY_VERSION = "sentinel-kids-v1"
 KIDS_PROFILE_AVATAR_MAX_BYTES = 10 * 1024 * 1024
 KIDS_CHANNEL_ART_MAX_BYTES = 8 * 1024 * 1024
 KIDS_SHELF_ICONS = {
-    "learning": "book.fill",
-    "fun": "star.fill",
+    "new": "sparkles",
+    "learning-nl": "book.fill",
+    "fun-en": "globe",
+    "fun-nl": "star.fill",
     "again": "arrow.counterclockwise",
 }
+KIDS_PROFILE_SHELF_IDS = {
+    "noah": ("new", "learning-nl", "fun-en", "fun-nl", "again"),
+    "felix": ("new", "learning-nl", "fun-nl", "again"),
+}
+KIDS_SHELF_PAGE_SIZE = 12
+KIDS_SHELF_TARGET = 72
+KIDS_SHELF_MIN_AGAIN = 3
 KIDS_SHELF_COOLDOWN = timedelta(days=7)
 router = APIRouter()
 
@@ -169,23 +177,29 @@ def _kids_channel_opaque_id(channel: dict[str, Any]) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _kids_shelf_limit(profile: str) -> int:
-    return 5 if profile == "felix" else 7
-
-
 def _kids_shelf_language_rank(profile: str, shelf: str, language: str) -> int | None:
     if shelf == "again":
         return 0
-    if profile == "felix":
+    if shelf == "new":
+        return 0
+    if shelf == "learning-nl":
         return {"nl": 0, "mixed": 1}.get(language)
-    if shelf == "learning":
+    if shelf == "fun-en":
+        return {"en": 0, "mixed": 1}.get(language)
+    if shelf == "fun-nl":
         return {"nl": 0, "mixed": 1}.get(language)
-    return {"en": 0, "mixed": 1}.get(language)
+    return None
 
 
 def _kids_shelf_daily_key(day: str, profile: str, shelf: str, item_id: int) -> str:
     return hashlib.sha256(
         f"{day}\x00{profile}\x00{shelf}\x00{item_id}".encode("utf-8")
+    ).hexdigest()
+
+
+def _kids_shelf_source_key(day: str, profile: str, shelf: str, source_id: int) -> str:
+    return hashlib.sha256(
+        f"{day}\x00{profile}\x00{shelf}\x00source\x00{source_id}".encode("utf-8")
     ).hexdigest()
 
 
@@ -198,6 +212,13 @@ def _kids_shelf_candidate_allowed(
 ) -> bool:
     if shelf == "again":
         return _parse_utc(item.get("_profile_history_at")) is not None
+    if shelf == "new":
+        language = str(item.get("_source_language") or "unknown").strip().lower()
+        return (
+            _parse_utc(item.get("_profile_history_at")) is None
+            and language
+            in ({"nl", "mixed"} if profile == "felix" else {"nl", "en", "mixed"})
+        )
     raw_completed_at = item.get("_profile_completed_at")
     completed_at = _parse_utc(raw_completed_at)
     if str(raw_completed_at or "").strip() and (
@@ -205,9 +226,12 @@ def _kids_shelf_candidate_allowed(
     ):
         return False
     content_kind = str(item.get("_source_content_kind") or "unknown").strip().lower()
-    if shelf == "learning" and content_kind not in {"learning", "mixed"}:
+    if shelf == "learning-nl" and content_kind not in {"learning", "mixed"}:
         return False
-    if shelf == "fun" and content_kind not in {"entertainment", "mixed"}:
+    if shelf in {"fun-en", "fun-nl"} and content_kind not in {
+        "entertainment",
+        "mixed",
+    }:
         return False
     return (
         _kids_shelf_language_rank(
@@ -217,6 +241,99 @@ def _kids_shelf_candidate_allowed(
         )
         is not None
     )
+
+
+def _kids_shelf_order_key(
+    item: dict[str, Any],
+    *,
+    day: str,
+    profile: str,
+    shelf: str,
+) -> tuple[Any, ...]:
+    item_id = int(item["id"])
+    if shelf == "new":
+        return (
+            -item_id,
+            _kids_shelf_daily_key(day, profile, shelf, item_id),
+            item_id,
+        )
+    if shelf == "again":
+        history_at = _parse_utc(item.get("_profile_history_at"))
+        return (
+            -(history_at.timestamp() if history_at is not None else 0),
+            _kids_shelf_daily_key(day, profile, shelf, item_id),
+            item_id,
+        )
+    content_kind = str(item.get("_source_content_kind") or "unknown").strip().lower()
+    language = str(item.get("_source_language") or "unknown").strip().lower()
+    language_rank = _kids_shelf_language_rank(profile, shelf, language)
+    content_rank = 0 if content_kind == (
+        "learning" if shelf == "learning-nl" else "entertainment"
+    ) else 1
+    return (
+        language_rank if language_rank is not None else 2,
+        content_rank,
+        _kids_shelf_daily_key(day, profile, shelf, item_id),
+        item_id,
+    )
+
+
+def _kids_shelf_round_robin(
+    items: list[dict[str, Any]],
+    *,
+    profile: str,
+    shelf: str,
+    day: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    by_source: dict[int, list[dict[str, Any]]] = {}
+    for item in items:
+        try:
+            item_id = int(item["id"])
+            source_id = int(item["source_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        by_source.setdefault(source_id, []).append(item)
+    for source_items in by_source.values():
+        source_items.sort(
+            key=lambda item: _kids_shelf_order_key(
+                item,
+                day=day,
+                profile=profile,
+                shelf=shelf,
+            )
+        )
+    source_order = sorted(
+        by_source,
+        key=lambda source_id: (
+            _kids_shelf_order_key(
+                by_source[source_id][0],
+                day=day,
+                profile=profile,
+                shelf=shelf,
+            ),
+            _kids_shelf_source_key(day, profile, shelf, source_id),
+            source_id,
+        ),
+    )
+    positions = {source_id: 0 for source_id in source_order}
+    selected: list[dict[str, Any]] = []
+    while len(selected) < limit:
+        added = False
+        for source_id in source_order:
+            position = positions[source_id]
+            source_items = by_source[source_id]
+            if position >= len(source_items):
+                continue
+            item = source_items[position]
+            positions[source_id] = position + 1
+            selected.append(item)
+            added = True
+            if len(selected) >= limit:
+                break
+        if not added:
+            break
+    return selected
 
 
 def _select_kids_shelves(
@@ -231,69 +348,75 @@ def _select_kids_shelves(
         now = now.replace(tzinfo=timezone.utc)
     now = now.astimezone(timezone.utc)
     cooldown_after = now - KIDS_SHELF_COOLDOWN
-    selected = {shelf: [] for shelf in KIDS_SHELF_NAMES}
-    selected_sources = {shelf: set() for shelf in KIDS_SHELF_NAMES}
-    source_totals: dict[int, int] = {}
-    shelf_limit = _kids_shelf_limit(profile)
-
-    for shelf in KIDS_SHELF_NAMES:
-        candidates: list[tuple[tuple[Any, ...], dict[str, Any], int, int]] = []
-        for item in items:
-            try:
-                item_id = int(item["id"])
-                source_id = int(item["source_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if not _kids_shelf_candidate_allowed(
+    shelf_ids = KIDS_PROFILE_SHELF_IDS.get(
+        str(profile or "").strip().lower(),
+        KIDS_PROFILE_SHELF_IDS["noah"],
+    )
+    selected: dict[str, list[dict[str, Any]]] = {
+        shelf: [] for shelf in shelf_ids if shelf != "again"
+    }
+    selected_ids: set[int] = set()
+    shelf_limit = KIDS_SHELF_TARGET
+    candidates_by_shelf = {
+        shelf: [
+            item
+            for item in items
+            if _kids_shelf_candidate_allowed(
                 item,
                 profile=profile,
                 shelf=shelf,
                 cooldown_after=cooldown_after,
-            ):
-                continue
-            if shelf == "again":
-                history_at = _parse_utc(item.get("_profile_history_at"))
-                if history_at is None:
-                    continue
-                sort_key = (
-                    -history_at.timestamp(),
-                    _kids_shelf_daily_key(day, profile, shelf, item_id),
-                    item_id,
-                )
-            else:
-                content_kind = str(
-                    item.get("_source_content_kind") or "unknown"
-                ).strip().lower()
-                language_rank = _kids_shelf_language_rank(
-                    profile,
-                    shelf,
-                    str(item.get("_source_language") or "unknown").strip().lower(),
-                )
-                if language_rank is None:
-                    continue
-                content_rank = 0 if (
-                    content_kind
-                    == ("learning" if shelf == "learning" else "entertainment")
-                ) else 1
-                sort_key = (
-                    language_rank,
-                    content_rank,
-                    _kids_shelf_daily_key(day, profile, shelf, item_id),
-                    item_id,
-                )
-            candidates.append((sort_key, item, item_id, source_id))
+            )
+        ]
+        for shelf in shelf_ids
+    }
+    if len(candidates_by_shelf.get("again", [])) < KIDS_SHELF_MIN_AGAIN:
+        candidates_by_shelf.pop("again", None)
+    if "again" in candidates_by_shelf:
+        selected["again"] = _kids_shelf_round_robin(
+            candidates_by_shelf["again"],
+            profile=profile,
+            shelf="again",
+            day=day,
+            limit=shelf_limit,
+        )
+        selected_ids.update(int(item["id"]) for item in selected["again"])
+    priority = [
+        shelf
+        for shelf in shelf_ids
+        if shelf not in {"again", "new"} and shelf in candidates_by_shelf
+    ]
+    if "new" in candidates_by_shelf:
+        priority.append("new")
 
-        candidates.sort(key=lambda candidate: candidate[0])
-        for _sort_key, item, item_id, source_id in candidates:
-            if len(selected[shelf]) >= shelf_limit:
+    ranked = {
+        shelf: _kids_shelf_round_robin(
+            candidates_by_shelf[shelf],
+            profile=profile,
+            shelf=shelf,
+            day=day,
+            limit=len(candidates_by_shelf[shelf]),
+        )
+        for shelf in priority
+    }
+    positions = {shelf: 0 for shelf in priority}
+    while any(len(selected.get(shelf, [])) < shelf_limit for shelf in priority):
+        added = False
+        for shelf in priority:
+            if len(selected.get(shelf, [])) >= shelf_limit:
+                continue
+            while positions[shelf] < len(ranked[shelf]):
+                item = ranked[shelf][positions[shelf]]
+                positions[shelf] += 1
+                item_id = int(item["id"])
+                if item_id in selected_ids:
+                    continue
+                selected.setdefault(shelf, []).append(item)
+                selected_ids.add(item_id)
+                added = True
                 break
-            if source_totals.get(source_id, 0) >= 2:
-                continue
-            if source_id in selected_sources[shelf]:
-                continue
-            selected[shelf].append(item)
-            selected_sources[shelf].add(source_id)
-            source_totals[source_id] = source_totals.get(source_id, 0) + 1
+        if not added:
+            break
     return selected
 
 
@@ -577,12 +700,19 @@ async def kids_shelves(
 ) -> dict[str, Any]:
     runtime: Any = request.app.state.runtime
     profile_row = await _kids_profile(request, profile)
+    shelf_ids = KIDS_PROFILE_SHELF_IDS[profile_row["slug"]]
     await runtime.reconcile_kids_catalog_policy()
     state = await runtime.kids_policy_state()
     revision = await runtime.db.catalog_revision()
     empty_shelves = [
-        {"id": shelf, "icon": KIDS_SHELF_ICONS[shelf], "items": []}
-        for shelf in KIDS_SHELF_NAMES
+        {
+            "id": shelf,
+            "icon": KIDS_SHELF_ICONS[shelf],
+            "items": [],
+            "next_cursor": None,
+        }
+        for shelf in shelf_ids
+        if shelf != "again"
     ]
     if state != "ready":
         return {
@@ -605,18 +735,19 @@ async def kids_shelves(
         day=day,
         now=day_boundary,
     )
+    active_shelf_ids = tuple(shelf for shelf in shelf_ids if shelf in selected)
     daily_slots = await runtime.db.kids_daily_library_get_or_create(
         day=day,
         profile=profile_row["slug"],
-        shelf_limit=_kids_shelf_limit(profile_row["slug"]),
+        shelf_limit=KIDS_SHELF_TARGET,
+        shelf_ids=active_shelf_ids,
         proposed_item_ids={
             shelf: [int(item["id"]) for item in selected[shelf]]
-            for shelf in KIDS_SHELF_NAMES
+            for shelf in active_shelf_ids
         },
     )
     candidates_by_id = {int(item["id"]): item for item in candidates}
     cooldown_after = day_boundary - KIDS_SHELF_COOLDOWN
-    base_url = str(request.base_url).rstrip("/")
     shelf_items_by_name = {
         shelf: [
             item
@@ -630,44 +761,58 @@ async def kids_shelves(
                 cooldown_after=cooldown_after,
             )
         ]
-        for shelf in KIDS_SHELF_NAMES
+        for shelf in active_shelf_ids
     }
-    item_ids = list(
-        dict.fromkeys(
-            int(item["id"])
-            for shelf in KIDS_SHELF_NAMES
-            for item in shelf_items_by_name[shelf]
-        )
-    )
-    assets_by_item_id: dict[int, dict[str, Any]] = {}
-    if item_ids:
-        session = await runtime.db.kids_feed_session_create(
-            profile=profile_row["slug"],
-            policy_version=KIDS_DATAPLANE_POLICY_VERSION,
-            minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
-            minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
-            ordered_item_ids=item_ids,
-        )
-        assets_by_item_id = {
-            int(item["item_id"]): item for item in session["items"]
-        }
-    response_shelves = []
-    for shelf in KIDS_SHELF_NAMES:
+    response_shelves: list[dict[str, Any]] = []
+    base_url = str(request.base_url).rstrip("/")
+    for shelf in active_shelf_ids:
         shelf_items = shelf_items_by_name[shelf]
+        ordered_item_ids = [int(item["id"]) for item in shelf_items]
+        page: dict[str, Any] = {"items": [], "next_offset": None}
+        session_id: str | None = None
+        if ordered_item_ids:
+            session = await runtime.db.kids_feed_session_create(
+                profile=profile_row["slug"],
+                policy_version=KIDS_DATAPLANE_POLICY_VERSION,
+                minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+                minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+                ordered_item_ids=ordered_item_ids,
+            )
+            session_id = session["id"]
+            page = await runtime.db.kids_feed_session_page(
+                session_id,
+                profile=profile_row["slug"],
+                offset=0,
+                limit=KIDS_SHELF_PAGE_SIZE,
+                policy_version=KIDS_DATAPLANE_POLICY_VERSION,
+                minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+                minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
+            )
+            if page["status"] != "ok":
+                page = {"items": [], "next_offset": None}
+        response_items = [
+            {
+                "id": item["asset_id"],
+                "thumbnail_url": f"{base_url}/v1/kids/thumbnails/{item['asset_id']}",
+                "duration_seconds": item["duration_seconds"],
+                "visual_category": item["visual_category"],
+            }
+            for item in page["items"]
+        ]
         response_shelves.append(
             {
                 "id": shelf,
                 "icon": KIDS_SHELF_ICONS[shelf],
-                "items": [
-                    {
-                        "id": asset["asset_id"],
-                        "thumbnail_url": f"{base_url}/v1/kids/thumbnails/{asset['asset_id']}",
-                        "duration_seconds": asset["duration_seconds"],
-                        "visual_category": asset["visual_category"],
-                    }
-                    for item in shelf_items
-                    if (asset := assets_by_item_id.get(int(item["id"]))) is not None
-                ],
+                "items": response_items,
+                "next_cursor": (
+                    _encode_kids_cursor(
+                        session_id,
+                        page["next_offset"],
+                        profile_row["slug"],
+                    )
+                    if session_id is not None and page["next_offset"] is not None
+                    else None
+                ),
             }
         )
     return {
@@ -819,8 +964,6 @@ async def kids_thumbnail(asset_id: str, request: Request) -> Response:
     )
     if asset is None:
         raise HTTPException(status_code=404, detail="Kids asset not found")
-    if asset["catalog_revision"] != await runtime.db.catalog_revision():
-        raise HTTPException(status_code=409, detail="Kids asset is stale")
     return await _kids_proxy_image(
         runtime,
         str(asset["thumbnail_url"]),

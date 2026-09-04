@@ -13,14 +13,21 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..config import Settings
 from ..db import Database
+from .kids_catalog import (
+    KIDS_MIN_RELAY_LIFETIME,
+    KIDS_PRACTICAL_CANDIDATE_TTL,
+    KIDS_SIGNED_URL_MARGIN,
+    kids_candidate_usable_until,
+)
 from .kids_ingest import YouTubeKidsCDP
 
 
 logger = logging.getLogger(__name__)
 
-PRACTICAL_CANDIDATE_TTL = timedelta(minutes=20)
+PRACTICAL_CANDIDATE_TTL = KIDS_PRACTICAL_CANDIDATE_TTL
 PRACTICAL_TTL = PRACTICAL_CANDIDATE_TTL
-MIN_RELAY_LIFETIME = timedelta(seconds=120)
+SIGNED_URL_MARGIN = KIDS_SIGNED_URL_MARGIN
+MIN_RELAY_LIFETIME = KIDS_MIN_RELAY_LIFETIME
 MIN_CANDIDATE_QUALITY_HEIGHT = 720
 MAX_CANDIDATE_QUALITY_HEIGHT = 1080
 KIDS_WATCH_URL = "https://www.youtubekids.com/watch?v="
@@ -112,22 +119,13 @@ def candidate_expiry(
     candidate: dict[str, Any],
     *,
     now: datetime | None = None,
+    resolved_at: datetime | None = None,
 ) -> datetime | None:
-    if not isinstance(candidate, dict):
-        return None
-    expiries = [
-        _signed_expiry(candidate.get("media_url")),
-        _signed_expiry(candidate.get("audio_url")),
-    ]
-    if any(expiry is None for expiry in expiries):
-        return None
     current = now or _now()
-    useful_until = current + MIN_RELAY_LIFETIME
-    if any(expiry <= useful_until for expiry in expiries if expiry is not None):
-        return None
-    return min(
-        *(expiry for expiry in expiries if expiry is not None),
-        current + PRACTICAL_TTL,
+    return kids_candidate_usable_until(
+        candidate,
+        now=current,
+        resolved_at=resolved_at or current,
     )
 
 
@@ -258,11 +256,12 @@ def normalize_candidate(
     if any(expiry is None for expiry in expiries):
         return None
     resolved_datetime = datetime.fromisoformat(resolved_at)
-    earliest_expiry = min(
-        *(expiry for expiry in expiries if expiry is not None),
-        resolved_datetime + PRACTICAL_CANDIDATE_TTL,
+    earliest_expiry = candidate_expiry(
+        candidate,
+        now=_now(),
+        resolved_at=resolved_datetime,
     )
-    if earliest_expiry <= _now() + MIN_RELAY_LIFETIME:
+    if earliest_expiry is None:
         return None
     if not required.issubset(candidate):
         return None

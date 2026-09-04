@@ -8,8 +8,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.db import Database
-from app.kids_api import _select_kids_shelves
-from app.services.kids_database import KIDS_SHELF_NAMES
+from app.kids_api import KIDS_PROFILE_SHELF_IDS, KIDS_SHELF_PAGE_SIZE, _select_kids_shelves
 
 
 def _item(
@@ -73,6 +72,7 @@ def test_shelf_languages_kinds_and_source_diversity():
         [
             _item(17, 17, language="en", content_kind="learning"),
             _item(18, 18, language="nl", content_kind="entertainment"),
+            _item(19, 19, language="unknown", content_kind="unknown"),
         ]
     )
 
@@ -89,47 +89,40 @@ def test_shelf_languages_kinds_and_source_diversity():
         now=datetime(2026, 9, 4, tzinfo=timezone.utc),
     )
 
-    assert len(noah["learning"]) == 7
-    assert len(noah["fun"]) == 7
-    assert len(felix["learning"]) == 5
-    assert len(felix["fun"]) == 5
-    assert [item["_source_language"] for item in noah["learning"]] == [
-        "nl"
-    ] * 4 + ["mixed"] * 3
-    assert [item["_source_language"] for item in noah["fun"]] == [
-        "en"
-    ] * 4 + ["mixed"] * 3
-    assert [item["_source_language"] for item in felix["learning"]] == [
-        "nl"
-    ] * 4 + ["mixed"]
-    assert [item["_source_language"] for item in felix["fun"]] == [
-        "nl"
-    ] + ["mixed"] * 4
+    assert set(noah) == {"new", "learning-nl", "fun-en", "fun-nl"}
+    assert set(felix) == {"new", "learning-nl", "fun-nl"}
     assert all(
         item["_source_language"] in {"nl", "mixed"}
         and item["_source_content_kind"] in {"learning", "mixed"}
-        for item in noah["learning"] + felix["learning"]
+        for item in noah["learning-nl"] + felix["learning-nl"]
     )
     assert all(
         item["_source_language"] in {"en", "mixed"}
         and item["_source_content_kind"] in {"entertainment", "mixed"}
-        for item in noah["fun"]
+        for item in noah["fun-en"]
     )
     assert all(
         item["_source_language"] in {"nl", "mixed"}
         and item["_source_content_kind"] in {"entertainment", "mixed"}
-        for item in felix["fun"]
+        for item in noah["fun-nl"] + felix["fun-nl"]
     )
-    assert 17 not in {item["id"] for item in noah["learning"]}
-    assert 18 not in {item["id"] for item in noah["fun"]}
+    assert all(selected for selected in noah.values())
+    assert all(selected for selected in felix.values())
+    assert 19 not in {
+        item["id"]
+        for shelves in (noah, felix)
+        for selected in shelves.values()
+        for item in selected
+    }
 
     for shelves in (noah, felix):
-        for selected in shelves.values():
-            assert len({item["source_id"] for item in selected}) == len(selected)
-        assert max(
-            Counter(item["source_id"] for selected in shelves.values() for item in selected).values(),
-            default=0,
-        ) <= 2
+        selected_ids = [
+            item["id"] for selected in shelves.values() for item in selected
+        ]
+        assert len(selected_ids) == len(set(selected_ids))
+        assert max(Counter(
+            item["source_id"] for selected in shelves.values() for item in selected
+        ).values(), default=0) == 1
 
 
 def test_shelf_history_cooldown_started_completed_and_daily_determinism():
@@ -173,18 +166,12 @@ def test_shelf_history_cooldown_started_completed_and_daily_determinism():
         day="2026-09-04",
         now=now,
     )
-    next_day = _select_kids_shelves(
-        items,
-        profile="noah",
-        day="2026-09-05",
-        now=now + timedelta(days=1),
-    )
-
     assert {
         item["id"] for item in first["again"]
     } == {1, 2, 3}
-    assert 2 not in {item["id"] for item in first["learning"]}
-    assert 3 in {item["id"] for item in first["learning"]}
+    assert 2 not in {item["id"] for item in first["learning-nl"]}
+    assert 3 not in {item["id"] for item in first["learning-nl"]}
+    assert 4 in {item["id"] for item in first["learning-nl"]}
     assert 4 not in {item["id"] for item in first["again"]}
     assert {
         shelf: [item["id"] for item in selected]
@@ -192,13 +179,6 @@ def test_shelf_history_cooldown_started_completed_and_daily_determinism():
     } == {
         shelf: [item["id"] for item in selected]
         for shelf, selected in repeat.items()
-    }
-    assert {
-        shelf: [item["id"] for item in selected]
-        for shelf, selected in first.items()
-    } != {
-        shelf: [item["id"] for item in selected]
-        for shelf, selected in next_day.items()
     }
 
 
@@ -372,6 +352,20 @@ def _asset_item_ids(db_path, payload):
     }
 
 
+def _item_ids_for_assets(db_path, asset_ids):
+    if not asset_ids:
+        return []
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT asset_id,item_id FROM feed_session_items WHERE asset_id IN ({})".format(
+                ",".join("?" for _ in asset_ids)
+            ),
+            asset_ids,
+        ).fetchall()
+    item_by_asset = dict(rows)
+    return [item_by_asset[asset_id] for asset_id in asset_ids]
+
+
 def _daily_rows(db_path, day: str, profile: str):
     with sqlite3.connect(db_path) as connection:
         rows = connection.execute(
@@ -391,30 +385,22 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
     specs = [
         *[
             (index, "nl", "learning", ["noah", "felix"])
-            for index in range(1, 8)
+            for index in range(1, 16)
         ],
         *[
-            (index, "en", "entertainment", ["noah", "felix"])
-            for index in range(101, 109)
+            (index, "en", "entertainment", ["noah"])
+            for index in range(101, 116)
         ],
         *[
             (index, "nl", "entertainment", ["noah", "felix"])
-            for index in range(201, 206)
+            for index in range(201, 216)
+        ],
+        *[
+            (index, "nl", "unknown", ["noah", "felix"])
+            for index in range(301, 316)
         ],
     ]
     db = asyncio.run(_seed_shelf_catalog(db_path, specs))
-    history_item = asyncio.run(db.catalog_items_list())[0]
-    asyncio.run(
-        db.kids_watch_event_record(
-            video_id=history_item["video_id"],
-            event="started",
-            profile="noah",
-            position_seconds=1,
-            session_id="",
-            startup_ms=None,
-            correlation_id="shelf-overlap-history",
-        )
-    )
     module = _load_app(tmp_path, monkeypatch)
     requests = []
     _mock_upstream(monkeypatch, module, requests)
@@ -430,14 +416,19 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
             "shelves",
         }
         assert first["state"] == "ready"
-        assert isinstance(first["shelves"], list)
-        assert [shelf["id"] for shelf in first["shelves"]] == list(KIDS_SHELF_NAMES)
+        assert [shelf["id"] for shelf in first["shelves"]] == list(
+            KIDS_PROFILE_SHELF_IDS["noah"][:-1]
+        )
         assert [shelf["icon"] for shelf in first["shelves"]] == [
+            "sparkles",
             "book.fill",
+            "globe",
             "star.fill",
-            "arrow.counterclockwise",
         ]
-        assert all(set(shelf) == {"id", "icon", "items"} for shelf in first["shelves"])
+        assert all(
+            set(shelf) == {"id", "icon", "items", "next_cursor"}
+            for shelf in first["shelves"]
+        )
         assert all(
             set(item) == {
                 "id",
@@ -448,9 +439,17 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
             for shelf in first["shelves"]
             for item in shelf["items"]
         )
-        assert len(first["shelves"][0]["items"]) == 7
-        assert len(first["shelves"][1]["items"]) == 7
-        assert len(first["shelves"][2]["items"]) == 1
+        assert all(
+            len(shelf["items"]) == KIDS_SHELF_PAGE_SIZE
+            and shelf["next_cursor"]
+            for shelf in first["shelves"]
+        )
+        first_assets = {
+            item["id"]
+            for shelf in first["shelves"]
+            for item in shelf["items"]
+        }
+        assert len(first_assets) == 4 * KIDS_SHELF_PAGE_SIZE
         serialized = json.dumps(first)
         assert "video_id" not in serialized
         assert "googlevideo" not in serialized
@@ -461,20 +460,22 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
             "/v1/kids/playback-sessions",
             json={"asset_id": first["shelves"][0]["items"][0]["id"]},
         ).status_code == 200
-        learning_assets = {
-            item["id"] for item in first["shelves"][0]["items"]
-        }
-        again_assets = {
-            item["id"] for item in first["shelves"][2]["items"]
-        }
-        assert learning_assets & again_assets
+        for shelf in first["shelves"]:
+            next_page = client.get(
+                "/v1/kids/feed",
+                params={"cursor": shelf["next_cursor"], "limit": KIDS_SHELF_PAGE_SIZE},
+            )
+            assert next_page.status_code == 200
+            assert len(next_page.json()["items"]) == 3
+            assert next_page.json()["next_cursor"] is None
+            assert first_assets.isdisjoint(
+                item["id"] for item in next_page.json()["items"]
+            )
 
         first_ids = _asset_item_ids(db_path, first)
         day = datetime.now(timezone.utc).date().isoformat()
         initial_rows = _daily_rows(db_path, day, "noah")
-        assert len(initial_rows) == 21
-        assert [row[2] for row in initial_rows if row[0] == "learning"][:7] == first_ids["learning"]
-        assert [row[2] for row in initial_rows if row[0] == "fun"][:7] == first_ids["fun"]
+        assert len(initial_rows) == 4 * 72
 
         _, new_item = asyncio.run(
             _ready_item(
@@ -489,19 +490,31 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
         assert second_response.status_code == 200
         second_ids = _asset_item_ids(db_path, second_response.json())
         assert second_ids == first_ids
-        assert new_item["id"] not in {
-            item_id
-            for shelf_ids in second_ids.values()
-            for item_id in shelf_ids
-        }
+        tail_item_ids = []
+        for shelf in second_response.json()["shelves"]:
+            if shelf["next_cursor"]:
+                tail = client.get(
+                    "/v1/kids/feed",
+                    params={
+                        "cursor": shelf["next_cursor"],
+                        "limit": KIDS_SHELF_PAGE_SIZE,
+                    },
+                ).json()
+                tail_item_ids.extend(
+                    _item_ids_for_assets(
+                        db_path,
+                        [item["id"] for item in tail["items"]],
+                    )
+                )
+        assert new_item["id"] in tail_item_ids
 
         felix_response = client.get("/v1/kids/shelves", params={"profile": "felix"})
         assert felix_response.status_code == 200
         felix = felix_response.json()
-        assert isinstance(felix["shelves"], list)
-        assert len(felix["shelves"][0]["items"]) == 5
-        assert len(felix["shelves"][1]["items"]) == 5
-        assert felix["shelves"][2]["items"] == []
+        assert [shelf["id"] for shelf in felix["shelves"]] == list(
+            KIDS_PROFILE_SHELF_IDS["felix"][:-1]
+        )
+        assert all(len(shelf["items"]) == KIDS_SHELF_PAGE_SIZE for shelf in felix["shelves"])
 
 
 def test_again_history_is_profile_bound_and_accepts_started(tmp_path, monkeypatch):
@@ -509,21 +522,25 @@ def test_again_history_is_profile_bound_and_accepts_started(tmp_path, monkeypatc
     db = asyncio.run(
         _seed_shelf_catalog(
             db_path,
-            [(1, "nl", "learning", ["noah", "felix"])],
+            [
+                (index, "nl", "learning", ["noah", "felix"])
+                for index in range(1, 4)
+            ],
         )
     )
-    item = asyncio.run(db.catalog_items_list())[0]
-    asyncio.run(
-        db.kids_watch_event_record(
-            video_id=item["video_id"],
-            event="started",
-            profile="noah",
-            position_seconds=2,
-            session_id="",
-            startup_ms=None,
-            correlation_id="shelf-started-history",
+    items = asyncio.run(db.catalog_items_list())
+    for item in items:
+        asyncio.run(
+            db.kids_watch_event_record(
+                video_id=item["video_id"],
+                event="started",
+                profile="noah",
+                position_seconds=2,
+                session_id="",
+                startup_ms=None,
+                correlation_id=f"shelf-started-history-{item['id']}",
+            )
         )
-    )
     module = _load_app(tmp_path, monkeypatch)
     _mock_upstream(monkeypatch, module, [])
 
@@ -532,8 +549,10 @@ def test_again_history_is_profile_bound_and_accepts_started(tmp_path, monkeypatc
         felix = client.get("/v1/kids/shelves", params={"profile": "felix"})
         assert noah.status_code == 200
         assert felix.status_code == 200
-        assert _asset_item_ids(db_path, noah.json())["again"] == [item["id"]]
-        assert _asset_item_ids(db_path, felix.json())["again"] == []
+        assert set(_asset_item_ids(db_path, noah.json())["again"]) == {
+            item["id"] for item in items
+        }
+        assert "again" not in _asset_item_ids(db_path, felix.json())
 
 
 def test_shelves_fill_initially_empty_daily_slots_without_reordering(tmp_path, monkeypatch):
@@ -545,7 +564,7 @@ def test_shelves_fill_initially_empty_daily_slots_without_reordering(tmp_path, m
     with TestClient(module.app) as client:
         empty = client.get("/v1/kids/shelves", params={"profile": "noah"})
         assert empty.status_code == 200
-        assert _asset_item_ids(db_path, empty.json())["learning"] == []
+        assert _asset_item_ids(db_path, empty.json())["learning-nl"] == []
 
         first_items = [
             asyncio.run(
@@ -560,8 +579,10 @@ def test_shelves_fill_initially_empty_daily_slots_without_reordering(tmp_path, m
             for index in range(1, 4)
         ]
         filled = client.get("/v1/kids/shelves", params={"profile": "noah"})
-        filled_ids = _asset_item_ids(db_path, filled.json())["learning"]
-        assert set(filled_ids) == {item["id"] for item in first_items}
+        filled_ids = _asset_item_ids(db_path, filled.json())
+        assert {
+            item_id for shelf_ids in filled_ids.values() for item_id in shelf_ids
+        } == {item["id"] for item in first_items}
 
         asyncio.run(
             _ready_item(
@@ -573,16 +594,19 @@ def test_shelves_fill_initially_empty_daily_slots_without_reordering(tmp_path, m
             )
         )
         extended = client.get("/v1/kids/shelves", params={"profile": "noah"})
-        extended_ids = _asset_item_ids(db_path, extended.json())["learning"]
-        assert extended_ids[: len(filled_ids)] == filled_ids
-        assert len(extended_ids) == len(filled_ids) + 1
+        extended_ids = _asset_item_ids(db_path, extended.json())
+        for shelf, item_ids in filled_ids.items():
+            assert extended_ids[shelf][: len(item_ids)] == item_ids
+        assert sum(map(len, extended_ids.values())) == sum(
+            map(len, filled_ids.values())
+        ) + 1
 
 
 def test_shelves_keep_materialized_gaps_after_revoke_and_block(tmp_path, monkeypatch):
     db_path = tmp_path / "sentinel.db"
     specs = [
         (index, "nl", "learning", ["noah"])
-        for index in range(1, 9)
+        for index in range(1, 17)
     ]
     db = asyncio.run(_seed_shelf_catalog(db_path, specs))
     module = _load_app(tmp_path, monkeypatch)
@@ -590,9 +614,12 @@ def test_shelves_keep_materialized_gaps_after_revoke_and_block(tmp_path, monkeyp
 
     with TestClient(module.app) as client:
         first = client.get("/v1/kids/shelves", params={"profile": "noah"}).json()
-        first_ids = _asset_item_ids(db_path, first)["learning"]
-        assert len(first_ids) == 7
+        first_ids = _asset_item_ids(db_path, first)["learning-nl"]
+        assert len(first_ids) == 8
         revoked_id, blocked_id = first_ids[:2]
+        learning = next(
+            shelf for shelf in first["shelves"] if shelf["id"] == "learning-nl"
+        )
         with sqlite3.connect(db_path) as connection:
             source_ids = dict(
                 connection.execute(
@@ -607,7 +634,7 @@ def test_shelves_keep_materialized_gaps_after_revoke_and_block(tmp_path, monkeyp
 
         lease = client.post(
             "/v1/kids/playback-sessions",
-            json={"asset_id": first["shelves"][0]["items"][0]["id"]},
+            json={"asset_id": learning["items"][0]["id"]},
         )
         assert lease.status_code == 200
         lease_id = lease.json()["id"]
@@ -647,17 +674,23 @@ def test_shelves_keep_materialized_gaps_after_revoke_and_block(tmp_path, monkeyp
 
         current = client.get("/v1/kids/shelves", params={"profile": "noah"})
         assert current.status_code == 200
-        current_ids = _asset_item_ids(db_path, current.json())["learning"]
+        current_ids = _asset_item_ids(db_path, current.json())["learning-nl"]
         assert current_ids == [
             item_id for item_id in first_ids if item_id not in {revoked_id, blocked_id}
         ]
-        assert new_item["id"] not in current_ids
+        assert new_item["id"] in {
+            item_id
+            for shelf_ids in _asset_item_ids(db_path, current.json()).values()
+            for item_id in shelf_ids
+        }
         rows = _daily_rows(
             db_path,
             datetime.now(timezone.utc).date().isoformat(),
             "noah",
         )
-        assert [row[2] for row in rows if row[0] == "learning"][:7] == first_ids
+        assert [
+            row[2] for row in rows if row[0] == "learning-nl"
+        ][:8] == first_ids
         with sqlite3.connect(db_path) as connection:
             assert connection.execute(
                 "SELECT state FROM relay_leases WHERE id=?",
@@ -665,5 +698,5 @@ def test_shelves_keep_materialized_gaps_after_revoke_and_block(tmp_path, monkeyp
             ).fetchone()[0] == "revoked"
         assert client.post(
             "/v1/kids/playback-sessions",
-            json={"asset_id": first["shelves"][0]["items"][0]["id"]},
+            json={"asset_id": learning["items"][0]["id"]},
         ).status_code in {403, 409}

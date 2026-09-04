@@ -15,6 +15,7 @@ from .kids_catalog import (
     _parse_utc,
     _quality_height_or_default,
     _stored_candidate_meets_policy,
+    kids_candidate_usable_until,
     kids_source_url,
     kids_video_url,
 )
@@ -1285,16 +1286,36 @@ class KidsDatabaseMixin:
         profile: str,
         shelf_limit: int,
         proposed_item_ids: dict[str, list[int]],
+        shelf_ids: tuple[str, ...] | list[str] | None = None,
     ) -> dict[str, list[int | None]]:
         limit = max(0, int(shelf_limit))
-        proposed = {
-            shelf: list(
-                dict.fromkeys(
-                    int(item_id) for item_id in proposed_item_ids.get(shelf, [])
+        shelves = tuple(
+            dict.fromkeys(
+                str(shelf).strip()
+                for shelf in (
+                    shelf_ids
+                    if shelf_ids is not None
+                    else (tuple(proposed_item_ids) or KIDS_SHELF_NAMES)
                 )
-            )[:limit]
-            for shelf in KIDS_SHELF_NAMES
-        }
+                if str(shelf).strip()
+            )
+        )
+        proposed: dict[str, list[int]] = {}
+        proposed_ids: set[int] = set()
+        for shelf in shelves:
+            values: list[int] = []
+            for raw_item_id in proposed_item_ids.get(shelf, []):
+                try:
+                    item_id = int(raw_item_id)
+                except (TypeError, ValueError):
+                    continue
+                if item_id in proposed_ids:
+                    continue
+                values.append(item_id)
+                proposed_ids.add(item_id)
+                if len(values) >= limit:
+                    break
+            proposed[shelf] = values
         now = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -1307,65 +1328,66 @@ class KidsDatabaseMixin:
                 """,
                 (day, profile),
             )
-            existing: dict[str, list[int | None]] = {
-                shelf: [] for shelf in KIDS_SHELF_NAMES
-            }
-            for shelf, _ordinal, item_id in await cur.fetchall():
-                if shelf in existing:
-                    existing[shelf].append(
-                        int(item_id) if item_id is not None else None
-                    )
-            if all(
-                len(existing[shelf]) == limit
-                for shelf in KIDS_SHELF_NAMES
-            ):
-                result = existing
-                for shelf in KIDS_SHELF_NAMES:
-                    unused = iter(
-                        item_id
-                        for item_id in proposed[shelf]
-                        if item_id not in result[shelf]
-                    )
-                    for ordinal, item_id in enumerate(result[shelf]):
-                        if item_id is not None:
+            existing: dict[str, dict[int, int | None]] = {}
+            for shelf, ordinal, item_id in await cur.fetchall():
+                existing.setdefault(str(shelf), {})[int(ordinal)] = (
+                    int(item_id) if item_id is not None else None
+                )
+            existing_owner: dict[int, str] = {}
+            for shelf in shelves:
+                for item_id in existing.get(shelf, {}).values():
+                    if item_id is not None:
+                        existing_owner.setdefault(item_id, shelf)
+            result: dict[str, list[int | None]] = {}
+            used_item_ids = set(existing_owner)
+            for shelf in shelves:
+                stored = existing.get(shelf, {})
+                values = [stored.get(ordinal) for ordinal in range(limit)]
+                for ordinal, item_id in enumerate(values):
+                    if item_id is not None and existing_owner.get(item_id) != shelf:
+                        values[ordinal] = None
+                replacements = iter(
+                    item_id
+                    for item_id in proposed[shelf]
+                    if item_id not in used_item_ids
+                )
+                for ordinal, item_id in enumerate(values):
+                    if item_id is not None:
+                        continue
+                    replacement = next(replacements, None)
+                    if replacement is None:
+                        continue
+                    values[ordinal] = replacement
+                    used_item_ids.add(replacement)
+                result[shelf] = values
+                await db.execute(
+                    """
+                    DELETE FROM kids_daily_library
+                    WHERE day=? AND profile=? AND shelf=? AND ordinal>=?
+                    """,
+                    (day, profile, shelf, limit),
+                )
+                for ordinal, item_id in enumerate(values):
+                    if ordinal in stored:
+                        if stored[ordinal] == item_id:
                             continue
-                        replacement = next(unused, None)
-                        if replacement is None:
-                            break
-                        result[shelf][ordinal] = replacement
                         await db.execute(
                             """
                             UPDATE kids_daily_library
                             SET item_id=?
                             WHERE day=? AND profile=? AND shelf=? AND ordinal=?
                             """,
-                            (replacement, day, profile, shelf, ordinal),
+                            (item_id, day, profile, shelf, ordinal),
                         )
-            else:
-                await db.execute(
-                    "DELETE FROM kids_daily_library WHERE day=? AND profile=?",
-                    (day, profile),
-                )
-                for shelf in KIDS_SHELF_NAMES:
-                    await db.executemany(
-                        """
-                        INSERT INTO kids_daily_library(
-                            day,profile,shelf,ordinal,item_id,created_at
-                        ) VALUES(?,?,?,?,?,?)
-                        """,
-                        [
-                            (day, profile, shelf, ordinal, item_id, now)
-                            for ordinal, item_id in enumerate(
-                                proposed[shelf]
-                                + [None] * (limit - len(proposed[shelf]))
-                            )
-                        ],
-                    )
-                result = {
-                    shelf: proposed[shelf]
-                    + [None] * (limit - len(proposed[shelf]))
-                    for shelf in KIDS_SHELF_NAMES
-                }
+                    else:
+                        await db.execute(
+                            """
+                            INSERT INTO kids_daily_library(
+                                day,profile,shelf,ordinal,item_id,created_at
+                            ) VALUES(?,?,?,?,?,?)
+                            """,
+                            (day, profile, shelf, ordinal, item_id, now),
+                        )
             await db.commit()
         return result
 
@@ -1689,7 +1711,7 @@ class KidsDatabaseMixin:
                 return {"status": "not_found"}
             (
                 session_profile,
-                session_revision,
+                _session_revision,
                 session_policy,
                 session_expires,
                 session_source_id,
@@ -1701,12 +1723,6 @@ class KidsDatabaseMixin:
                 return {"status": "profile_mismatch"}
             if session_policy != policy_version:
                 return {"status": "policy_mismatch"}
-            revision_row = await (
-                await db.execute("SELECT value FROM catalog_meta WHERE key='revision'")
-            ).fetchone()
-            revision = int(revision_row[0]) if revision_row else 0
-            if int(session_revision) != revision:
-                return {"status": "stale_revision"}
             # Re-check authorization after session creation. A later
             # blocklist/revoke can invalidate early ordinals, so scan forward
             # in batches until the page is full or the session is exhausted.
@@ -2490,6 +2506,18 @@ class KidsDatabaseMixin:
             or candidate.get("quality_height") != quality_height
         ):
             return
+        resolved_datetime = _parse_utc(resolved_at)
+        practical_expiry = (
+            kids_candidate_usable_until(
+                candidate,
+                now=datetime.now(timezone.utc),
+                resolved_at=resolved_datetime,
+            )
+            if resolved_datetime is not None
+            else None
+        )
+        if practical_expiry is None:
+            return
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
@@ -2503,7 +2531,7 @@ class KidsDatabaseMixin:
                     quality_height,
                     codec,
                     resolved_at,
-                    expires_at,
+                    practical_expiry.isoformat(),
                     utc_now_iso(),
                     item_id,
                 ),
