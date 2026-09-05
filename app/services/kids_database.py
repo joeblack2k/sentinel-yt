@@ -4058,6 +4058,20 @@ class KidsDatabaseMixin:
             cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in rows]
 
+    async def kids_completion_receipt(self, *, asset_id: str, session_id: str, profile: str) -> int | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            row = await (await db.execute(
+                "SELECT w.id FROM kids_watch_events w "
+                "JOIN relay_leases l ON l.id=w.session_id "
+                "JOIN feed_session_items f ON f.feed_session_id=l.feed_session_id AND f.item_id=l.item_id "
+                "JOIN feed_sessions fs ON fs.id=f.feed_session_id "
+                "JOIN catalog_items i ON i.id=f.item_id AND i.video_id=w.video_id "
+                "WHERE f.asset_id=? AND l.id=? AND fs.profile=? AND w.profile=fs.profile "
+                "AND w.event='completed' ORDER BY w.id LIMIT 1",
+                (asset_id, session_id, profile),
+            )).fetchone()
+        return int(row[0]) if row else None
+
     async def kids_watch_event_record(
         self,
         *,
@@ -4073,6 +4087,16 @@ class KidsDatabaseMixin:
             raise ValueError("invalid Kids watch event")
         now = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if event == "completed" and session_id:
+                db.row_factory = aiosqlite.Row
+                existing = await (await db.execute(
+                    "SELECT * FROM kids_watch_events WHERE session_id=? "
+                    "AND profile=? AND video_id=? AND event='completed' ORDER BY id LIMIT 1",
+                    (session_id, profile, video_id),
+                )).fetchone()
+                if existing is not None:
+                    return dict(existing)
             item = await (
                 await db.execute(
                     "SELECT id FROM catalog_items WHERE video_id=?",

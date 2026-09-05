@@ -1051,6 +1051,12 @@ async def kids_dataplane_event(
 ) -> dict[str, Any]:
     runtime: Any = request.app.state.runtime
     profile = (await _kids_profile(request, payload.profile))["slug"]
+    if payload.event == "completed" and payload.session_id:
+        receipt = await runtime.db.kids_completion_receipt(
+            asset_id=payload.asset_id, session_id=payload.session_id, profile=profile,
+        )
+        if receipt is not None:
+            return {"status": "accepted", "event_id": receipt}
     asset = await runtime.db.kids_feed_asset(
         payload.asset_id,
         profile=profile,
