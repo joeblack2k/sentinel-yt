@@ -17,6 +17,13 @@ KIDS_ITEM_LANGUAGES = frozenset({"nl", "en", "mixed", "unknown"})
 KIDS_ITEM_VERDICTS = frozenset({"SAFE", "UNSAFE", "UNCERTAIN"})
 KIDS_ITEM_CONTENT_KINDS = frozenset({"learning", "entertainment", "mixed", "unknown"})
 KIDS_AGE_SUITABILITY_VALUES = frozenset({"SUITABLE", "UNSUITABLE", "UNCERTAIN"})
+KIDS_PROFILE_SHELF_IDS = {
+    "noah": ("new", "learning-nl", "fun-en", "fun-nl", "again"),
+    "felix": ("new", "learning-nl", "fun-nl", "again"),
+}
+KIDS_SHELF_TARGET = 72
+KIDS_SHELF_MIN_AGAIN = 3
+KIDS_SHELF_COOLDOWN = timedelta(days=7)
 
 
 def normalize_age_suitability(value: Any) -> dict[str, str]:
@@ -326,3 +333,47 @@ def _parse_utc(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _kids_shelf_language_rank(shelf: str, language: str) -> int | None:
+    if shelf in {"again", "new"}:
+        return 0
+    if shelf in {"learning-nl", "fun-nl"}:
+        return {"nl": 0, "mixed": 1}.get(language)
+    if shelf == "fun-en":
+        return {"en": 0, "mixed": 1}.get(language)
+    return None
+
+
+def _kids_shelf_candidate_allowed(
+    item: dict[str, Any],
+    *,
+    profile: str,
+    shelf: str,
+    cooldown_after: datetime,
+) -> bool:
+    if shelf == "again":
+        return _parse_utc(item.get("_profile_history_at")) is not None
+    if shelf == "new":
+        language = str(item.get("_source_language") or "unknown").strip().lower()
+        return (
+            _parse_utc(item.get("_profile_history_at")) is None
+            and language
+            in ({"nl", "mixed"} if profile == "felix" else {"nl", "en", "mixed"})
+        )
+    raw_completed_at = item.get("_profile_completed_at")
+    completed_at = _parse_utc(raw_completed_at)
+    if str(raw_completed_at or "").strip() and (
+        completed_at is None or completed_at > cooldown_after
+    ):
+        return False
+    language = str(item.get("_source_language") or "unknown").strip().lower()
+    content_kind = str(item.get("_source_content_kind") or "unknown").strip().lower()
+    if shelf == "learning-nl" and content_kind not in {"learning", "mixed"}:
+        return False
+    if shelf in {"fun-en", "fun-nl"} and content_kind not in {
+        "entertainment",
+        "mixed",
+    }:
+        return False
+    return _kids_shelf_language_rank(shelf, language) is not None

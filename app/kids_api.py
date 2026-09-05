@@ -6,7 +6,7 @@ import json
 import os
 import secrets
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from itertools import chain, islice, zip_longest
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -34,7 +34,15 @@ from .services.kids_database import (
     KIDS_VIDEO_THUMBNAIL_HOSTS,
     _kids_channel_avatar_is_proxyable,
 )
-from .services.kids_catalog import _parse_utc
+from .services.kids_catalog import (
+    KIDS_PROFILE_SHELF_IDS,
+    KIDS_SHELF_COOLDOWN,
+    KIDS_SHELF_MIN_AGAIN,
+    KIDS_SHELF_TARGET,
+    _kids_shelf_candidate_allowed,
+    _kids_shelf_language_rank,
+    _parse_utc,
+)
 
 
 KIDS_DATAPLANE_POLICY_VERSION = "sentinel-kids-v1"
@@ -47,14 +55,7 @@ KIDS_SHELF_ICONS = {
     "fun-nl": "star.fill",
     "again": "arrow.counterclockwise",
 }
-KIDS_PROFILE_SHELF_IDS = {
-    "noah": ("new", "learning-nl", "fun-en", "fun-nl", "again"),
-    "felix": ("new", "learning-nl", "fun-nl", "again"),
-}
 KIDS_SHELF_PAGE_SIZE = 12
-KIDS_SHELF_TARGET = 72
-KIDS_SHELF_MIN_AGAIN = 3
-KIDS_SHELF_COOLDOWN = timedelta(days=7)
 router = APIRouter()
 
 
@@ -177,59 +178,10 @@ def _kids_channel_opaque_id(channel: dict[str, Any]) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _kids_shelf_language_rank(shelf: str, language: str) -> int | None:
-    if shelf in {"again", "new"}:
-        return 0
-    if shelf in {"learning-nl", "fun-nl"}:
-        return {"nl": 0, "mixed": 1}.get(language)
-    if shelf == "fun-en":
-        return {"en": 0, "mixed": 1}.get(language)
-    return None
-
-
 def _kids_shelf_daily_key(day: str, profile: str, shelf: str, item_id: int) -> str:
     return hashlib.sha256(
         f"{day}\x00{profile}\x00{shelf}\x00{item_id}".encode("utf-8")
     ).hexdigest()
-
-
-def _kids_shelf_candidate_allowed(
-    item: dict[str, Any],
-    *,
-    profile: str,
-    shelf: str,
-    cooldown_after: datetime,
-) -> bool:
-    if shelf == "again":
-        return _parse_utc(item.get("_profile_history_at")) is not None
-    if shelf == "new":
-        language = str(item.get("_source_language") or "unknown").strip().lower()
-        return (
-            _parse_utc(item.get("_profile_history_at")) is None
-            and language
-            in ({"nl", "mixed"} if profile == "felix" else {"nl", "en", "mixed"})
-        )
-    raw_completed_at = item.get("_profile_completed_at")
-    completed_at = _parse_utc(raw_completed_at)
-    if str(raw_completed_at or "").strip() and (
-        completed_at is None or completed_at > cooldown_after
-    ):
-        return False
-    content_kind = str(item.get("_source_content_kind") or "unknown").strip().lower()
-    if shelf == "learning-nl" and content_kind not in {"learning", "mixed"}:
-        return False
-    if shelf in {"fun-en", "fun-nl"} and content_kind not in {
-        "entertainment",
-        "mixed",
-    }:
-        return False
-    return (
-        _kids_shelf_language_rank(
-            shelf,
-            str(item.get("_source_language") or "unknown").strip().lower(),
-        )
-        is not None
-    )
 
 
 def _kids_shelf_order_key(

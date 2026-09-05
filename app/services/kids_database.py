@@ -9,10 +9,14 @@ from urllib.parse import parse_qs, quote, urlparse
 import aiosqlite
 
 from .kids_catalog import (
+    KIDS_PROFILE_SHELF_IDS,
+    KIDS_SHELF_COOLDOWN,
+    KIDS_SHELF_TARGET,
     KIDS_ITEM_CONTENT_KINDS,
     KIDS_ITEM_LANGUAGES,
     KIDS_ITEM_VERDICTS,
     KIDS_HOME_SOURCE_REFERENCE,
+    _kids_shelf_candidate_allowed,
     _catalog_item_is_authorized_for_profile,
     _catalog_item_is_authorized,
     _catalog_item_safety_is_current,
@@ -2596,6 +2600,22 @@ class KidsDatabaseMixin:
             cur = await db.execute(
                 """
                 SELECT i.*,
+                       (SELECT MAX(w.created_at)
+                        FROM kids_watch_events w
+                        WHERE w.video_id=i.video_id
+                          AND w.profile='noah'
+                          AND w.event='completed') AS _noah_completed_at,
+                       (SELECT MAX(w.created_at)
+                        FROM kids_watch_events w
+                        WHERE w.video_id=i.video_id
+                          AND w.profile='felix'
+                          AND w.event='completed') AS _felix_completed_at,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(d.profile || ':' || d.shelf, ',')
+                           FROM kids_daily_library d
+                           WHERE d.item_id=i.id
+                             AND d.day=(SELECT MAX(day) FROM kids_daily_library)
+                       ), '') AS _daily_shelves,
                        s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
                        s.safety_verdict AS _source_safety_verdict,
@@ -2627,37 +2647,194 @@ class KidsDatabaseMixin:
             )
             rows = await cur.fetchall()
             columns = [description[0] for description in cur.description]
+            budget_day_row = await (
+                await db.execute(
+                    "SELECT value FROM settings WHERE key='kids_item_assessment_budget_day'"
+                )
+            ).fetchone()
+            budget_count_row = await (
+                await db.execute(
+                    "SELECT value FROM settings WHERE key='kids_item_assessment_budget_count'"
+                )
+            ).fetchone()
+        stored_budget_day = str(budget_day_row[0]) if budget_day_row else ""
+        if stored_budget_day == current.date().isoformat():
+            try:
+                budget_count = max(0, int(budget_count_row[0])) if budget_count_row else 0
+            except (TypeError, ValueError):
+                budget_count = 0
+        else:
+            budget_count = 0
+        content_shelves_by_profile = {
+            profile: tuple(
+                shelf
+                for shelf in KIDS_PROFILE_SHELF_IDS.get(profile, ())
+                if shelf not in {"new", "again"}
+            )
+            for profile in DEFAULT_KIDS_PROFILE_SLUGS
+        }
+        content_shelf_counts = {
+            (profile, shelf): 0
+            for profile, shelves in content_shelves_by_profile.items()
+            for shelf in shelves
+        }
         result: list[dict[str, Any]] = []
         pending_by_source: dict[int, list[dict[str, Any]]] = {}
         assessed_by_source: dict[int, int] = {}
+        source_order: dict[int, int] = {}
+        cooldown_after = current - KIDS_SHELF_COOLDOWN
         for row in rows:
             item, source, _candidate_json = _catalog_row_context(row, columns)
             profiles = _profile_slugs(item.pop("_profile_slugs", ""))
+            completed_at_by_profile = {
+                "noah": item.pop("_noah_completed_at", None),
+                "felix": item.pop("_felix_completed_at", None),
+            }
+            daily_owned: dict[str, set[str]] = {}
+            for value in str(item.pop("_daily_shelves", "") or "").split(","):
+                profile, separator, shelf = value.partition(":")
+                if separator:
+                    daily_owned.setdefault(profile, set()).add(shelf)
             item.pop("_daily_priority", None)
             item.pop("_ready_priority", None)
-            if not profiles or not any(
-                _source_is_authorized_for_profile(source, profile)
+            authorized_profiles = [
+                profile
                 for profile in profiles
-            ):
+                if _source_is_authorized_for_profile(source, profile)
+            ]
+            if not authorized_profiles:
                 continue
+            source_id = int(item["source_id"])
+            source_order.setdefault(source_id, len(source_order))
+            shelf_item = dict(item)
+            shelf_item["_source_language"] = (
+                item.get("language")
+                if item.get("language") not in {None, "", "unknown"}
+                else source.get("language") or "unknown"
+            )
+            shelf_item["_source_content_kind"] = (
+                item.get("content_kind")
+                if item.get("content_kind") not in {None, "", "unknown"}
+                else source.get("content_kind") or "unknown"
+            )
+
+            def eligible_content_shelves(profile: str) -> list[str]:
+                owned = daily_owned.get(profile, set())
+                if owned & {"new", "again"}:
+                    return []
+                profile_item = dict(shelf_item)
+                profile_item["_profile_completed_at"] = completed_at_by_profile.get(profile)
+                eligible = [
+                    shelf
+                    for shelf in content_shelves_by_profile.get(profile, ())
+                    if _kids_shelf_candidate_allowed(
+                        profile_item,
+                        profile=profile,
+                        shelf=shelf,
+                        cooldown_after=cooldown_after,
+                    )
+                ]
+                owned_content = [shelf for shelf in eligible if shelf in owned]
+                return owned_content or (eligible if not owned else [])
+
             if _catalog_item_safety_is_current(
                 item,
                 policy_version=self.kids_item_policy_version,
                 recheck_seconds=self.kids_item_recheck_seconds,
                 now=current,
             ):
-                source_id = int(item["source_id"])
                 assessed_by_source[source_id] = assessed_by_source.get(source_id, 0) + 1
+                if item.get("safety_verdict") != "SAFE":
+                    continue
+                for profile in authorized_profiles:
+                    if not self.kids_item_is_authorized(item, source, profile):
+                        continue
+                    eligible_shelves = eligible_content_shelves(profile)
+                    if eligible_shelves:
+                        content_shelf_counts[(profile, eligible_shelves[0])] += 1
                 continue
-            pending_by_source.setdefault(int(item["source_id"]), []).append({"item": item, "source": source})
+            shelf_hints: set[tuple[str, str]] = set()
+            for profile in authorized_profiles:
+                shelf_hints.update(
+                    (profile, shelf)
+                    for shelf in eligible_content_shelves(profile)
+                )
+            pending_by_source.setdefault(source_id, []).append(
+                {"item": item, "source": source, "_shelf_hints": shelf_hints}
+            )
         picked_sources: set[int] = set()
-        while pending_by_source and len(result) < bounded:
-            source_id = min(pending_by_source, key=lambda key: (assessed_by_source.get(key, 0), key in picked_sources))
-            result.append(pending_by_source[source_id].pop(0))
+        fairness_slots = bounded // 2
+        if bounded % 2 and budget_count % 2 == 0:
+            fairness_slots += 1
+        deficit_slots = bounded - fairness_slots
+
+        def fair_source_id(source_ids: list[int]) -> int:
+            return min(
+                source_ids,
+                key=lambda source_id: (
+                    assessed_by_source.get(source_id, 0),
+                    source_id in picked_sources,
+                    source_order[source_id],
+                ),
+            )
+
+        for _ in range(fairness_slots):
+            source_ids = list(pending_by_source)
+            if not source_ids:
+                break
+            source_id = fair_source_id(source_ids)
+            entry = pending_by_source[source_id].pop(0)
+            result.append({"item": entry["item"], "source": entry["source"]})
             picked_sources.add(source_id)
             assessed_by_source[source_id] = assessed_by_source.get(source_id, 0) + 1
             if not pending_by_source[source_id]:
                 del pending_by_source[source_id]
+
+        for _ in range(deficit_slots):
+            source_ids = list(pending_by_source)
+            if not source_ids:
+                break
+            scored: list[tuple[int, int, bool, int, int, set[tuple[str, str]]]] = []
+            for source_id in source_ids:
+                pairs = {
+                    pair
+                    for entry in pending_by_source[source_id]
+                    for pair in entry["_shelf_hints"]
+                    if content_shelf_counts[pair] < KIDS_SHELF_TARGET
+                }
+                if not pairs:
+                    continue
+                score = min(content_shelf_counts[pair] for pair in pairs)
+                scored.append(
+                    (
+                        score,
+                        assessed_by_source.get(source_id, 0),
+                        source_id in picked_sources,
+                        source_order[source_id],
+                        source_id,
+                        {pair for pair in pairs if content_shelf_counts[pair] == score},
+                    )
+                )
+            if scored:
+                _, _, _, _, source_id, target_pairs = min(scored)
+                entry_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(pending_by_source[source_id])
+                        if entry["_shelf_hints"] & target_pairs
+                    ),
+                    0,
+                )
+            else:
+                source_id = fair_source_id(source_ids)
+                entry_index = 0
+            entry = pending_by_source[source_id].pop(entry_index)
+            result.append({"item": entry["item"], "source": entry["source"]})
+            picked_sources.add(source_id)
+            assessed_by_source[source_id] = assessed_by_source.get(source_id, 0) + 1
+            if pending_by_source[source_id]:
+                continue
+            del pending_by_source[source_id]
         return result
 
     async def kids_item_assessment_budget_take(
