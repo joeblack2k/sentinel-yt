@@ -1014,9 +1014,8 @@ async def ingest_once(
 
     # Discover channel identities from Home; SAFE sources are auto-approved and remain parent-revocable.
     known_references = {
-        channel_id_from_reference(str(source.get("reference", "")))
-        for source in await db.catalog_sources_list()
-        if source.get("kind") == "channel"
+        channel_id_from_reference(reference)
+        for reference in await db.catalog_channel_references()
     }
     for card in raw_cards[:max_cards_per_source]:
         channel_id = str(card.get("channel_id", "")).strip()

@@ -916,9 +916,12 @@ class KidsDatabaseMixin:
             if expected_state is not None and old != expected_state:
                 await db.rollback()
                 return None
-            if old == "revoked" and values["state"] == "approved":
+            if old == "revoked" and (
+                values["state"] == "approved"
+                or entity == "source" and values["state"] != "revoked"
+            ):
                 await db.rollback()
-                raise ValueError("revoked entries cannot be approved")
+                raise ValueError("revoked entries cannot be reactivated")
             revision = await self._catalog_revision(db)
             await db.execute(
                 f"UPDATE {table} SET state=?, actor=?, changed_at=?, reason=?, revision=?, correlation_id=? WHERE id=?",
@@ -938,6 +941,17 @@ class KidsDatabaseMixin:
             if values["state"] in {"blocked", "revoked"}:
                 revoke_reason = values["reason"][:1000]
                 if entity == "source":
+                    if values["state"] == "revoked":
+                        await db.execute(
+                            "UPDATE catalog_sources SET parent_profile_slugs_json='[]' WHERE id=?",
+                            (entity_id,),
+                        )
+                        await db.execute("DELETE FROM catalog_source_profiles WHERE source_id=?", (entity_id,))
+                        if values["reason"].startswith("parent_discard:"):
+                            await db.execute(
+                                "UPDATE kids_daily_library SET item_id=NULL WHERE item_id IN (SELECT id FROM catalog_items WHERE source_id=?)",
+                                (entity_id,),
+                            )
                     await db.execute(
                         """
                         UPDATE relay_leases
@@ -2926,34 +2940,16 @@ class KidsDatabaseMixin:
                     FROM (
                         SELECT b.item_id,b.video_id,i.source_id,
                                CASE WHEN d.item_id IS NULL THEN 1 ELSE 0 END AS daily_priority,
-                               sp.shelf_priority,0 AS priority,
-                               COALESCE(b.next_attempt_at,'') AS due
+                               sp.shelf_priority,
+                               CASE b.status WHEN 'pending' THEN 0 WHEN 'retry' THEN 1 ELSE 2 END AS priority,
+                               CASE WHEN b.status='ready' THEN b.expires_at ELSE COALESCE(b.next_attempt_at,'') END AS due
                         FROM kids_resolve_backlog b
                         JOIN catalog_items i ON i.id=b.item_id
                         JOIN source_priority sp ON sp.id=i.source_id
                         LEFT JOIN daily_items d ON d.item_id=b.item_id
-                        WHERE b.status='pending'
-                          AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
-                        UNION ALL
-                        SELECT b.item_id,b.video_id,i.source_id,
-                               CASE WHEN d.item_id IS NULL THEN 1 ELSE 0 END AS daily_priority,
-                               sp.shelf_priority,1 AS priority,
-                               COALESCE(b.next_attempt_at,'') AS due
-                        FROM kids_resolve_backlog b
-                        JOIN catalog_items i ON i.id=b.item_id
-                        JOIN source_priority sp ON sp.id=i.source_id
-                        LEFT JOIN daily_items d ON d.item_id=b.item_id
-                        WHERE b.status='retry'
-                          AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?)
-                        UNION ALL
-                        SELECT b.item_id,b.video_id,i.source_id,
-                               CASE WHEN d.item_id IS NULL THEN 1 ELSE 0 END AS daily_priority,
-                               sp.shelf_priority,2 AS priority,b.expires_at AS due
-                        FROM kids_resolve_backlog b
-                        JOIN catalog_items i ON i.id=b.item_id
-                        JOIN source_priority sp ON sp.id=i.source_id
-                        LEFT JOIN daily_items d ON d.item_id=b.item_id
-                        WHERE b.status='ready' AND b.expires_at<=?
+                        WHERE (b.status IN ('pending','retry')
+                               AND (b.next_attempt_at IS NULL OR b.next_attempt_at<=?))
+                           OR (b.status='ready' AND b.expires_at<=?)
                     )
                 ) AS ranked
                 JOIN catalog_items i ON i.id=ranked.item_id
@@ -2962,7 +2958,7 @@ class KidsDatabaseMixin:
                          ranked.priority ASC,ranked.source_position ASC,
                          ranked.due ASC,ranked.item_id ASC
                 """,
-                (now_iso, now_iso, refresh_at),
+                (now_iso, refresh_at),
             )
             candidate_rows = await cur.fetchall()
             candidate_columns = [description[0] for description in cur.description]
@@ -3214,7 +3210,11 @@ class KidsDatabaseMixin:
             "id": "b.item_id",
         }.get(sort_base, "b.updated_at")
         order_direction = "DESC" if sort_desc else "ASC"
-        where = []
+        where = ["""NOT EXISTS (
+            SELECT 1 FROM catalog_transitions t
+            WHERE t.entity_type='source' AND t.entity_id=s.id
+              AND t.to_state='revoked' AND substr(t.reason,1,15)='parent_discard:'
+        )"""]
         args: list[Any] = []
         if status_value:
             where.append("b.status=?")
@@ -3531,6 +3531,13 @@ class KidsDatabaseMixin:
             cols = [d[0] for d in cur.description] if row else []
         return dict(zip(cols, row)) if row else None
 
+    async def catalog_channel_references(self) -> list[str]:
+        async with aiosqlite.connect(self.db_path) as db:
+            rows = await (await db.execute(
+                "SELECT reference FROM catalog_sources WHERE kind='channel'"
+            )).fetchall()
+        return [row[0] for row in rows]
+
     async def catalog_sources_list(
         self,
         *,
@@ -3602,6 +3609,10 @@ class KidsDatabaseMixin:
             cur = await db.execute(
                 f"""
                 SELECT s.*,
+                       (SELECT t.reason FROM catalog_transitions t
+                        WHERE t.entity_type='source' AND t.entity_id=s.id
+                          AND t.to_state='revoked' AND substr(t.reason,1,15)='parent_discard:'
+                        ORDER BY t.id DESC LIMIT 1) AS discard_reason,
                        COUNT(DISTINCT i.id) AS item_count,
                        COUNT(DISTINCT CASE WHEN i.state='approved' THEN i.id END) AS approved_item_count,
                        COUNT(DISTINCT CASE WHEN b.status='ready' THEN i.id END) AS ready_item_count,
