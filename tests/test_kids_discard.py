@@ -35,6 +35,14 @@ async def test_discard_is_permanent_visible_and_keeps_safety_verdict(tmp_path):
     assert row['parent_profile_slugs_json'] == '[]'
     assert await db.kids_item_assessment_candidates(limit=10) == []
     assert await db.kids_eligible_feed_list(300, profile='noah') == []
+    deferred = await eligible_item(db, 'age-deferred')
+    await db.kids_source_profiles_set(deferred['source_id'], [], actor='parent-ui',
+        reason='parent_defer:age: Later', correlation_id='defer', persist_parent_selection=True)
+    await db.kids_resolve_sync_backlog()
+    rows = await db.kids_resolve_recent_rows()
+    assert [row['item_id'] for row in rows] == [deferred['id']]
+    counts = (await db.kids_resolve_summary())['counts']
+    assert sum(count for state, count in counts.items() if state != 'failed') == 1
 
 
 @pytest.mark.asyncio

@@ -3121,7 +3121,11 @@ class KidsDatabaseMixin:
                 SELECT b.status,COUNT(*)
                 FROM kids_resolve_backlog b
                 JOIN catalog_items i ON i.id=b.item_id
-                WHERE 1=1 {profile_filter}
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM catalog_transitions t
+                    WHERE t.entity_type='source' AND t.entity_id=i.source_id
+                      AND t.to_state='revoked' AND substr(t.reason,1,15)='parent_discard:'
+                ) {profile_filter}
                 GROUP BY b.status
                 """,
                 tuple(args),
