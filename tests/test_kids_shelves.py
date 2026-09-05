@@ -88,6 +88,12 @@ def test_shelf_languages_kinds_and_source_diversity():
         day="2026-09-04",
         now=datetime(2026, 9, 4, tzinfo=timezone.utc),
     )
+    next_day = _select_kids_shelves(
+        items,
+        profile="noah",
+        day="2026-09-05",
+        now=datetime(2026, 9, 5, tzinfo=timezone.utc),
+    )
 
     assert set(noah) == {"new", "learning-nl", "fun-en", "fun-nl"}
     assert set(felix) == {"new", "learning-nl", "fun-nl"}
@@ -114,6 +120,14 @@ def test_shelf_languages_kinds_and_source_diversity():
         for selected in shelves.values()
         for item in selected
     }
+    assert {
+        item["id"] for selected in next_day.values() for item in selected
+    } == {
+        item["id"] for selected in noah.values() for item in selected
+    }
+    assert [item["id"] for item in next_day["learning-nl"]] != [
+        item["id"] for item in noah["learning-nl"]
+    ]
 
     for shelves in (noah, felix):
         selected_ids = [
