@@ -86,7 +86,7 @@ class Settings:
     kids_item_assessment_daily_limit: int = field(
         default_factory=lambda: max(
             0,
-            min(200, int(os.getenv("KIDS_ITEM_ASSESSMENT_DAILY_LIMIT", "200"))),
+            min(400, int(os.getenv("KIDS_ITEM_ASSESSMENT_DAILY_LIMIT", "200"))),
         )
     )
     kids_resolver_min_quality_height: int = field(default_factory=_kids_resolver_min_quality_height)

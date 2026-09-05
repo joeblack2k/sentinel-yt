@@ -2664,7 +2664,7 @@ class KidsDatabaseMixin:
         self,
         daily_limit: int,
     ) -> bool:
-        limit = max(0, min(int(daily_limit), 200))
+        limit = max(0, min(int(daily_limit), 400))
         if limit == 0:
             return False
         day = datetime.now(timezone.utc).date().isoformat()
