@@ -717,7 +717,6 @@ async def kids_shelves(
         day=day,
         profile=profile_row["slug"],
         shelf_limit=KIDS_SHELF_TARGET,
-        shelf_ids=active_shelf_ids,
         proposed_item_ids={
             shelf: [int(item["id"]) for item in selected[shelf]]
             for shelf in active_shelf_ids

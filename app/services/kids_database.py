@@ -44,7 +44,6 @@ KIDS_CHANNEL_ART_HOSTS = frozenset(
     }
 )
 KIDS_VIDEO_THUMBNAIL_HOSTS = frozenset({"i.ytimg.com"})
-KIDS_SHELF_NAMES = ("learning", "fun", "again")
 
 
 def _profile_slugs(value: Any) -> list[str]:
@@ -1627,20 +1626,9 @@ class KidsDatabaseMixin:
         profile: str,
         shelf_limit: int,
         proposed_item_ids: dict[str, list[int]],
-        shelf_ids: tuple[str, ...] | list[str] | None = None,
     ) -> dict[str, list[int | None]]:
         limit = max(0, int(shelf_limit))
-        shelves = tuple(
-            dict.fromkeys(
-                str(shelf).strip()
-                for shelf in (
-                    shelf_ids
-                    if shelf_ids is not None
-                    else (tuple(proposed_item_ids) or KIDS_SHELF_NAMES)
-                )
-                if str(shelf).strip()
-            )
-        )
+        shelves = tuple(proposed_item_ids)
         proposed: dict[str, list[int]] = {}
         proposed_ids: set[int] = set()
         for shelf in shelves:
@@ -2627,6 +2615,8 @@ class KidsDatabaseMixin:
             rows = await cur.fetchall()
             columns = [description[0] for description in cur.description]
         result: list[dict[str, Any]] = []
+        pending_by_source: dict[int, list[dict[str, Any]]] = {}
+        assessed_by_source: dict[int, int] = {}
         for row in rows:
             item, source, _candidate_json = _catalog_row_context(row, columns)
             profiles = _profile_slugs(item.pop("_profile_slugs", ""))
@@ -2643,10 +2633,18 @@ class KidsDatabaseMixin:
                 recheck_seconds=self.kids_item_recheck_seconds,
                 now=current,
             ):
+                source_id = int(item["source_id"])
+                assessed_by_source[source_id] = assessed_by_source.get(source_id, 0) + 1
                 continue
-            result.append({"item": item, "source": source})
-            if len(result) >= bounded:
-                break
+            pending_by_source.setdefault(int(item["source_id"]), []).append({"item": item, "source": source})
+        picked_sources: set[int] = set()
+        while pending_by_source and len(result) < bounded:
+            source_id = min(pending_by_source, key=lambda key: (assessed_by_source.get(key, 0), key in picked_sources))
+            result.append(pending_by_source[source_id].pop(0))
+            picked_sources.add(source_id)
+            assessed_by_source[source_id] = assessed_by_source.get(source_id, 0) + 1
+            if not pending_by_source[source_id]:
+                del pending_by_source[source_id]
         return result
 
     async def kids_item_assessment_budget_take(
