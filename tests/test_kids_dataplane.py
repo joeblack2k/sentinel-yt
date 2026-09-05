@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import aiosqlite
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -1032,6 +1033,59 @@ def test_playback_relay_manifest_range_head_event_and_delete(tmp_path, monkeypat
             },
         ).status_code == 202
         assert client.delete(f"/v1/kids/playback-sessions/{lease['id']}").json() == {"closed": False}
+
+
+@pytest.mark.asyncio
+async def test_backlog_sync_batches_allow_lease_check_and_revoke(tmp_path, monkeypatch):
+    db = await seed_catalog(tmp_path / "sentinel.db", qualities=(1080,))
+    session = await create_feed_session(db)
+    with sqlite3.connect(db.db_path) as connection:
+        asset_id = connection.execute(
+            "SELECT asset_id FROM feed_session_items WHERE feed_session_id=? LIMIT 1",
+            (session["id"],),
+        ).fetchone()[0]
+        source_id = connection.execute("SELECT id FROM catalog_sources LIMIT 1").fetchone()[0]
+        now = datetime.now(timezone.utc).isoformat()
+        connection.executemany(
+            """INSERT INTO catalog_items(
+                video_id,source_id,state,actor,changed_at,reason,revision,correlation_id
+            ) VALUES(?,?,'approved','test',?,'concurrency',0,?)""",
+            [(f"concurrency-{i}", source_id, now, f"sync-{i}") for i in range(250)],
+        )
+        connection.commit()
+    lease = await db.kids_relay_lease_create(
+        asset_id=asset_id, policy_version="test-v1",
+        minimum_remaining_seconds=0, minimum_quality_height=720,
+    )
+    assert lease["status"] == "ok"
+    original_execute = aiosqlite.Connection.execute
+    original_commit = aiosqlite.Connection.commit
+    processed = 0
+    interleaved = False
+    syncing = asyncio.current_task()
+
+    async def execute(connection, sql, parameters=None):
+        nonlocal processed
+        if asyncio.current_task() is syncing and "UPDATE relay_leases" in sql:
+            processed += 1
+        return await original_execute(connection, sql, parameters)
+
+    async def commit(connection):
+        nonlocal interleaved
+        await original_commit(connection)
+        # A separate connection must validate and revoke before the scan ends.
+        if asyncio.current_task() is syncing and 0 < processed < 250 and not interleaved:
+            interleaved = True
+            assert await asyncio.wait_for(db.kids_relay_lease_get(lease["id"]), 1)
+            assert await asyncio.wait_for(
+                db.kids_revoke_active_leases(reason="concurrency-policy"), 1
+            ) == 1
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", execute)
+    monkeypatch.setattr(aiosqlite.Connection, "commit", commit)
+    await db.kids_resolve_sync_backlog()
+    assert interleaved, "The backlog writer held its transaction for the entire catalog"
+    assert await db.kids_relay_lease_get(lease["id"]) is None
 
 
 def test_playback_relay_follows_upstream_media_redirects(tmp_path, monkeypatch):

@@ -3027,6 +3027,9 @@ class KidsDatabaseMixin:
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         now_datetime = datetime.now(timezone.utc)
         now = now_datetime.isoformat()
+
+        # Keep the catalog snapshot outside write transactions, then re-read
+        # current item/source state for each bounded write batch.
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
@@ -3044,8 +3047,13 @@ class KidsDatabaseMixin:
                 """,
                 (now, KIDS_HOME_SOURCE_REFERENCE),
             )
+            await db.commit()
             cur = await db.execute(
-                """
+                "SELECT item_id FROM kids_resolve_backlog ORDER BY item_id"
+            )
+            item_ids = [int(row[0]) for row in await cur.fetchall()]
+
+        select_sql_template = """
                 SELECT b.item_id,b.status,b.candidate_json AS _candidate_json,
                        b.quality_height AS _backlog_quality_height,
                        b.resolved_at AS _backlog_resolved_at,
@@ -3064,101 +3072,113 @@ class KidsDatabaseMixin:
                 FROM kids_resolve_backlog b
                 LEFT JOIN catalog_items i ON i.id=b.item_id
                 LEFT JOIN catalog_sources s ON s.id=i.source_id
-                """,
-            )
-            rows = await cur.fetchall()
-            columns = [d[0] for d in cur.description]
-            for row in rows:
-                item, source, candidate_json = _catalog_row_context(row, columns)
-                item_id = item["item_id"]
-                status = item["status"]
-                quality_height = item["_backlog_quality_height"]
-                resolved_at = _parse_utc(item["_backlog_resolved_at"])
-                profiles = _profile_slugs(item.pop("_profile_slugs", ""))
-                if not _catalog_item_is_authorized(item, source):
-                    await db.execute(
-                        """
-                        UPDATE kids_resolve_backlog
-                        SET status='blocked',candidate_json='',quality_height=NULL,codec='',
-                            resolved_at=NULL,expires_at=NULL,next_attempt_at=NULL,
-                            last_error_code='ineligible',updated_at=?
-                        WHERE item_id=?
-                        """,
-                        (now, item_id),
-                    )
-                    await db.execute(
-                        """
-                        UPDATE relay_leases
-                        SET state='revoked',
-                            revoked_reason=CASE
-                                WHEN trim(coalesce(revoked_reason,''))='' THEN 'catalog_ineligible'
-                                ELSE revoked_reason
-                            END,
-                            heartbeat_at=?
-                        WHERE item_id=? AND state='active'
-                        """,
-                        (now, item_id),
-                    )
-                elif not self.kids_item_is_authorized_for_any_profile(
-                        item,
-                        source,
-                        profiles,
-                    ):
-                    await db.execute(
-                        """
-                        UPDATE relay_leases
-                        SET state='revoked',
-                            revoked_reason=CASE
-                                WHEN trim(coalesce(revoked_reason,''))=''
-                                    THEN 'item_safety_ineligible'
-                                ELSE revoked_reason
-                            END,
-                            heartbeat_at=?
-                        WHERE item_id=? AND state='active'
-                        """,
-                        (now, item_id),
-                    )
-                elif status == "ready":
-                    try:
-                        candidate = json.loads(str(candidate_json))
-                    except (TypeError, json.JSONDecodeError):
-                        candidate = None
-                    usable_until = (
-                        kids_candidate_usable_until(
-                            candidate,
-                            now=now_datetime,
-                            resolved_at=resolved_at,
-                        )
-                        if resolved_at is not None
-                        else None
-                    )
-                    if (
-                        usable_until is None
-                        or not _stored_candidate_meets_policy(
-                            candidate_json,
-                            quality_height,
-                            minimum_quality_height,
-                        )
-                    ):
+                WHERE b.item_id IN ({})
+                """
+
+        for offset in range(0, len(item_ids), 100):
+            batch_ids = item_ids[offset:offset + 100]
+            placeholders = ",".join("?" for _ in batch_ids)
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("BEGIN IMMEDIATE")
+                cur = await db.execute(
+                    select_sql_template.format(placeholders),
+                    batch_ids,
+                )
+                rows = await cur.fetchall()
+                columns = [d[0] for d in cur.description]
+                for row in rows:
+                    item, source, candidate_json = _catalog_row_context(row, columns)
+                    item_id = item["item_id"]
+                    status = item["status"]
+                    quality_height = item["_backlog_quality_height"]
+                    resolved_at = _parse_utc(item["_backlog_resolved_at"])
+                    profiles = _profile_slugs(item.pop("_profile_slugs", ""))
+                    if not _catalog_item_is_authorized(item, source):
                         await db.execute(
                             """
                             UPDATE kids_resolve_backlog
-                            SET status='pending',candidate_json='',quality_height=NULL,codec='',
+                            SET status='blocked',candidate_json='',quality_height=NULL,codec='',
                                 resolved_at=NULL,expires_at=NULL,next_attempt_at=NULL,
-                                last_error_code='quality_below_policy',updated_at=?
+                                last_error_code='ineligible',updated_at=?
                             WHERE item_id=?
                             """,
                             (now, item_id),
                         )
-                    elif _parse_utc(item["_backlog_expires_at"]) != usable_until:
                         await db.execute(
                             """
-                            UPDATE kids_resolve_backlog
-                            SET expires_at=?,updated_at=?
-                            WHERE item_id=?
+                            UPDATE relay_leases
+                            SET state='revoked',
+                                revoked_reason=CASE
+                                    WHEN trim(coalesce(revoked_reason,''))='' THEN 'catalog_ineligible'
+                                    ELSE revoked_reason
+                                END,
+                                heartbeat_at=?
+                            WHERE item_id=? AND state='active'
                             """,
-                            (usable_until.isoformat(), now, item_id),
+                            (now, item_id),
                         )
+                    elif not self.kids_item_is_authorized_for_any_profile(
+                        item, source, profiles
+                    ):
+                        await db.execute(
+                            """
+                            UPDATE relay_leases
+                            SET state='revoked',
+                                revoked_reason=CASE
+                                    WHEN trim(coalesce(revoked_reason,''))=''
+                                        THEN 'item_safety_ineligible'
+                                    ELSE revoked_reason
+                                END,
+                                heartbeat_at=?
+                            WHERE item_id=? AND state='active'
+                            """,
+                            (now, item_id),
+                        )
+                    elif status == "ready":
+                        try:
+                            candidate = json.loads(str(candidate_json))
+                        except (TypeError, json.JSONDecodeError):
+                            candidate = None
+                        usable_until = (
+                            kids_candidate_usable_until(
+                                candidate,
+                                now=now_datetime,
+                                resolved_at=resolved_at,
+                            )
+                            if resolved_at is not None
+                            else None
+                        )
+                        if (
+                            usable_until is None
+                            or not _stored_candidate_meets_policy(
+                                candidate_json,
+                                quality_height,
+                                minimum_quality_height,
+                            )
+                        ):
+                            await db.execute(
+                                """
+                                UPDATE kids_resolve_backlog
+                                SET status='pending',candidate_json='',quality_height=NULL,codec='',
+                                    resolved_at=NULL,expires_at=NULL,next_attempt_at=NULL,
+                                    last_error_code='quality_below_policy',updated_at=?
+                                WHERE item_id=?
+                                """,
+                                (now, item_id),
+                            )
+                        elif _parse_utc(item["_backlog_expires_at"]) != usable_until:
+                            await db.execute(
+                                """
+                                UPDATE kids_resolve_backlog
+                                SET expires_at=?,updated_at=?
+                                WHERE item_id=?
+                                """,
+                                (usable_until.isoformat(), now, item_id),
+                            )
+                await db.commit()
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 """
                 UPDATE relay_leases
