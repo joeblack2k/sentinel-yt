@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -33,6 +34,7 @@ def test_committed_receipt_survives_closed_lease_but_cannot_create_history(tmp_p
     with TestClient(module.app) as client:
         asset = client.get("/v1/kids/feed").json()["items"][0]["id"]
         lease = client.post("/v1/kids/playback-sessions", json={"asset_id": asset}).json()["id"]
+        different_asset = client.get("/v1/kids/feed").json()["items"][0]["id"]
         payload = dict(asset_id=asset, session_id=lease, profile="noah", event="completed")
         first = client.post("/v1/kids/events", json=payload)
         assert first.status_code == 202
@@ -41,6 +43,13 @@ def test_committed_receipt_survives_closed_lease_but_cannot_create_history(tmp_p
         assert retry.status_code == 202
         assert retry.json() == first.json()
         assert client.post("/v1/kids/events", json={**payload, "profile": "felix"}).status_code != 202
+        assert different_asset != asset
+        assert client.post("/v1/kids/events", json={**payload, "asset_id": different_asset}).status_code != 202
         other = client.post("/v1/kids/playback-sessions", json={"asset_id": asset}).json()["id"]
         client.delete(f"/v1/kids/playback-sessions/{other}")
         assert client.post("/v1/kids/events", json={**payload, "session_id": other}).status_code != 202
+        with sqlite3.connect(tmp_path / "sentinel.db") as connection:
+            connection.execute("UPDATE feed_sessions SET expires_at='2000-01-01T00:00:00+00:00'")
+        expired_retry = client.post("/v1/kids/events", json=payload)
+        assert expired_retry.status_code == 202
+        assert expired_retry.json() == first.json()
