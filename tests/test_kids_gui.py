@@ -28,5 +28,41 @@ def test_kids_template_includes_shelves_preview_and_api_contract():
     assert 'data-slug="noah"' in html
 
     assert 'fetch(`/v1/kids/shelves?profile=${encodeURIComponent(slug)}`)' in html
-    assert "const labels = { learning: 'Leren & ontdekken', fun: 'Verhalen & plezier', again: 'Nog een keer' };" in html
-    assert "const safeLabel = escapeHTML(labels[shelf.id] || 'Plank');" in html
+    assert "'lego-build': 'LEGO bouwen'" in html
+    assert "'learning-nl': 'Leren & ontdekken (NL)'" in html
+    assert "'fun-en': 'Engels & plezier (EN)'" in html
+    assert "const safeLabel = escapeHTML(labels[shelf.id] || shelf.title || shelf.id);" in html
+
+
+def test_kids_template_includes_editorial_classification_controls():
+    items = [
+        {"id": 42, "video_id": "testvideo123", "title": "Test Lego Video", "state": "approved", "source_id": 10, "thumbnail_url": None}
+    ]
+    environment = Environment(
+        loader=FileSystemLoader(TEMPLATES),
+        autoescape=select_autoescape(["html", "xml"]),
+    )
+    html = environment.get_template("kids.html").render(
+        page="kids",
+        profiles=[],
+        kids_status={},
+        sources=[],
+        items=items
+    )
+    assert 'class="btn-classify secondary"' in html
+    assert 'data-item-id="42"' in html
+    assert 'id="editorial-row-42"' in html
+    assert 'id="editorial-box-42"' in html
+    assert 'for="editorial-audience-${itemId}"' in html
+    assert 'id="editorial-audience-${itemId}"' in html
+    assert 'for="editorial-category-${itemId}"' in html
+    assert 'id="editorial-category-${itemId}"' in html
+    assert 'for="editorial-reason-${itemId}"' in html
+    assert 'id="editorial-reason-${itemId}"' in html
+    assert 'maxlength="1000"' in html
+    assert 'fetch(`/api/kids/items/${itemId}/editorial`)' in html
+    assert 'method: \'PUT\'' in html
+    assert 'target_audience:' in html
+    assert 'lego_build' in html
+    assert 'preschool' in html
+    assert 'Peuter / Kleuter' in html

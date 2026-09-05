@@ -482,11 +482,21 @@
             {% endif %}
           </td>
           <td style="text-align:right;">
-            {% if item.state != 'revoked' %}
-              <button type="button" class="btn-revoke" data-item-id="{{ item.id }}" data-state="revoked" title="Revoke item">Revoke (Unsave)</button>
-            {% else %}
-              <span class="muted" style="font-size:12px;">Revoked</span>
-            {% endif %}
+            <div style="display:flex; flex-direction:column; gap:6px; align-items:flex-end;">
+              <button type="button" class="btn-classify secondary" data-item-id="{{ item.id }}" title="Classificeer video">Classificeer</button>
+              {% if item.state != 'revoked' %}
+                <button type="button" class="btn-revoke" data-item-id="{{ item.id }}" data-state="revoked" title="Revoke item">Revoke (Unsave)</button>
+              {% else %}
+                <span class="muted" style="font-size:12px;">Revoked</span>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        <tr id="editorial-row-{{ item.id }}" class="editorial-row" style="display:none; background:#f8fafc; border-bottom: 2px solid #cbd5e1;">
+          <td colspan="6" style="padding:12px 18px;">
+            <div id="editorial-box-{{ item.id }}" class="editorial-box" data-item-id="{{ item.id }}">
+              <div class="editorial-loading muted" style="font-size:13px;">Classificatie laden...</div>
+            </div>
           </td>
         </tr>
         {% else %}
@@ -779,6 +789,145 @@ applyQuickSourcesFilters();
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
   }[tag]));
 
+  document.querySelectorAll('.btn-classify').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const itemId = btn.dataset.itemId;
+      const row = document.getElementById(`editorial-row-${itemId}`);
+      const box = document.getElementById(`editorial-box-${itemId}`);
+      if (!row || !box) return;
+
+      if (row.style.display !== 'none') {
+        row.style.display = 'none';
+        return;
+      }
+
+      row.style.display = 'table-row';
+      box.innerHTML = '<div class="editorial-loading muted" style="font-size:13px;">Classificatie laden...</div>';
+
+      try {
+        const response = await fetch(`/api/kids/items/${itemId}/editorial`);
+        if (!response.ok) throw new Error(await response.text());
+        const data = await response.json();
+        renderEditorialEditor(box, itemId, data.classification);
+      } catch (err) {
+        box.innerHTML = `<div style="color:#b91c1c; font-size:13px;">Fout bij ophalen classificatie: ${escapeHTML(err.message || String(err))}</div>`;
+      }
+    });
+  });
+
+  function renderEditorialEditor(box, itemId, classification) {
+    const c = classification || {};
+    const origin = c.origin || null;
+    const targetAudience = c.target_audience || 'unknown';
+    const category = c.category || 'unknown';
+    const reason = c.reason || '';
+
+    let originBadge = '';
+    if (origin === 'parent') {
+      originBadge = '<span class="badge badge-approved" style="font-size:11px;">Ouder (Handmatig)</span>';
+    } else if (origin === 'classifier') {
+      originBadge = '<span class="badge badge-pending" style="font-size:11px;">Classifier (Automatisch)</span>';
+    } else {
+      originBadge = '<span class="badge" style="background:#f1f5f9; color:#64748b; font-size:11px;">Nog niet geclassificeerd</span>';
+    }
+
+    box.innerHTML = `
+      <form class="editorial-form" data-item-id="${itemId}" style="display:flex; flex-direction:column; gap:12px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <strong style="font-size:14.5px; font-weight:700; color:#13232f;">Redactionele Classificatie</strong>
+            <span class="editorial-origin-container">${originBadge}</span>
+          </div>
+          <span class="editorial-status-msg" style="font-size:13.5px; font-weight:500;"></span>
+        </div>
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:14px; align-items:start;">
+          <div>
+            <label for="editorial-audience-${itemId}" style="display:block; font-size:13.5px; font-weight:600; margin-bottom:4px; color:#334155;">Doelgroep</label>
+            <select id="editorial-audience-${itemId}" name="target_audience" style="width:100%; padding:7px 10px; font-size:14px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1d2a32;">
+              <option value="preschool" ${targetAudience === 'preschool' ? 'selected' : ''}>Peuter / Kleuter (preschool)</option>
+              <option value="school_age" ${targetAudience === 'school_age' ? 'selected' : ''}>Schoolkind (school_age)</option>
+              <option value="mixed" ${targetAudience === 'mixed' ? 'selected' : ''}>Gemengd (mixed)</option>
+              <option value="unknown" ${targetAudience === 'unknown' ? 'selected' : ''}>Onbekend (unknown)</option>
+            </select>
+          </div>
+          <div>
+            <label for="editorial-category-${itemId}" style="display:block; font-size:13.5px; font-weight:600; margin-bottom:4px; color:#334155;">Categorie</label>
+            <select id="editorial-category-${itemId}" name="category" style="width:100%; padding:7px 10px; font-size:14px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1d2a32;">
+              <option value="lego_build" ${category === 'lego_build' ? 'selected' : ''}>LEGO Bouwen (lego_build)</option>
+              <option value="lego_other" ${category === 'lego_other' ? 'selected' : ''}>LEGO Overig (lego_other)</option>
+              <option value="pokemon" ${category === 'pokemon' ? 'selected' : ''}>Pokémon (pokemon)</option>
+              <option value="science_nature" ${category === 'science_nature' ? 'selected' : ''}>Wetenschap &amp; Natuur (science_nature)</option>
+              <option value="language_learning" ${category === 'language_learning' ? 'selected' : ''}>Taal &amp; Leren (language_learning)</option>
+              <option value="stories_animation" ${category === 'stories_animation' ? 'selected' : ''}>Verhalen &amp; Animatie (stories_animation)</option>
+              <option value="music" ${category === 'music' ? 'selected' : ''}>Muziek (music)</option>
+              <option value="other" ${category === 'other' ? 'selected' : ''}>Overig (other)</option>
+              <option value="unknown" ${category === 'unknown' ? 'selected' : ''}>Onbekend (unknown)</option>
+            </select>
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <label for="editorial-reason-${itemId}" style="display:block; font-size:13.5px; font-weight:600; margin-bottom:4px; color:#334155;">Toelichting / Reden</label>
+            <input type="text" id="editorial-reason-${itemId}" name="reason" value="${escapeHTML(reason)}" maxlength="1000" placeholder="Waarom deze classificatie?" required style="width:100%; padding:7px 10px; font-size:14px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1d2a32;">
+          </div>
+        </div>
+        <div style="display:flex; gap:10px; align-items:center; margin-top:4px;">
+          <button type="submit" class="btn-save-editorial" style="font-size:13.5px; padding:6px 16px;">Opslaan</button>
+          <button type="button" class="btn-close-editorial secondary" data-item-id="${itemId}" style="font-size:13.5px; padding:6px 14px;">Sluiten</button>
+        </div>
+      </form>
+    `;
+
+    const form = box.querySelector('.editorial-form');
+    const closeBtn = box.querySelector('.btn-close-editorial');
+    const statusMsg = box.querySelector('.editorial-status-msg');
+    const saveBtn = box.querySelector('.btn-save-editorial');
+    const originContainer = box.querySelector('.editorial-origin-container');
+
+    closeBtn.addEventListener('click', () => {
+      const row = document.getElementById(`editorial-row-${itemId}`);
+      if (row) row.style.display = 'none';
+    });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      const targetAudienceVal = fd.get('target_audience');
+      const categoryVal = fd.get('category');
+      const reasonVal = (fd.get('reason') || '').trim();
+
+      if (!reasonVal) {
+        statusMsg.textContent = 'Vul een geldige reden in';
+        statusMsg.style.color = '#b91c1c';
+        return;
+      }
+
+      saveBtn.disabled = true;
+      statusMsg.textContent = 'Bezig met opslaan...';
+      statusMsg.style.color = '#5f6d6f';
+
+      try {
+        const resp = await fetch(`/api/kids/items/${itemId}/editorial`, {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
+          body: JSON.stringify({
+            target_audience: targetAudienceVal,
+            category: categoryVal,
+            reason: reasonVal
+          })
+        });
+        if (!resp.ok) throw new Error(await resp.text());
+        saveBtn.disabled = false;
+        statusMsg.textContent = 'Opgeslagen';
+        statusMsg.style.color = '#047857';
+        originContainer.innerHTML = '<span class="badge badge-approved" style="font-size:11px;">Ouder (Handmatig)</span>';
+        setTimeout(() => { if (statusMsg.textContent === 'Opgeslagen') statusMsg.textContent = ''; }, 3000);
+      } catch (saveErr) {
+        saveBtn.disabled = false;
+        statusMsg.textContent = `Fout: ${saveErr.message || String(saveErr)}`;
+        statusMsg.style.color = '#b91c1c';
+      }
+    });
+  }
+
   document.querySelectorAll('.profile-shelves-preview').forEach(async (container) => {
     const slug = container.dataset.slug;
     try {
@@ -795,8 +944,17 @@ applyQuickSourcesFilters();
       let html = '<div class="shelves-grid">';
 
       data.shelves.forEach(shelf => {
-        const labels = { learning: 'Leren & ontdekken', fun: 'Verhalen & plezier', again: 'Nog een keer' };
-        const safeLabel = escapeHTML(labels[shelf.id] || 'Plank');
+        const labels = {
+          'new': 'Nieuw',
+          'learning-nl': 'Leren & ontdekken (NL)',
+          'learning': 'Leren & ontdekken',
+          'fun-nl': 'Verhalen & plezier (NL)',
+          'fun-en': 'Engels & plezier (EN)',
+          'fun': 'Verhalen & plezier',
+          'lego-build': 'LEGO bouwen',
+          'again': 'Nog een keer'
+        };
+        const safeLabel = escapeHTML(labels[shelf.id] || shelf.title || shelf.id);
         html += `<div class="shelf-card">
           <div class="shelf-title">${safeLabel}</div>
           <div class="shelf-thumbs">`;
