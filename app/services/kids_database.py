@@ -941,17 +941,16 @@ class KidsDatabaseMixin:
             if values["state"] in {"blocked", "revoked"}:
                 revoke_reason = values["reason"][:1000]
                 if entity == "source":
-                    if values["state"] == "revoked":
+                    if values["state"] == "revoked" and values["reason"].startswith("parent_discard:"):
                         await db.execute(
                             "UPDATE catalog_sources SET parent_profile_slugs_json='[]' WHERE id=?",
                             (entity_id,),
                         )
                         await db.execute("DELETE FROM catalog_source_profiles WHERE source_id=?", (entity_id,))
-                        if values["reason"].startswith("parent_discard:"):
-                            await db.execute(
-                                "UPDATE kids_daily_library SET item_id=NULL WHERE item_id IN (SELECT id FROM catalog_items WHERE source_id=?)",
-                                (entity_id,),
-                            )
+                        await db.execute(
+                            "UPDATE kids_daily_library SET item_id=NULL WHERE item_id IN (SELECT id FROM catalog_items WHERE source_id=?)",
+                            (entity_id,),
+                        )
                     await db.execute(
                         """
                         UPDATE relay_leases
