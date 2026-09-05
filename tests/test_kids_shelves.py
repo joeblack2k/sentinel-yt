@@ -8,7 +8,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.db import Database
-from app.kids_api import KIDS_PROFILE_SHELF_IDS, KIDS_SHELF_PAGE_SIZE, _select_kids_shelves
+from app.kids_api import KIDS_PROFILE_SHELF_IDS, KIDS_SHELF_PAGE_SIZE, _encode_kids_cursor, _select_kids_shelves
 
 
 def _item(
@@ -139,7 +139,7 @@ def test_shelf_languages_kinds_and_source_diversity():
         ).values(), default=0) == 1
 
 
-def test_shelf_history_cooldown_started_completed_and_daily_determinism():
+def test_shelf_completed_only_history_and_daily_determinism():
     now = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
     items = [
         _item(
@@ -182,7 +182,11 @@ def test_shelf_history_cooldown_started_completed_and_daily_determinism():
     )
     assert {
         item["id"] for item in first["again"]
-    } == {1, 2, 3}
+    } == {2, 3}
+    assert 1 in {
+        item["id"] for shelf, values in first.items()
+        if shelf != "again" for item in values
+    }
     assert 2 not in {item["id"] for item in first["learning-nl"]}
     assert 3 not in {item["id"] for item in first["learning-nl"]}
     assert 4 in {item["id"] for item in first["learning-nl"]}
@@ -194,6 +198,18 @@ def test_shelf_history_cooldown_started_completed_and_daily_determinism():
         shelf: [item["id"] for item in selected]
         for shelf, selected in repeat.items()
     }
+
+
+def test_single_old_completion_remains_exclusively_in_again():
+    now = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
+    items = [_item(
+        1, 1, language="nl", content_kind="learning",
+        history_at=now - timedelta(days=30),
+        completed_at=now - timedelta(days=30),
+    )]
+    shelves = _select_kids_shelves(items, profile="noah", day="2026-09-04", now=now)
+    assert [item["id"] for item in shelves["again"]] == [1]
+    assert all(not items for shelf, items in shelves.items() if shelf != "again")
 
 
 async def _ready_item(
@@ -595,7 +611,7 @@ def test_new_session_interleaves_sources_in_existing_daily_slots(tmp_path, monke
         assert occupied.issubset(_daily_rows(db_path, day, "noah"))
 
 
-def test_again_history_is_profile_bound_and_accepts_started(tmp_path, monkeypatch):
+def test_again_history_is_profile_bound_and_requires_completion(tmp_path, monkeypatch):
     db_path = tmp_path / "sentinel.db"
     db = asyncio.run(
         _seed_shelf_catalog(
@@ -611,7 +627,7 @@ def test_again_history_is_profile_bound_and_accepts_started(tmp_path, monkeypatc
         asyncio.run(
             db.kids_watch_event_record(
                 video_id=item["video_id"],
-                event="started",
+                event="completed",
                 profile="noah",
                 position_seconds=2,
                 session_id="",
@@ -631,6 +647,55 @@ def test_again_history_is_profile_bound_and_accepts_started(tmp_path, monkeypatc
             item["id"] for item in items
         }
         assert "again" not in _asset_item_ids(db_path, felix.json())
+
+
+def test_completion_moves_existing_daily_owner_to_again(tmp_path, monkeypatch):
+    db_path = tmp_path / "sentinel.db"
+    db = asyncio.run(_seed_shelf_catalog(
+        db_path, [(i, "nl", "learning", ["noah", "felix"]) for i in range(1, 4)],
+    ))
+    module = _load_app(tmp_path, monkeypatch)
+    _mock_upstream(monkeypatch, module, [])
+    with TestClient(module.app) as client:
+        before = client.get("/v1/kids/shelves", params={"profile": "noah"}).json()
+        before_ids = _asset_item_ids(db_path, before)
+        assert "again" not in before_ids
+        item = asyncio.run(db.catalog_items_list())[0]
+        assert item["id"] in {i for ids in before_ids.values() for i in ids}
+        with sqlite3.connect(db_path) as connection:
+            old_session = connection.execute(
+                "SELECT f.feed_session_id FROM feed_session_items f "
+                "JOIN feed_sessions s ON s.id=f.feed_session_id "
+                "WHERE f.item_id=? AND s.profile='noah' AND s.shelf_id!='again'",
+                (item["id"],),
+            ).fetchone()[0]
+        asyncio.run(db.kids_watch_event_record(
+            video_id=item["video_id"], event="completed", profile="noah",
+            position_seconds=None, session_id="", startup_ms=None,
+            correlation_id="daily-owner-completion",
+        ))
+        stale = asyncio.run(db.kids_daily_library_get_or_create(
+            day=datetime.now(timezone.utc).date().isoformat(), profile="noah",
+            shelf_limit=72, proposed_item_ids=before_ids,
+        ))
+        assert all(item["id"] not in ids for shelf, ids in stale.items() if shelf != "again")
+        after = _asset_item_ids(db_path, client.get(
+            "/v1/kids/shelves", params={"profile": "noah"},
+        ).json())
+        assert after["again"] == [item["id"]]
+        assert all(item["id"] not in ids for shelf, ids in after.items() if shelf != "again")
+        old_page = client.get("/v1/kids/feed", params={
+            "profile": "noah", "cursor": _encode_kids_cursor(old_session, 0, "noah"),
+        })
+        assert old_page.status_code == 200
+        assert item["id"] not in _item_ids_for_assets(
+            db_path, [entry["id"] for entry in old_page.json()["items"]],
+        )
+        felix = _asset_item_ids(db_path, client.get(
+            "/v1/kids/shelves", params={"profile": "felix"},
+        ).json())
+        assert "again" not in felix
+        assert item["id"] in {i for ids in felix.values() for i in ids}
 
 
 def test_shelves_fill_initially_empty_daily_slots_without_reordering(tmp_path, monkeypatch):

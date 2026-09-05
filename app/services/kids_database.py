@@ -10,7 +10,6 @@ import aiosqlite
 
 from .kids_catalog import (
     KIDS_PROFILE_SHELF_IDS,
-    KIDS_SHELF_COOLDOWN,
     KIDS_SHELF_TARGET,
     KIDS_ITEM_CONTENT_KINDS,
     KIDS_ITEM_LANGUAGES,
@@ -1665,6 +1664,18 @@ class KidsDatabaseMixin:
         now = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                UPDATE kids_daily_library SET item_id=NULL
+                WHERE day=? AND profile=? AND shelf!='again'
+                  AND item_id IN (
+                      SELECT i.id FROM catalog_items i
+                      JOIN kids_watch_events w ON w.video_id=i.video_id
+                      WHERE w.profile=? AND w.event='completed'
+                  )
+                """,
+                (day, profile, profile),
+            )
             cur = await db.execute(
                 """
                 SELECT shelf,ordinal,item_id
@@ -1680,22 +1691,37 @@ class KidsDatabaseMixin:
                     int(item_id) if item_id is not None else None
                 )
             existing_owner: dict[int, str] = {}
+            completed_ids = {
+                int(row[0]) for row in await (await db.execute(
+                    "SELECT DISTINCT i.id FROM catalog_items i "
+                    "JOIN kids_watch_events w ON w.video_id=i.video_id "
+                    "WHERE w.profile=? AND w.event='completed'",
+                    (profile,),
+                )).fetchall()
+            }
             for shelf in shelves:
+                if shelf == "again":
+                    continue
                 for item_id in existing.get(shelf, {}).values():
                     if item_id is not None:
                         existing_owner.setdefault(item_id, shelf)
             result: dict[str, list[int | None]] = {}
-            used_item_ids = set(existing_owner)
+            used_item_ids = set(existing_owner) | set(proposed.get("again", []))
             for shelf in shelves:
                 stored = existing.get(shelf, {})
-                values = [stored.get(ordinal) for ordinal in range(limit)]
+                values = (
+                    (proposed[shelf] + [None] * limit)[:limit]
+                    if shelf == "again"
+                    else [stored.get(ordinal) for ordinal in range(limit)]
+                )
                 for ordinal, item_id in enumerate(values):
-                    if item_id is not None and existing_owner.get(item_id) != shelf:
+                    if shelf != "again" and item_id is not None and existing_owner.get(item_id) != shelf:
                         values[ordinal] = None
                 replacements = iter(
                     item_id
                     for item_id in proposed[shelf]
                     if item_id not in used_item_ids
+                    and (shelf == "again" or item_id not in completed_ids)
                 )
                 for ordinal, item_id in enumerate(values):
                     if item_id is not None:
@@ -1740,6 +1766,7 @@ class KidsDatabaseMixin:
         include_items: bool = True,
         source_id: int | None = None,
         ordered_item_ids: list[int] | None = None,
+        shelf_id: str | None = None,
     ) -> dict[str, Any]:
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         now = datetime.now(timezone.utc)
@@ -1779,10 +1806,10 @@ class KidsDatabaseMixin:
             await db.execute(
                 """
                 INSERT INTO feed_sessions(
-                    id,profile,source_id,catalog_revision,policy_version,created_at,expires_at
-                ) VALUES(?,?,?,?,?,?,?)
+                    id,profile,source_id,catalog_revision,policy_version,created_at,expires_at,shelf_id
+                ) VALUES(?,?,?,?,?,?,?,?)
                 """,
-                (session_id, profile, source_id, revision, policy_version, now_iso, expires_at),
+                (session_id, profile, source_id, revision, policy_version, now_iso, expires_at, shelf_id),
             )
             if include_items:
                 source_filter = ""
@@ -2031,7 +2058,7 @@ class KidsDatabaseMixin:
             session = await (
                 await db.execute(
                     """
-                    SELECT profile,catalog_revision,policy_version,expires_at,source_id
+                    SELECT profile,catalog_revision,policy_version,expires_at,source_id,shelf_id
                     FROM feed_sessions WHERE id=?
                     """,
                     (session_id,),
@@ -2045,6 +2072,7 @@ class KidsDatabaseMixin:
                 session_policy,
                 session_expires,
                 session_source_id,
+                session_shelf_id,
             ) = session
             parsed_expiry = _parse_utc(session_expires)
             if parsed_expiry is None or parsed_expiry <= now:
@@ -2089,6 +2117,10 @@ class KidsDatabaseMixin:
                       )
                       AND (? IS NULL OR i.source_id=?)
                       AND b.status='ready' AND b.expires_at>?
+                      AND (?='again' OR NOT EXISTS (
+                          SELECT 1 FROM kids_watch_events w
+                          WHERE w.video_id=i.video_id AND w.profile=? AND w.event='completed'
+                      ))
                     ORDER BY f.ordinal ASC
                     LIMIT ?
                     """,
@@ -2100,6 +2132,8 @@ class KidsDatabaseMixin:
                         session_source_id,
                         session_source_id,
                         expires_after,
+                        session_shelf_id,
+                        profile,
                         batch_size,
                     ),
                 )
@@ -2682,7 +2716,6 @@ class KidsDatabaseMixin:
         pending_by_source: dict[int, list[dict[str, Any]]] = {}
         assessed_by_source: dict[int, int] = {}
         source_order: dict[int, int] = {}
-        cooldown_after = current - KIDS_SHELF_COOLDOWN
         for row in rows:
             item, source, _candidate_json = _catalog_row_context(row, columns)
             profiles = _profile_slugs(item.pop("_profile_slugs", ""))
@@ -2731,7 +2764,6 @@ class KidsDatabaseMixin:
                         profile_item,
                         profile=profile,
                         shelf=shelf,
-                        cooldown_after=cooldown_after,
                     )
                 ]
                 owned_content = [shelf for shelf in eligible if shelf in owned]

@@ -22,8 +22,7 @@ KIDS_PROFILE_SHELF_IDS = {
     "felix": ("new", "learning-nl", "fun-nl", "again"),
 }
 KIDS_SHELF_TARGET = 72
-KIDS_SHELF_MIN_AGAIN = 3
-KIDS_SHELF_COOLDOWN = timedelta(days=7)
+KIDS_SHELF_MIN_AGAIN = 1
 
 
 def normalize_age_suitability(value: Any) -> dict[str, str]:
@@ -350,23 +349,19 @@ def _kids_shelf_candidate_allowed(
     *,
     profile: str,
     shelf: str,
-    cooldown_after: datetime,
 ) -> bool:
+    raw_completed_at = item.get("_profile_completed_at")
+    completed_at = _parse_utc(raw_completed_at)
     if shelf == "again":
-        return _parse_utc(item.get("_profile_history_at")) is not None
+        return completed_at is not None
+    if str(raw_completed_at or "").strip():
+        return False
     if shelf == "new":
         language = str(item.get("_source_language") or "unknown").strip().lower()
         return (
-            _parse_utc(item.get("_profile_history_at")) is None
-            and language
+            language
             in ({"nl", "mixed"} if profile == "felix" else {"nl", "en", "mixed"})
         )
-    raw_completed_at = item.get("_profile_completed_at")
-    completed_at = _parse_utc(raw_completed_at)
-    if str(raw_completed_at or "").strip() and (
-        completed_at is None or completed_at > cooldown_after
-    ):
-        return False
     language = str(item.get("_source_language") or "unknown").strip().lower()
     content_kind = str(item.get("_source_content_kind") or "unknown").strip().lower()
     if shelf == "learning-nl" and content_kind not in {"learning", "mixed"}:

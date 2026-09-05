@@ -36,7 +36,6 @@ from .services.kids_database import (
 )
 from .services.kids_catalog import (
     KIDS_PROFILE_SHELF_IDS,
-    KIDS_SHELF_COOLDOWN,
     KIDS_SHELF_MIN_AGAIN,
     KIDS_SHELF_TARGET,
     _kids_shelf_candidate_allowed,
@@ -274,7 +273,6 @@ def _select_kids_shelves(
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     now = now.astimezone(timezone.utc)
-    cooldown_after = now - KIDS_SHELF_COOLDOWN
     shelf_ids = KIDS_PROFILE_SHELF_IDS.get(
         str(profile or "").strip().lower(),
         KIDS_PROFILE_SHELF_IDS["noah"],
@@ -292,7 +290,6 @@ def _select_kids_shelves(
                 item,
                 profile=profile,
                 shelf=shelf,
-                cooldown_after=cooldown_after,
             )
         ]
         for shelf in shelf_ids
@@ -675,7 +672,6 @@ async def kids_shelves(
         },
     )
     candidates_by_id = {int(item["id"]): item for item in candidates}
-    cooldown_after = day_boundary - KIDS_SHELF_COOLDOWN
     shelf_items_by_name = {
         shelf: [
             item
@@ -686,7 +682,6 @@ async def kids_shelves(
                 item,
                 profile=profile_row["slug"],
                 shelf=shelf,
-                cooldown_after=cooldown_after,
             )
         ]
         for shelf in active_shelf_ids
@@ -711,6 +706,7 @@ async def kids_shelves(
                 minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
                 minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
                 ordered_item_ids=ordered_item_ids,
+                shelf_id=shelf,
             )
             session_id = session["id"]
             page = await runtime.db.kids_feed_session_page(
