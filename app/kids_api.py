@@ -1373,6 +1373,7 @@ async def api_kids_source_profiles(
             actor=payload.actor,
             reason=payload.reason,
             correlation_id=payload.correlation_id,
+            persist_parent_selection=True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

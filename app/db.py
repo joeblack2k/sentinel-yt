@@ -428,6 +428,8 @@ class Database(KidsDatabaseMixin):
                 await db.execute(
                     "ALTER TABLE catalog_sources ADD COLUMN age_suitability_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            if "parent_profile_slugs_json" not in source_cols:
+                await db.execute("ALTER TABLE catalog_sources ADD COLUMN parent_profile_slugs_json TEXT")
             cur = await db.execute("PRAGMA table_info(feed_sessions)")
             feed_session_cols = {row[1] for row in await cur.fetchall()}
             if "source_id" not in feed_session_cols:

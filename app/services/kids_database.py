@@ -307,6 +307,7 @@ class KidsDatabaseMixin:
         actor: str,
         reason: str,
         correlation_id: str,
+        persist_parent_selection: bool = False,
     ) -> dict[str, Any] | None:
         requested = list(dict.fromkeys(str(profile or "").strip().lower() for profile in profiles))
         if any(profile not in DEFAULT_KIDS_PROFILE_SLUGS for profile in requested):
@@ -317,7 +318,8 @@ class KidsDatabaseMixin:
             source = await (
                 await db.execute(
                     """
-                    SELECT id,kind,reference,language,safety_verdict,age_suitability_json
+                    SELECT id,kind,reference,language,safety_verdict,age_suitability_json,
+                           parent_profile_slugs_json,state
                     FROM catalog_sources WHERE id=?
                     """,
                     (source_id,),
@@ -334,6 +336,15 @@ class KidsDatabaseMixin:
                 "safety_verdict": source[4],
                 "age_suitability_json": source[5],
             }
+            parent_json = json.dumps(sorted(requested)) if persist_parent_selection else source[6]
+            intent_changed = persist_parent_selection and parent_json != source[6]
+            if not persist_parent_selection and parent_json is not None:
+                requested = [
+                    profile for profile in json.loads(parent_json)
+                    if _source_is_authorized_for_profile(source_policy, profile)
+                ]
+            if source[7] in {"blocked", "revoked"}:
+                requested = []
             if any(
                 not _source_is_authorized_for_profile(source_policy, profile)
                 for profile in requested
@@ -350,8 +361,13 @@ class KidsDatabaseMixin:
             )
             current = {str(row[0]) for row in await cur.fetchall()}
             desired = set(requested)
-            if current != desired:
+            if current != desired or intent_changed:
                 revision = await self._catalog_revision(db)
+                if intent_changed:
+                    await db.execute(
+                        "UPDATE catalog_sources SET parent_profile_slugs_json=? WHERE id=?",
+                        (parent_json, source_id),
+                    )
                 if desired:
                     placeholders = ",".join("?" for _ in desired)
                     await db.execute(
@@ -402,16 +418,28 @@ class KidsDatabaseMixin:
                     ) VALUES(?,?,?,?,?,?,?,?)
                     """,
                     (
-                        "source_profiles_changed",
+                        "source_parent_profiles_changed" if intent_changed else "source_profiles_changed",
                         "source",
                         source_id,
                         actor,
-                        f"{reason[:900]} profiles={','.join(sorted(desired)) or 'none'}",
+                        f"{reason[:800]} "
+                        + (f"parent_profiles={parent_json} " if intent_changed else "")
+                        + f"profiles={','.join(sorted(desired)) or 'none'}",
                         revision,
                         correlation_id,
                         now,
                     ),
                 )
+            await db.execute(
+                """
+                UPDATE kids_daily_library SET item_id=NULL
+                WHERE item_id IN (SELECT id FROM catalog_items WHERE source_id=?)
+                  AND profile NOT IN (
+                      SELECT profile_slug FROM catalog_source_profiles WHERE source_id=?
+                  )
+                """,
+                (source_id, source_id),
+            )
             await db.commit()
         source_row = await self.catalog_get("source", source_id)
         if source_row is None:
