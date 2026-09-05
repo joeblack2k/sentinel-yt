@@ -394,3 +394,160 @@ async def test_daily_new_item_does_not_cover_a_content_shelf_deficit(tmp_path):
     candidates = await db.kids_item_assessment_candidates(limit=1)
 
     assert candidates[0]["item"]["source_id"] == daily_source["source_id"]
+
+
+@pytest.mark.asyncio
+async def test_editorial_reserve_uses_budget_cadence_for_batch_of_six(tmp_path):
+    db = Database(str(tmp_path / "kids.db"))
+    await db.init()
+    safety_source = await eligible_item(db, "cadence-safety")
+    editorial_source = await eligible_item(db, "cadence-editorial")
+    safety_items = [
+        await approved_item_for_source(
+            db, safety_source["source_id"], safety_source["channel_id"], f"cadence-safety-{i}"
+        )
+        for i in range(6)
+    ]
+    editorial_items = [
+        await approved_item_for_source(
+            db, editorial_source["source_id"], editorial_source["channel_id"], f"cadence-editorial-{i}"
+        )
+        for i in range(3)
+    ]
+    mark_unassessed(db, *(item["id"] for item in safety_items))
+    for item in editorial_items[:2]:
+        await db.kids_item_editorial(
+            item["id"],
+            {"target_audience": "school_age", "category": "other", "reason": "done"},
+        )
+    await db.set_setting("kids_item_assessment_budget_day", datetime.now(timezone.utc).date().isoformat())
+    await db.set_setting("kids_item_assessment_budget_count", "9")
+
+    candidates = await db.kids_item_assessment_candidates(limit=6)
+
+    assert len(candidates) == 6
+    assert sum(entry.get("editorial_only", False) for entry in candidates) == 1
+    assert candidates[0]["editorial_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_editorial_cadence_advances_after_tenth_budget_slot(tmp_path):
+    db = Database(str(tmp_path / "kids.db"))
+    await db.init()
+    editorial = await eligible_item(db, "cadence-advance")
+    await db.kids_item_editorial(
+        editorial["id"],
+        {"target_audience": "school_age", "category": "other", "reason": "done"},
+    )
+    second = await approved_item_for_source(
+        db, editorial["source_id"], editorial["channel_id"], "cadence-advance-2"
+    )
+    mark_unassessed(db, second["id"])
+    await db.set_setting("kids_item_assessment_budget_day", datetime.now(timezone.utc).date().isoformat())
+    await db.set_setting("kids_item_assessment_budget_count", "10")
+
+    candidates = await db.kids_item_assessment_candidates(limit=6)
+
+    assert [entry["item"]["id"] for entry in candidates] == [second["id"]]
+    assert all(not entry.get("editorial_only") for entry in candidates)
+
+
+@pytest.mark.asyncio
+async def test_parent_editorial_stale_hash_is_never_selected(tmp_path):
+    db = Database(str(tmp_path / "kids.db"))
+    await db.init()
+    item = await eligible_item(db, "parent-editorial")
+    await db.kids_item_editorial(
+        item["id"],
+        {"target_audience": "school_age", "category": "other", "reason": "parent"},
+    )
+    with sqlite3.connect(db.db_path) as connection:
+        connection.execute("UPDATE catalog_items SET title='changed' WHERE id=?", (item["id"],))
+        connection.commit()
+    refreshed = await db.catalog_get("item", item["id"])
+    await db.catalog_item_safety_update(
+        item["id"],
+        verdict=refreshed["safety_verdict"],
+        language=refreshed["language"],
+        content_kind=refreshed["content_kind"],
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+        reason=refreshed["safety_reason"],
+        actor="test",
+        correlation_id="parent-editorial-refresh",
+    )
+
+    candidates = await db.kids_item_assessment_candidates(limit=6)
+    assert all(not entry.get("editorial_only") for entry in candidates)
+
+
+@pytest.mark.asyncio
+async def test_editorial_interleave_respects_near_exhausted_budget(tmp_path):
+    db = Database(str(tmp_path / "kids.db"))
+    await db.init()
+    safety_source = await eligible_item(db, "near-limit-safety")
+    editorial_source = await eligible_item(db, "near-limit-editorial")
+    safety_items = [safety_source] + [
+        await approved_item_for_source(
+            db, safety_source["source_id"], safety_source["channel_id"], f"near-limit-safety-{i}"
+        )
+        for i in range(1)
+    ]
+    editorial = await approved_item_for_source(
+        db, editorial_source["source_id"], editorial_source["channel_id"], "near-limit-editorial-item"
+    )
+    await db.kids_item_editorial(
+        editorial_source["id"],
+        {"target_audience": "school_age", "category": "other", "reason": "done"},
+    )
+    mark_unassessed(db, *(item["id"] for item in safety_items))
+    day = datetime.now(timezone.utc).date().isoformat()
+    await db.set_setting("kids_item_assessment_budget_day", day)
+    await db.set_setting("kids_item_assessment_budget_count", "198")
+
+    candidates = await db.kids_item_assessment_candidates(
+        limit=6, daily_limit=200
+    )
+
+    assert len(candidates) == 2
+    assert candidates[0]["item"]["id"] == safety_items[0]["id"]
+    assert candidates[1]["item"]["id"] == editorial["id"]
+    assert candidates[1]["editorial_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_editorial_fills_spare_batch_slots_after_last_safety_item(tmp_path):
+    db = Database(str(tmp_path / "kids.db"))
+    await db.init()
+    safety_source = await eligible_item(db, "spare-safety")
+    editorial_source = await eligible_item(db, "spare-editorial")
+    safety = await approved_item_for_source(
+        db, safety_source["source_id"], safety_source["channel_id"], "spare-safety-item"
+    )
+    editorials = [
+        await approved_item_for_source(
+            db, editorial_source["source_id"], editorial_source["channel_id"], f"spare-editorial-{i}"
+        )
+        for i in range(3)
+    ]
+    await db.kids_item_editorial(
+        editorial_source["id"],
+        {"target_audience": "school_age", "category": "other", "reason": "done"},
+    )
+    await db.kids_item_editorial(
+        safety_source["id"],
+        {"target_audience": "school_age", "category": "other", "reason": "done"},
+    )
+    await db.kids_item_editorial(
+        safety["id"],
+        {"target_audience": "school_age", "category": "other", "reason": "pending"},
+    )
+    mark_unassessed(db, safety["id"])
+
+    candidates = await db.kids_item_assessment_candidates(
+        limit=6, daily_limit=200
+    )
+
+    assert [entry["item"]["id"] for entry in candidates] == [
+        safety["id"], *(item["id"] for item in editorials)
+    ]
+    assert all(entry.get("editorial_only") for entry in candidates[1:])

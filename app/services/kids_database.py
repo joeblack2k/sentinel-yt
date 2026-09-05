@@ -2679,6 +2679,7 @@ class KidsDatabaseMixin:
         self,
         *,
         limit: int,
+        daily_limit: int | None = None,
     ) -> list[dict[str, Any]]:
         bounded = max(0, min(int(limit), 20))
         if bounded == 0:
@@ -2753,6 +2754,10 @@ class KidsDatabaseMixin:
                 budget_count = 0
         else:
             budget_count = 0
+        if daily_limit is not None:
+            bounded = min(bounded, max(0, min(int(daily_limit), 400)) - budget_count)
+            if bounded <= 0:
+                return []
         content_shelves_by_profile = {
             profile: tuple(
                 shelf
@@ -2768,6 +2773,7 @@ class KidsDatabaseMixin:
         }
         result: list[dict[str, Any]] = []
         pending_by_source: dict[int, list[dict[str, Any]]] = {}
+        editorial_by_source: dict[int, list[dict[str, Any]]] = {}
         assessed_by_source: dict[int, int] = {}
         source_order: dict[int, int] = {}
         for row in rows:
@@ -2832,6 +2838,29 @@ class KidsDatabaseMixin:
                 assessed_by_source[source_id] = assessed_by_source.get(source_id, 0) + 1
                 if item.get("safety_verdict") != "SAFE":
                     continue
+                try:
+                    editorial = json.loads(item.get("editorial_classification_json") or "null")
+                except (TypeError, ValueError):
+                    editorial = None
+                editorial_current = (
+                    isinstance(editorial, dict)
+                    and editorial.get("input_hash") == catalog_item_input_hash(item)
+                    and editorial.get("version") == "kids-editorial-v1"
+                )
+                if (
+                    not editorial_current
+                    and not (
+                        isinstance(editorial, dict)
+                        and editorial.get("origin") == "parent"
+                    )
+                    and any(
+                        self.kids_item_is_authorized(item, source, profile)
+                        for profile in authorized_profiles
+                    )
+                ):
+                    editorial_by_source.setdefault(source_id, []).append(
+                        {"item": item, "source": source}
+                    )
                 for profile in authorized_profiles:
                     if not self.kids_item_is_authorized(item, source, profile):
                         continue
@@ -2921,6 +2950,28 @@ class KidsDatabaseMixin:
             if pending_by_source[source_id]:
                 continue
             del pending_by_source[source_id]
+
+        safety_result = result
+        editorial_result: list[dict[str, Any]] = []
+        while editorial_by_source and len(editorial_result) < bounded:
+            source_ids = list(editorial_by_source)
+            source_id = fair_source_id(source_ids)
+            entry = editorial_by_source[source_id].pop(0)
+            editorial_result.append(
+                {"item": entry["item"], "source": entry["source"], "editorial_only": True}
+            )
+            picked_sources.add(source_id)
+            assessed_by_source[source_id] = assessed_by_source.get(source_id, 0) + 1
+            if not editorial_by_source[source_id]:
+                del editorial_by_source[source_id]
+        result = []
+        for offset in range(bounded):
+            if editorial_result and (not safety_result or (budget_count + offset + 1) % 10 == 0):
+                result.append(editorial_result.pop(0))
+            elif safety_result:
+                result.append(safety_result.pop(0))
+            else:
+                break
         return result
 
     async def kids_item_assessment_budget_take(

@@ -74,6 +74,18 @@ class OpenCodexKidsClassifier:
                         {
                             "role": "system",
                             "content": (
+                                (
+                                "Classify only the editorial video fields. Do not assess safety, "
+                                "language, content kind, or age suitability. Return strict JSON with "
+                                "editorial containing target_audience preschool, school_age, mixed, or "
+                                "unknown; category lego_build, lego_other, pokemon, science_nature, "
+                                "language_learning, stories_animation, music, other, or unknown; and "
+                                "a short reason. Noah is nearly seven: toddler songs/basic preschool stories "
+                                "are preschool even when safe. lego_build requires real hands/people physically "
+                                "assembling LEGO as the main activity, not cartoons, gameplay, stop motion, "
+                                "unboxing alone or finished-model showcases. Use unknown without adequate evidence."
+                                if metadata.get("editorial_only")
+                                else
                                 "Classify this Kids source or video for a calm children's catalog "
                                 "with separate target ages 2 and 6. "
                                 "When kind is channel, judge the channel from all supplied samples, including thumbnails. "
@@ -103,6 +115,7 @@ class OpenCodexKidsClassifier:
                                 "are preschool even when safe. lego_build requires real hands/people physically "
                                 "assembling LEGO as the main activity, not cartoons, gameplay, stop motion, "
                                 "unboxing alone or finished-model showcases. Use unknown without adequate evidence."
+                                )
                             ),
                         },
                         {"role": "user", "content": user_content},
@@ -112,6 +125,9 @@ class OpenCodexKidsClassifier:
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
             result = self._parse_json(content)
+            if metadata.get("editorial_only"):
+                editorial = KidsEditorialRequest.model_validate(result.get("editorial")).model_dump()
+                return {"editorial": editorial}
             verdict = result.get("verdict")
             if verdict not in {"SAFE", "UNSAFE", "UNCERTAIN"}:
                 raise ValueError("invalid verdict")

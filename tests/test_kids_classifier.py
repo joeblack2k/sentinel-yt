@@ -29,6 +29,38 @@ async def test_video_editorial_is_validated_without_extra_requests(category):
 
 
 @pytest.mark.asyncio
+async def test_editorial_only_response_does_not_require_or_parse_safety_fields():
+    def handler(request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "gemini-kids"}]})
+        payload = json.loads(request.content)
+        assert "Do not assess safety" in payload["messages"][0]["content"]
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps({
+                "editorial": {
+                    "target_audience": "school_age",
+                    "category": "lego_build",
+                    "reason": "physical building",
+                }
+            })}}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        classifier = OpenCodexKidsClassifier(
+            base_url="http://test/v1", model="gemini-kids", client=client
+        )
+        result = await classifier.classify({"kind": "video", "editorial_only": True})
+    assert result == {
+        "editorial": {
+            "target_audience": "school_age",
+            "category": "lego_build",
+            "reason": "physical building",
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_classifier_checks_exact_model_and_returns_strict_safe_result():
     model_checks = 0
 

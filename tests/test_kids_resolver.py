@@ -833,6 +833,141 @@ async def test_resolver_classifier_outage_is_retryable_and_recovers_next_run(tmp
 
 
 @pytest.mark.asyncio
+async def test_existing_safe_item_editorial_backfill_preserves_safety(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    item = await eligible_item(db, "editorial-safe")
+    settings = Settings(db_path=db.db_path, kids_item_assessment_batch_size=1)
+    safety_before = await db.catalog_get("item", item["id"])
+
+    class Classifier:
+        async def check_model(self):
+            return settings.opencodex_model
+
+        async def classify(self, metadata):
+            assert metadata["editorial_only"] is True
+            return {
+                "verdict": "UNSAFE",
+                "language": "en",
+                "content_kind": "entertainment",
+                "age_suitability": {"2": "UNSUITABLE", "6": "UNSUITABLE"},
+                "reason": "editorial-only test",
+                "confidence": 100,
+                "editorial": {
+                    "target_audience": "school_age",
+                    "category": "lego_build",
+                    "reason": "physical building",
+                },
+            }
+
+    class Resolver:
+        async def resolve(self, video_id):
+            return None
+
+    result = await run_once(
+        db=db, settings=settings, classifier=Classifier(), resolver=Resolver()
+    )
+    safety_after = await db.catalog_get("item", item["id"])
+
+    assert result["assessed"] == 1
+    assert {
+        key: safety_after[key]
+        for key in (
+            "safety_verdict", "safety_reason", "safety_checked_at",
+            "safety_policy_version", "safety_input_hash",
+            "age_suitability_json", "state",
+        )
+    } == {
+        key: safety_before[key]
+        for key in (
+            "safety_verdict", "safety_reason", "safety_checked_at",
+            "safety_policy_version", "safety_input_hash",
+            "age_suitability_json", "state",
+        )
+    }
+    assert safety_after["editorial_classification_json"]
+
+
+@pytest.mark.asyncio
+async def test_editorial_backfill_exhausted_budget_makes_zero_calls(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    item = await eligible_item(db, "editorial-budget")
+    await db.set_setting("kids_item_assessment_budget_day", datetime.now(timezone.utc).date().isoformat())
+    await db.set_setting("kids_item_assessment_budget_count", "200")
+    calls = 0
+    settings = Settings(
+        db_path=db.db_path,
+        kids_item_assessment_batch_size=1,
+        kids_item_assessment_daily_limit=200,
+    )
+
+    class Classifier:
+        async def check_model(self):
+            return settings.opencodex_model
+
+        async def classify(self, metadata):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("budget should prevent classification")
+
+    class Resolver:
+        async def resolve(self, video_id):
+            return None
+
+    result = await run_once(
+        db=db, settings=settings, classifier=Classifier(), resolver=Resolver()
+    )
+
+    assert calls == 0
+    assert result["assessed"] == 0
+    assert (await db.catalog_get("item", item["id"]))["editorial_classification_json"] is None
+
+
+@pytest.mark.asyncio
+async def test_missing_editorial_is_marked_unknown_once(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    item = await eligible_item(db, "editorial-unknown")
+    settings = Settings(db_path=db.db_path, kids_item_assessment_batch_size=1)
+    calls = 0
+
+    class Classifier:
+        async def check_model(self):
+            return settings.opencodex_model
+
+        async def classify(self, metadata):
+            nonlocal calls
+            calls += 1
+            assert metadata["editorial_only"] is True
+            return {
+                "verdict": "SAFE",
+                "language": "nl",
+                "content_kind": "learning",
+                "age_suitability": {"2": "SUITABLE", "6": "SUITABLE"},
+                "reason": "safe",
+                "confidence": 100,
+            }
+
+    class Resolver:
+        async def resolve(self, video_id):
+            return None
+
+    first = await run_once(
+        db=db, settings=settings, classifier=Classifier(), resolver=Resolver()
+    )
+    second = await run_once(
+        db=db, settings=settings, classifier=Classifier(), resolver=Resolver()
+    )
+    stored = (await db.catalog_get("item", item["id"]))["editorial_classification_json"]
+
+    assert first["assessed"] == 1
+    assert second["assessed"] == 0
+    assert calls == 1
+    assert '"category": "unknown"' in stored
+
+
+@pytest.mark.asyncio
 async def test_item_assessment_prioritizes_current_daily_ready_inventory(tmp_path):
     db = Database(str(tmp_path / "sentinel.db"))
     await db.init()

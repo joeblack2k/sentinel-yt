@@ -399,6 +399,7 @@ async def run_once(
     judge = judge or JudgeService(db)
     assessment_candidates = await db.kids_item_assessment_candidates(
         limit=settings.kids_item_assessment_batch_size,
+        daily_limit=settings.kids_item_assessment_daily_limit,
     )
     counts: dict[str, int] = {
         "assessed": 0,
@@ -419,6 +420,7 @@ async def run_once(
         )
         owned_classifier = True
     assessment_failed = False
+    assessment_model_unavailable = False
     try:
         if classifier is not None:
             try:
@@ -426,14 +428,18 @@ async def run_once(
                 await db.set_setting("kids_resolver_classifier_status", "ready")
             except Exception:
                 counts["assessment_error"] += 1
-                counts["infrastructure_error"] = 1
                 await db.set_setting("kids_resolver_classifier_status", "unavailable")
-                assessment_failed = True
-        for assessment in assessment_candidates:
+                if any(not assessment.get("editorial_only") for assessment in assessment_candidates):
+                    counts["infrastructure_error"] = 1
+                    assessment_failed = True
+                else:
+                    assessment_model_unavailable = True
+        for assessment in ([] if assessment_model_unavailable else assessment_candidates):
             if assessment_failed:
                 break
             item = assessment["item"]
             source = assessment["source"]
+            editorial_only = bool(assessment.get("editorial_only"))
             if await judge.match_catalog_item_blocklist(item, source):
                 counts["assessment_blocklist"] += 1
                 continue
@@ -451,6 +457,7 @@ async def run_once(
             }
             metadata = {
                 "kind": "video",
+                **({"editorial_only": True} if editorial_only else {}),
                 **video_metadata,
                 "source_id": item.get("source_id"),
                 "source_reference": str(source.get("reference") or ""),
@@ -459,30 +466,55 @@ async def run_once(
             }
             try:
                 decision = await classifier.classify(metadata)
-                await db.catalog_item_safety_update(
-                    int(item["id"]),
-                    verdict=decision["verdict"],
-                    language=decision["language"],
-                    content_kind=decision["content_kind"],
-                    age_suitability=decision["age_suitability"],
-                    reason=str(decision.get("reason") or "Item classification"),
-                    actor="kids-item-classifier",
-                    correlation_id=f"kids-item-safety-{item['id']}",
-                    policy_version=settings.kids_item_policy_version,
-                    input_hash=catalog_item_input_hash(item),
-                    sync_backlog=False,
-                )
-                counts["assessed"] += 1
-                if decision.get("editorial") is not None:
+                if editorial_only:
+                    editorial = decision.get("editorial") or {
+                        "target_audience": "unknown",
+                        "category": "unknown",
+                        "reason": "No usable editorial classification",
+                    }
                     await db.kids_item_editorial(
-                        int(item["id"]), decision["editorial"],
+                        int(item["id"]), editorial,
                         input_hash=catalog_item_input_hash(item),
                     )
-                if decision["verdict"] == "UNCERTAIN":
-                    counts["assessment_uncertain"] += 1
+                else:
+                    await db.catalog_item_safety_update(
+                        int(item["id"]),
+                        verdict=decision["verdict"],
+                        language=decision["language"],
+                        content_kind=decision["content_kind"],
+                        age_suitability=decision["age_suitability"],
+                        reason=str(decision.get("reason") or "Item classification"),
+                        actor="kids-item-classifier",
+                        correlation_id=f"kids-item-safety-{item['id']}",
+                        policy_version=settings.kids_item_policy_version,
+                        input_hash=catalog_item_input_hash(item),
+                        sync_backlog=False,
+                    )
+                    if decision.get("editorial") is not None:
+                        await db.kids_item_editorial(
+                            int(item["id"]), decision["editorial"],
+                            input_hash=catalog_item_input_hash(item),
+                        )
+                    if decision["verdict"] == "UNCERTAIN":
+                        counts["assessment_uncertain"] += 1
+                counts["assessed"] += 1
                 await db.set_setting("kids_resolver_classifier_status", "ready")
             except Exception:
                 counts["assessment_error"] += 1
+                if editorial_only:
+                    try:
+                        await db.kids_item_editorial(
+                            int(item["id"]),
+                            {
+                                "target_audience": "unknown",
+                                "category": "unknown",
+                                "reason": "Editorial classification unavailable",
+                            },
+                            input_hash=catalog_item_input_hash(item),
+                        )
+                    except Exception:
+                        pass
+                    continue
                 counts["infrastructure_error"] = 1
                 await db.set_setting("kids_resolver_classifier_status", "unavailable")
                 assessment_failed = True
