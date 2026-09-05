@@ -6,19 +6,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-
-AGE_SUITABILITY_VALUES = frozenset({"SUITABLE", "UNSUITABLE", "UNCERTAIN"})
-
-
-def normalize_age_suitability(value: Any) -> dict[str, str]:
-    if not isinstance(value, dict) or set(value) != {"2", "6"}:
-        raise ValueError("invalid age suitability")
-    if any(
-        not isinstance(value[age], str) or value[age] not in AGE_SUITABILITY_VALUES
-        for age in ("2", "6")
-    ):
-        raise ValueError("invalid age suitability")
-    return {age: value[age] for age in ("2", "6")}
+from .kids_catalog import normalize_age_suitability
 
 
 class KidsClassificationError(RuntimeError):

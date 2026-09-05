@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
+from .services.kids_catalog import DEFAULT_KIDS_ITEM_POLICY_VERSION
+
 
 def _kids_resolver_min_quality_height() -> int:
     try:
@@ -62,6 +64,30 @@ class Settings:
     )
     kids_channel_sample_size: int = field(
         default_factory=lambda: int(os.getenv("KIDS_CHANNEL_SAMPLE_SIZE", "8"))
+    )
+    kids_item_policy_version: str = field(
+        default_factory=lambda: os.getenv(
+            "KIDS_ITEM_POLICY_VERSION",
+            DEFAULT_KIDS_ITEM_POLICY_VERSION,
+        ).strip()
+    )
+    kids_item_recheck_seconds: int = field(
+        default_factory=lambda: max(
+            0,
+            int(os.getenv("KIDS_ITEM_RECHECK_SECONDS", "0")),
+        )
+    )
+    kids_item_assessment_batch_size: int = field(
+        default_factory=lambda: max(
+            1,
+            min(20, int(os.getenv("KIDS_ITEM_ASSESSMENT_BATCH_SIZE", "6"))),
+        )
+    )
+    kids_item_assessment_daily_limit: int = field(
+        default_factory=lambda: max(
+            0,
+            min(200, int(os.getenv("KIDS_ITEM_ASSESSMENT_DAILY_LIMIT", "200"))),
+        )
     )
     kids_resolver_min_quality_height: int = field(default_factory=_kids_resolver_min_quality_height)
 

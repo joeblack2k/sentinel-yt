@@ -206,6 +206,16 @@ async def approved_item_for_source(
         item["id"],
         {"state": "approved", "actor": "parent", "reason": "approved", "correlation_id": "item-state"},
     )
+    await db.catalog_item_safety_update(
+        item["id"],
+        verdict="SAFE",
+        language="nl",
+        content_kind="learning",
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+        reason="test item safety",
+        actor="guardian",
+        correlation_id=f"item-safety-{video_id}",
+    )
     return item
 
 
@@ -748,6 +758,112 @@ async def test_resolver_worker_keeps_candidate_scoped_to_authorization_storage(t
         1, verdict="UNSAFE", reason="revoked", actor="guardian", correlation_id="unsafe"
     )
     assert await db.kids_playback_authorization("video-ready", minimum_remaining_seconds=300) is None
+
+
+@pytest.mark.asyncio
+async def test_resolver_classifier_outage_is_retryable_and_recovers_next_run(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    item = await eligible_item(db, "video-assessment-retry")
+    with sqlite3.connect(db.db_path) as connection:
+        connection.execute(
+            """
+            UPDATE catalog_items
+            SET safety_verdict='UNCERTAIN',safety_checked_at=NULL,
+                safety_policy_version='',safety_input_hash='',
+                age_suitability_json='{}'
+            WHERE id=?
+            """,
+            (item["id"],),
+        )
+        connection.commit()
+    settings = Settings(
+        db_path=db.db_path,
+        kids_resolver_batch_size=1,
+        kids_item_assessment_batch_size=1,
+    )
+
+    class OutageClassifier:
+        async def check_model(self):
+            raise RuntimeError("offline")
+
+    class HealthyClassifier:
+        async def check_model(self):
+            return settings.opencodex_model
+
+        async def classify(self, metadata):
+            assert metadata["video_id"] == "video-assessment-retry"
+            return {
+                "verdict": "SAFE",
+                "language": "nl",
+                "content_kind": "learning",
+                "age_suitability": {"2": "SUITABLE", "6": "SUITABLE"},
+                "reason": "safe test item",
+                "confidence": 100,
+            }
+
+    class Resolver:
+        async def resolve(self, video_id):
+            assert video_id == "video-assessment-retry"
+            return select_candidate(extraction_dump())
+
+    failed = await run_once(
+        db=db,
+        settings=settings,
+        resolver=Resolver(),
+        classifier=OutageClassifier(),
+    )
+    failed_item = await db.catalog_get("item", item["id"])
+    assert failed["infrastructure_error"] == 1
+    assert failed["claimed"] == 0
+    assert failed_item["safety_checked_at"] is None
+    assert await db.get_setting("kids_resolver_classifier_status") == "unavailable"
+    assert not await db.get_setting("kids_resolver_last_success_at")
+
+    recovered = await run_once(
+        db=db,
+        settings=settings,
+        resolver=Resolver(),
+        classifier=HealthyClassifier(),
+    )
+    recovered_item = await db.catalog_get("item", item["id"])
+    assert recovered["assessed"] == 1
+    assert recovered["ready"] == 1
+    assert recovered_item["safety_verdict"] == "SAFE"
+    assert recovered_item["safety_checked_at"]
+    assert await db.get_setting("kids_resolver_classifier_status") == "ready"
+    assert await db.get_setting("kids_resolver_last_success_at")
+
+
+@pytest.mark.asyncio
+async def test_item_assessment_prioritizes_current_daily_ready_inventory(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"))
+    await db.init()
+    old_retry = await eligible_item(db, "video-old-retry")
+    daily_ready = await eligible_item(db, "video-daily-ready")
+    await persist_ready_candidate(db, daily_ready["id"])
+    await db.kids_daily_library_get_or_create(
+        day="2026-09-05",
+        profile="noah",
+        shelf_limit=1,
+        proposed_item_ids={"learning": [daily_ready["id"]]},
+    )
+    with sqlite3.connect(db.db_path) as connection:
+        connection.execute(
+            """
+            UPDATE catalog_items
+            SET safety_verdict='UNCERTAIN',safety_checked_at=NULL,
+                safety_policy_version='',safety_input_hash='',
+                age_suitability_json='{}'
+            WHERE id IN (?,?)
+            """,
+            (old_retry["id"], daily_ready["id"]),
+        )
+        connection.commit()
+
+    candidates = await db.kids_item_assessment_candidates(limit=1)
+
+    assert candidates[0]["item"]["id"] == daily_ready["id"]
 
 
 @pytest.mark.asyncio

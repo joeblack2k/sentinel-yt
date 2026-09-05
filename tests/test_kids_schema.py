@@ -59,6 +59,16 @@ async def _approved_source_and_item(db: Database, suffix: str = "schema") -> tup
             "correlation_id": f"approve-item-{suffix}",
         },
     )
+    item = await db.catalog_item_safety_update(
+        item["id"],
+        verdict="SAFE",
+        language="nl",
+        content_kind="learning",
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+        reason="schema item safety",
+        actor="test",
+        correlation_id=f"item-safety-{suffix}",
+    )
     return source, item
 
 
@@ -126,6 +136,9 @@ async def test_kids_schema_init_is_idempotent_with_language_and_defaults(tmp_pat
         source_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(catalog_sources)")
         }
+        item_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(catalog_items)")
+        }
         feed_session_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(feed_sessions)")
         }
@@ -136,6 +149,16 @@ async def test_kids_schema_init_is_idempotent_with_language_and_defaults(tmp_pat
             )
         }
     assert {"language", "content_kind", "poster_item_id"} <= source_columns
+    assert {
+        "language",
+        "content_kind",
+        "safety_verdict",
+        "safety_reason",
+        "safety_checked_at",
+        "safety_policy_version",
+        "safety_input_hash",
+        "age_suitability_json",
+    } <= item_columns
     assert "source_id" in feed_session_columns
     assert {"feed_sessions", "feed_session_items", "relay_leases"} <= tables
 

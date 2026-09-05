@@ -173,7 +173,11 @@ class RuntimeState:
         await self.db.set_setting("last_error", "")
 
 settings = Settings()
-db = Database(settings.db_path)
+db = Database(
+    settings.db_path,
+    kids_item_policy_version=settings.kids_item_policy_version,
+    kids_item_recheck_seconds=settings.kids_item_recheck_seconds,
+)
 blocklists = BlocklistService(settings)
 judge = JudgeService(db, blocklists=blocklists)
 

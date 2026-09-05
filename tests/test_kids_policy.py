@@ -95,6 +95,16 @@ async def approved_source_and_item(
             "correlation_id": f"approve-item-{video_id}",
         },
     )
+    item = await db.catalog_item_safety_update(
+        item["id"],
+        verdict="SAFE",
+        language="nl",
+        content_kind="learning",
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+        reason="test item safety",
+        actor="guardian",
+        correlation_id=f"item-safety-{video_id}",
+    )
     return source, item
 
 
@@ -108,6 +118,27 @@ async def persist_ready(db: Database, item_id: int, quality_height: int = 1080) 
         resolved_at=resolved_at,
         expires_at=expires_at,
     )
+
+
+@pytest.mark.asyncio
+async def test_item_safety_without_time_limit_stays_valid_until_inputs_change(tmp_path):
+    db = Database(str(tmp_path / "sentinel.db"), kids_item_recheck_seconds=0)
+    await db.init()
+    source, item = await approved_source_and_item(
+        db,
+        video_id="stable00001",
+        title="Stable metadata",
+    )
+    with sqlite3.connect(db.db_path) as connection:
+        connection.execute(
+            "UPDATE catalog_items SET safety_checked_at=? WHERE id=?",
+            ((datetime.now(timezone.utc) - timedelta(days=365)).isoformat(), item["id"]),
+        )
+        connection.commit()
+
+    stored_item = await db.catalog_get("item", item["id"])
+    stored_source = await db.catalog_get("source", source["id"])
+    assert db.kids_item_is_authorized(stored_item, stored_source, "felix")
 
 
 @pytest.mark.asyncio

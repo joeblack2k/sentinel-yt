@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -7,9 +8,27 @@ from urllib.parse import parse_qs, quote, urlparse, urlsplit
 
 
 KIDS_HOME_SOURCE_REFERENCE = "__youtube_kids_home__"
+DEFAULT_KIDS_ITEM_POLICY_VERSION = "kids-item-safety-v1"
+DEFAULT_KIDS_ITEM_RECHECK_SECONDS = 0
 KIDS_PRACTICAL_CANDIDATE_TTL = timedelta(hours=5)
 KIDS_SIGNED_URL_MARGIN = timedelta(minutes=15)
 KIDS_MIN_RELAY_LIFETIME = timedelta(seconds=120)
+KIDS_ITEM_LANGUAGES = frozenset({"nl", "en", "mixed", "unknown"})
+KIDS_ITEM_VERDICTS = frozenset({"SAFE", "UNSAFE", "UNCERTAIN"})
+KIDS_ITEM_CONTENT_KINDS = frozenset({"learning", "entertainment", "mixed", "unknown"})
+KIDS_AGE_SUITABILITY_VALUES = frozenset({"SUITABLE", "UNSUITABLE", "UNCERTAIN"})
+
+
+def normalize_age_suitability(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {"2", "6"}:
+        raise ValueError("invalid age suitability")
+    if any(
+        not isinstance(value[age], str)
+        or value[age] not in KIDS_AGE_SUITABILITY_VALUES
+        for age in ("2", "6")
+    ):
+        raise ValueError("invalid age suitability")
+    return {age: value[age] for age in ("2", "6")}
 
 
 def _source_channel_id(kind: Any, reference: Any) -> str | None:
@@ -64,6 +83,21 @@ def _catalog_identity_is_known(item: dict[str, Any], source: dict[str, Any]) -> 
     return channel_id == expected_channel_id
 
 
+def catalog_item_input_hash(item: dict[str, Any]) -> str:
+    values = [
+        str(item.get(field) or "")
+        for field in (
+            "video_id",
+            "title",
+            "channel_id",
+            "channel_title",
+            "thumbnail_url",
+        )
+    ]
+    canonical = json.dumps(values, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _catalog_item_is_authorized(item: dict[str, Any], source: dict[str, Any]) -> bool:
     return not (
         item.get("state") != "approved"
@@ -74,18 +108,22 @@ def _catalog_item_is_authorized(item: dict[str, Any], source: dict[str, Any]) ->
     )
 
 
+def _age_suitability(value: Any) -> dict[str, str] | None:
+    try:
+        return normalize_age_suitability(json.loads(str(value or "{}")))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _source_is_authorized_for_profile(
     source: dict[str, Any],
     profile: str,
 ) -> bool:
-    try:
-        ages = json.loads(str(source.get("age_suitability_json") or "{}"))
-    except (TypeError, json.JSONDecodeError):
-        return False
-    language = str(source.get("language") or "unknown")
+    ages = _age_suitability(source.get("age_suitability_json"))
+    language = str(source.get("language") or "unknown").strip().lower()
     return bool(
         source.get("safety_verdict") == "SAFE"
-        and isinstance(ages, dict)
+        and ages is not None
         and (
             profile == "felix"
             and language in {"nl", "mixed"}
@@ -95,6 +133,72 @@ def _source_is_authorized_for_profile(
             and ages.get("6") == "SUITABLE"
         )
     )
+
+
+def _catalog_item_safety_is_current(
+    item: dict[str, Any],
+    *,
+    policy_version: str,
+    recheck_seconds: int,
+    now: datetime | None = None,
+) -> bool:
+    if (
+        not isinstance(policy_version, str)
+        or not policy_version
+        or item.get("safety_policy_version") != policy_version
+        or item.get("safety_input_hash") != catalog_item_input_hash(item)
+        or item.get("safety_verdict") not in KIDS_ITEM_VERDICTS
+        or str(item.get("language") or "").strip().lower()
+        not in KIDS_ITEM_LANGUAGES
+        or _age_suitability(item.get("age_suitability_json")) is None
+    ):
+        return False
+    checked_at_value = item.get("safety_checked_at")
+    if not isinstance(checked_at_value, str) or not checked_at_value:
+        return False
+    try:
+        parsed_checked_at = datetime.fromisoformat(checked_at_value)
+    except ValueError:
+        return False
+    if parsed_checked_at.tzinfo is None:
+        return False
+    checked_at = parsed_checked_at.astimezone(timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    try:
+        window_seconds = max(0, int(recheck_seconds))
+    except (TypeError, ValueError):
+        return False
+    return checked_at <= current and (
+        window_seconds == 0
+        or checked_at >= current - timedelta(seconds=window_seconds)
+    )
+
+
+def _catalog_item_is_authorized_for_profile(
+    item: dict[str, Any],
+    source: dict[str, Any],
+    profile: str,
+    *,
+    policy_version: str,
+    recheck_seconds: int = DEFAULT_KIDS_ITEM_RECHECK_SECONDS,
+    now: datetime | None = None,
+) -> bool:
+    if not _catalog_item_is_authorized(item, source):
+        return False
+    profile = str(profile or "").strip().lower()
+    if not _source_is_authorized_for_profile(source, profile):
+        return False
+    if not _catalog_item_safety_is_current(
+        item,
+        policy_version=policy_version,
+        recheck_seconds=recheck_seconds,
+        now=now,
+    ):
+        return False
+    return _source_is_authorized_for_profile(item, profile)
 
 
 def _quality_height_or_default(value: Any) -> int:
@@ -204,6 +308,9 @@ def _catalog_row_context(
         "title": values.pop("_source_title", None),
         "state": values.pop("_source_state", None),
         "safety_verdict": values.pop("_source_safety_verdict", None),
+        "language": values.pop("_source_language", None),
+        "content_kind": values.pop("_source_content_kind", None),
+        "age_suitability_json": values.pop("_source_age_suitability_json", None),
     }
     candidate_json = values.pop("_candidate_json", None)
     return values, source, candidate_json

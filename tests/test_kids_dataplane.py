@@ -92,6 +92,16 @@ async def seed_catalog(db_path, *, qualities=(720, 1080)) -> Database:
                 "correlation_id": f"dataplane-item-approved-{index}",
             },
         )
+        await db.catalog_item_safety_update(
+            item["id"],
+            verdict="SAFE",
+            language="nl",
+            content_kind="learning",
+            age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+            reason="contract item safety",
+            actor="test",
+            correlation_id=f"dataplane-item-safety-{index}",
+        )
         expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
         candidate = {
             "kind": "adaptive_mpv",
@@ -174,6 +184,16 @@ async def add_ready_source_item(
             "reason": f"secondary {suffix}",
             "correlation_id": f"secondary-item-approved-{suffix}",
         },
+    )
+    await db.catalog_item_safety_update(
+        item["id"],
+        verdict="SAFE" if safety_verdict == "SAFE" else "UNCERTAIN",
+        language="nl",
+        content_kind="learning",
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+        reason=f"secondary item {suffix}",
+        actor="test",
+        correlation_id=f"secondary-item-safety-{suffix}",
     )
     expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
     await db.kids_resolve_success(
@@ -753,6 +773,18 @@ def test_channel_feed_is_source_bound_across_pages_and_legacy_feed_remains(
             correlation_id="secondary-feed-thumbnail",
             channel_id=SECONDARY_CHANNEL_ID,
             channel_title=secondary_source["title"],
+        )
+    )
+    asyncio.run(
+        db.catalog_item_safety_update(
+            secondary_item["id"],
+            verdict="SAFE",
+            language="nl",
+            content_kind="learning",
+            age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+            reason="secondary refreshed item safety",
+            actor="test",
+            correlation_id="secondary-feed-item-safety",
         )
     )
     module = load_app(tmp_path, monkeypatch)

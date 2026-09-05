@@ -36,6 +36,9 @@ async def create_source(
     await db.catalog_source_safety_update(
         source["id"],
         verdict=safety_verdict,
+        language="nl",
+        content_kind="learning",
+        age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
         reason=f"poster source {suffix}",
         actor="test",
         correlation_id=f"poster-safety-{suffix}",
@@ -96,6 +99,16 @@ async def create_item(
                 "reason": f"poster item {suffix}",
                 "correlation_id": f"poster-item-state-{suffix}",
             },
+        )
+        await db.catalog_item_safety_update(
+            item["id"],
+            verdict="SAFE",
+            language="nl",
+            content_kind="learning",
+            age_suitability={"2": "SUITABLE", "6": "SUITABLE"},
+            reason=f"poster item safety {suffix}",
+            actor="test",
+            correlation_id=f"poster-item-safety-{suffix}",
         )
     return await db.catalog_get("item", item["id"])
 

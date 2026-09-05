@@ -7,14 +7,26 @@ from typing import Any, Optional
 import aiosqlite
 
 from .config import DEFAULT_POLICY_FLAGS, get_host_timezone_name
-from .services.kids_catalog import KIDS_HOME_SOURCE_REFERENCE
+from .services.kids_catalog import (
+    DEFAULT_KIDS_ITEM_POLICY_VERSION,
+    DEFAULT_KIDS_ITEM_RECHECK_SECONDS,
+    KIDS_HOME_SOURCE_REFERENCE,
+)
 from .services.kids_database import KidsDatabaseMixin
 from .services.time_utils import utc_now_iso
 
 
 class Database(KidsDatabaseMixin):
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        kids_item_policy_version: str = DEFAULT_KIDS_ITEM_POLICY_VERSION,
+        kids_item_recheck_seconds: int = DEFAULT_KIDS_ITEM_RECHECK_SECONDS,
+    ):
         self.db_path = db_path
+        self.kids_item_policy_version = kids_item_policy_version
+        self.kids_item_recheck_seconds = kids_item_recheck_seconds
 
     async def init(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -110,6 +122,17 @@ class Database(KidsDatabaseMixin):
                     thumbnail_url TEXT NOT NULL DEFAULT '',
                     duration_seconds INTEGER NOT NULL DEFAULT 0,
                     visual_category TEXT NOT NULL DEFAULT 'general',
+                    content_kind TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(content_kind IN ('learning', 'entertainment', 'mixed', 'unknown')),
+                    language TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(language IN ('nl', 'en', 'mixed', 'unknown')),
+                    safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN'
+                        CHECK(safety_verdict IN ('SAFE', 'UNSAFE', 'UNCERTAIN')),
+                    safety_reason TEXT NOT NULL DEFAULT '',
+                    safety_checked_at TEXT,
+                    safety_policy_version TEXT NOT NULL DEFAULT '',
+                    safety_input_hash TEXT NOT NULL DEFAULT '',
+                    age_suitability_json TEXT NOT NULL DEFAULT '{}',
                     state TEXT NOT NULL DEFAULT 'candidate'
                         CHECK(state IN ('candidate', 'approved', 'blocked', 'revoked', 'unknown')),
                     actor TEXT NOT NULL,
@@ -296,10 +319,52 @@ class Database(KidsDatabaseMixin):
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN duration_seconds INTEGER NOT NULL DEFAULT 0")
             if "visual_category" not in item_cols:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN visual_category TEXT NOT NULL DEFAULT 'general'")
+            if "content_kind" not in item_cols:
+                await db.execute(
+                    """
+                    ALTER TABLE catalog_items
+                    ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(content_kind IN ('learning', 'entertainment', 'mixed', 'unknown'))
+                    """
+                )
             if "channel_id" not in item_cols:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN channel_id TEXT NOT NULL DEFAULT ''")
             if "channel_title" not in item_cols:
                 await db.execute("ALTER TABLE catalog_items ADD COLUMN channel_title TEXT NOT NULL DEFAULT ''")
+            if "language" not in item_cols:
+                await db.execute(
+                    """
+                    ALTER TABLE catalog_items
+                    ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(language IN ('nl', 'en', 'mixed', 'unknown'))
+                    """
+                )
+            if "safety_verdict" not in item_cols:
+                await db.execute(
+                    """
+                    ALTER TABLE catalog_items
+                    ADD COLUMN safety_verdict TEXT NOT NULL DEFAULT 'UNCERTAIN'
+                        CHECK(safety_verdict IN ('SAFE', 'UNSAFE', 'UNCERTAIN'))
+                    """
+                )
+            if "safety_reason" not in item_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_items ADD COLUMN safety_reason TEXT NOT NULL DEFAULT ''"
+                )
+            if "safety_checked_at" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN safety_checked_at TEXT")
+            if "safety_policy_version" not in item_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_items ADD COLUMN safety_policy_version TEXT NOT NULL DEFAULT ''"
+                )
+            if "safety_input_hash" not in item_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_items ADD COLUMN safety_input_hash TEXT NOT NULL DEFAULT ''"
+                )
+            if "age_suitability_json" not in item_cols:
+                await db.execute(
+                    "ALTER TABLE catalog_items ADD COLUMN age_suitability_json TEXT NOT NULL DEFAULT '{}'"
+                )
             # Existing catalog rows predate source identity fields; backfill them
             # from the already-approved source instead of invalidating the catalog.
             await db.execute(
@@ -410,6 +475,7 @@ class Database(KidsDatabaseMixin):
             "schedule_mode": "blocklist",
             "kids_kill_switch": "true",
             "kids_resolver_last_success_at": "",
+            "kids_resolver_classifier_status": "unavailable",
         }
         for key, value in defaults.items():
             existing = await self.get_setting(key)

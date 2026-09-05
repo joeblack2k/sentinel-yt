@@ -252,6 +252,19 @@ async def _ready_item(
             "correlation_id": f"shelf-item-approved-{index}",
         },
     )
+    item = await db.catalog_item_safety_update(
+        item["id"],
+        verdict="SAFE",
+        language=language,
+        content_kind=content_kind,
+        age_suitability={
+            "2": "SUITABLE" if "felix" in profile_slugs else "UNSUITABLE",
+            "6": "SUITABLE" if "noah" in profile_slugs else "UNSUITABLE",
+        },
+        reason="shelf item safety",
+        actor="test",
+        correlation_id=f"shelf-item-safety-{index}",
+    )
     expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
     await db.kids_resolve_success(
         item_id=item["id"],

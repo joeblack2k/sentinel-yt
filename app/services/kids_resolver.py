@@ -9,14 +9,18 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs, urlsplit
 
 from ..config import Settings
 from ..db import Database
+from .blocklists import BlocklistService
+from .judge import JudgeService
+from .kids_classifier import OpenCodexKidsClassifier
 from .kids_catalog import (
     KIDS_MIN_RELAY_LIFETIME,
     KIDS_PRACTICAL_CANDIDATE_TTL,
     KIDS_SIGNED_URL_MARGIN,
+    _signed_stream_expiry,
+    catalog_item_input_hash,
     kids_candidate_usable_until,
 )
 from .kids_ingest import YouTubeKidsCDP
@@ -77,33 +81,6 @@ def _portrait_only(dump: dict[str, Any]) -> bool:
     return bool(videos) and all(_portrait(item) for item in videos)
 
 
-def _signed_googlevideo_url(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    parsed = urlsplit(value)
-    host = (parsed.hostname or "").lower()
-    query = parse_qs(parsed.query)
-    return (
-        parsed.scheme == "https"
-        and (host == "googlevideo.com" or host.endswith(".googlevideo.com"))
-        and bool(query.get("expire"))
-        and any(query.get(key) for key in ("sig", "signature", "lsig"))
-    )
-
-
-def _signed_expiry(value: Any) -> datetime | None:
-    if not _signed_googlevideo_url(value):
-        return None
-    try:
-        expiry = datetime.fromtimestamp(
-            int(parse_qs(urlsplit(value).query)["expire"][0]),
-            timezone.utc,
-        )
-    except (KeyError, TypeError, ValueError, OSError, OverflowError):
-        return None
-    return expiry
-
-
 def _headers(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
@@ -157,8 +134,8 @@ def select_candidate(
             for item in formats
             if isinstance(item, dict)
             and isinstance(item.get("url"), str)
-            and _signed_expiry(item["url"]) is not None
-            and _signed_expiry(item["url"]) > useful_until
+            and _signed_stream_expiry(item["url"]) is not None
+            and _signed_stream_expiry(item["url"]) > useful_until
             and str(item.get("vcodec", "")) == "none"
             and str(item.get("acodec", "")) not in {"", "none"}
         ),
@@ -170,8 +147,8 @@ def select_candidate(
         for item in formats
         if isinstance(item, dict)
         and isinstance(item.get("url"), str)
-        and _signed_expiry(item["url"]) is not None
-        and _signed_expiry(item["url"]) > useful_until
+        and _signed_stream_expiry(item["url"]) is not None
+        and _signed_stream_expiry(item["url"]) > useful_until
         and not _portrait(item)
         and str(item.get("vcodec", "")) not in {"", "none"}
         and str(item.get("acodec", "")) == "none"
@@ -251,7 +228,7 @@ def normalize_candidate(
     audio_url = candidate.get("audio_url")
     if not isinstance(media_url, str) or not isinstance(audio_url, str) or media_url == audio_url:
         return None
-    expiries = [_signed_expiry(media_url), _signed_expiry(audio_url)]
+    expiries = [_signed_stream_expiry(media_url), _signed_stream_expiry(audio_url)]
     required = {"media_url", "audio_url", "quality_height", "codec", "video_headers", "audio_headers"}
     if any(expiry is None for expiry in expiries):
         return None
@@ -413,16 +390,115 @@ async def run_once(
     db: Database,
     settings: Settings,
     resolver: YtDlpResolver | None = None,
+    classifier: OpenCodexKidsClassifier | None = None,
+    judge: JudgeService | None = None,
 ) -> dict[str, int]:
     await db.init()
+    db.kids_item_policy_version = settings.kids_item_policy_version
+    db.kids_item_recheck_seconds = settings.kids_item_recheck_seconds
     await db.kids_resolve_sync_backlog(
         minimum_quality_height=settings.kids_resolver_min_quality_height,
     )
+    judge = judge or JudgeService(db)
+    assessment_candidates = await db.kids_item_assessment_candidates(
+        limit=settings.kids_item_assessment_batch_size,
+    )
+    counts: dict[str, int] = {
+        "assessed": 0,
+        "assessment_uncertain": 0,
+        "assessment_blocklist": 0,
+        "assessment_budget_exhausted": 0,
+        "assessment_error": 0,
+        "infrastructure_error": 0,
+        "claimed": 0,
+        "ready": 0,
+        "retry": 0,
+    }
+    owned_classifier = False
+    if assessment_candidates and classifier is None:
+        classifier = OpenCodexKidsClassifier(
+            base_url=settings.opencodex_base_url,
+            model=settings.opencodex_model,
+        )
+        owned_classifier = True
+    assessment_failed = False
+    try:
+        if classifier is not None:
+            try:
+                await classifier.check_model()
+                await db.set_setting("kids_resolver_classifier_status", "ready")
+            except Exception:
+                counts["assessment_error"] += 1
+                counts["infrastructure_error"] = 1
+                await db.set_setting("kids_resolver_classifier_status", "unavailable")
+                assessment_failed = True
+        for assessment in assessment_candidates:
+            if assessment_failed:
+                break
+            item = assessment["item"]
+            source = assessment["source"]
+            if await judge.match_catalog_item_blocklist(item, source):
+                counts["assessment_blocklist"] += 1
+                continue
+            if not await db.kids_item_assessment_budget_take(
+                settings.kids_item_assessment_daily_limit,
+            ):
+                counts["assessment_budget_exhausted"] += 1
+                break
+            video_metadata = {
+                "video_id": str(item.get("video_id") or ""),
+                "title": str(item.get("title") or ""),
+                "channel_id": str(item.get("channel_id") or ""),
+                "channel_title": str(item.get("channel_title") or ""),
+                "thumbnail_url": str(item.get("thumbnail_url") or ""),
+            }
+            metadata = {
+                "kind": "video",
+                **video_metadata,
+                "source_id": item.get("source_id"),
+                "source_reference": str(source.get("reference") or ""),
+                "source_title": str(source.get("title") or ""),
+                "sample_videos": [video_metadata],
+            }
+            try:
+                decision = await classifier.classify(metadata)
+                await db.catalog_item_safety_update(
+                    int(item["id"]),
+                    verdict=decision["verdict"],
+                    language=decision["language"],
+                    content_kind=decision["content_kind"],
+                    age_suitability=decision["age_suitability"],
+                    reason=str(decision.get("reason") or "Item classification"),
+                    actor="kids-item-classifier",
+                    correlation_id=f"kids-item-safety-{item['id']}",
+                    policy_version=settings.kids_item_policy_version,
+                    input_hash=catalog_item_input_hash(item),
+                    sync_backlog=False,
+                )
+                counts["assessed"] += 1
+                if decision["verdict"] == "UNCERTAIN":
+                    counts["assessment_uncertain"] += 1
+                await db.set_setting("kids_resolver_classifier_status", "ready")
+            except Exception:
+                counts["assessment_error"] += 1
+                counts["infrastructure_error"] = 1
+                await db.set_setting("kids_resolver_classifier_status", "unavailable")
+                assessment_failed = True
+                break
+        await db.kids_resolve_sync_backlog(
+            minimum_quality_height=settings.kids_resolver_min_quality_height,
+        )
+    finally:
+        if owned_classifier and classifier is not None:
+            await classifier.close()
+    if assessment_failed:
+        logger.info("kids resolver stopped after assessment infrastructure error counts=%s", counts)
+        return counts
     jobs = await db.kids_resolve_claim_due(
         limit=settings.kids_resolver_batch_size,
         refresh_margin_seconds=settings.kids_resolve_refresh_margin_seconds,
     )
-    counts: dict[str, int] = {"claimed": len(jobs), "ready": 0, "retry": 0}
+    counts["claimed"] = len(jobs)
     if resolver is None:
         browser = YouTubeKidsCDP(settings.kids_resolver_cdp_url)
         resolver = YtDlpResolver(
@@ -474,7 +550,29 @@ async def _main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     logging.getLogger("yt_dlp").setLevel(logging.WARNING)
     settings = Settings()
-    await run_once(db=Database(settings.db_path), settings=settings)
+    db = Database(
+        settings.db_path,
+        kids_item_policy_version=settings.kids_item_policy_version,
+        kids_item_recheck_seconds=settings.kids_item_recheck_seconds,
+    )
+    await db.init()
+    blocklists = BlocklistService(settings)
+    await blocklists.reload(db)
+    judge = JudgeService(db, blocklists=blocklists)
+    await judge.reconcile_catalog_policy()
+    classifier = OpenCodexKidsClassifier(
+        base_url=settings.opencodex_base_url,
+        model=settings.opencodex_model,
+    )
+    try:
+        await run_once(
+            db=db,
+            settings=settings,
+            classifier=classifier,
+            judge=judge,
+        )
+    finally:
+        await classifier.close()
 
 
 if __name__ == "__main__":

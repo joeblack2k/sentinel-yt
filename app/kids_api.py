@@ -7,6 +7,7 @@ import os
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from itertools import chain, islice, zip_longest
 from pathlib import Path
 from typing import Any, AsyncGenerator
 from urllib.parse import quote, urlsplit
@@ -28,7 +29,6 @@ from .models import (
     KidsSourceProfilesRequest,
     KidsWatchEventRequest,
 )
-from .services.kids_classifier import OpenCodexKidsClassifier
 from .services.kids_database import (
     KIDS_CHANNEL_ART_HOSTS,
     KIDS_VIDEO_THUMBNAIL_HOSTS,
@@ -177,29 +177,19 @@ def _kids_channel_opaque_id(channel: dict[str, Any]) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _kids_shelf_language_rank(profile: str, shelf: str, language: str) -> int | None:
-    if shelf == "again":
+def _kids_shelf_language_rank(shelf: str, language: str) -> int | None:
+    if shelf in {"again", "new"}:
         return 0
-    if shelf == "new":
-        return 0
-    if shelf == "learning-nl":
+    if shelf in {"learning-nl", "fun-nl"}:
         return {"nl": 0, "mixed": 1}.get(language)
     if shelf == "fun-en":
         return {"en": 0, "mixed": 1}.get(language)
-    if shelf == "fun-nl":
-        return {"nl": 0, "mixed": 1}.get(language)
     return None
 
 
 def _kids_shelf_daily_key(day: str, profile: str, shelf: str, item_id: int) -> str:
     return hashlib.sha256(
         f"{day}\x00{profile}\x00{shelf}\x00{item_id}".encode("utf-8")
-    ).hexdigest()
-
-
-def _kids_shelf_source_key(day: str, profile: str, shelf: str, source_id: int) -> str:
-    return hashlib.sha256(
-        f"{day}\x00{profile}\x00{shelf}\x00source\x00{source_id}".encode("utf-8")
     ).hexdigest()
 
 
@@ -235,7 +225,6 @@ def _kids_shelf_candidate_allowed(
         return False
     return (
         _kids_shelf_language_rank(
-            profile,
             shelf,
             str(item.get("_source_language") or "unknown").strip().lower(),
         )
@@ -252,11 +241,7 @@ def _kids_shelf_order_key(
 ) -> tuple[Any, ...]:
     item_id = int(item["id"])
     if shelf == "new":
-        return (
-            -item_id,
-            _kids_shelf_daily_key(day, profile, shelf, item_id),
-            item_id,
-        )
+        return (-item_id,)
     if shelf == "again":
         history_at = _parse_utc(item.get("_profile_history_at"))
         return (
@@ -266,7 +251,7 @@ def _kids_shelf_order_key(
         )
     content_kind = str(item.get("_source_content_kind") or "unknown").strip().lower()
     language = str(item.get("_source_language") or "unknown").strip().lower()
-    language_rank = _kids_shelf_language_rank(profile, shelf, language)
+    language_rank = _kids_shelf_language_rank(shelf, language)
     content_rank = 0 if content_kind == (
         "learning" if shelf == "learning-nl" else "entertainment"
     ) else 1
@@ -305,35 +290,25 @@ def _kids_shelf_round_robin(
         )
     source_order = sorted(
         by_source,
-        key=lambda source_id: (
-            _kids_shelf_order_key(
-                by_source[source_id][0],
-                day=day,
-                profile=profile,
-                shelf=shelf,
-            ),
-            _kids_shelf_source_key(day, profile, shelf, source_id),
-            source_id,
+        key=lambda source_id: _kids_shelf_order_key(
+            by_source[source_id][0],
+            day=day,
+            profile=profile,
+            shelf=shelf,
         ),
     )
-    positions = {source_id: 0 for source_id in source_order}
-    selected: list[dict[str, Any]] = []
-    while len(selected) < limit:
-        added = False
-        for source_id in source_order:
-            position = positions[source_id]
-            source_items = by_source[source_id]
-            if position >= len(source_items):
-                continue
-            item = source_items[position]
-            positions[source_id] = position + 1
-            selected.append(item)
-            added = True
-            if len(selected) >= limit:
-                break
-        if not added:
-            break
-    return selected
+    return list(
+        islice(
+            (
+                item
+                for item in chain.from_iterable(
+                    zip_longest(*(by_source[source_id] for source_id in source_order))
+                )
+                if item is not None
+            ),
+            max(0, limit),
+        )
+    )
 
 
 def _select_kids_shelves(
@@ -1528,21 +1503,14 @@ async def api_kids_readyz(request: Request) -> dict[str, Any]:
         except ValueError:
             ingest_age_seconds = None
 
-    opencodex_ready = False
-    classifier = OpenCodexKidsClassifier(
-        base_url=runtime.settings.opencodex_base_url,
-        model=runtime.settings.opencodex_model,
-    )
-    try:
-        await classifier.check_model()
-        opencodex_ready = True
-    except Exception:
-        opencodex_ready = False
-    finally:
-        await classifier.close()
+    opencodex_status = (
+        await runtime.db.get_setting("kids_resolver_classifier_status")
+    ) or "unavailable"
+    opencodex_ready = opencodex_status == "ready"
 
     resolve_summary = await runtime.db.kids_resolve_summary(
-        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds
+        minimum_remaining_seconds=runtime.settings.kids_playback_min_remaining_seconds,
+        minimum_quality_height=runtime.settings.kids_resolver_min_quality_height,
     )
     payload = {
         "status": (

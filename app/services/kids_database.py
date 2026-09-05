@@ -9,8 +9,14 @@ from urllib.parse import parse_qs, quote, urlparse
 import aiosqlite
 
 from .kids_catalog import (
+    KIDS_ITEM_CONTENT_KINDS,
+    KIDS_ITEM_LANGUAGES,
+    KIDS_ITEM_VERDICTS,
     KIDS_HOME_SOURCE_REFERENCE,
+    _catalog_item_is_authorized_for_profile,
     _catalog_item_is_authorized,
+    _catalog_item_safety_is_current,
+    catalog_item_input_hash,
     _catalog_row_context,
     _parse_utc,
     _quality_height_or_default,
@@ -19,6 +25,7 @@ from .kids_catalog import (
     kids_candidate_usable_until,
     kids_source_url,
     kids_video_url,
+    normalize_age_suitability,
 )
 from .time_utils import utc_now_iso
 
@@ -116,6 +123,32 @@ def _kids_effective_poster_item(
 
 
 class KidsDatabaseMixin:
+    def kids_item_is_authorized(
+        self,
+        item: dict[str, Any],
+        source: dict[str, Any],
+        profile: str,
+    ) -> bool:
+        """Single fail-closed item, source, and profile authorization gate."""
+        return _catalog_item_is_authorized_for_profile(
+            item,
+            source,
+            profile,
+            policy_version=self.kids_item_policy_version,
+            recheck_seconds=self.kids_item_recheck_seconds,
+        )
+
+    def kids_item_is_authorized_for_any_profile(
+        self,
+        item: dict[str, Any],
+        source: dict[str, Any],
+        profiles: list[str] | tuple[str, ...] | set[str],
+    ) -> bool:
+        return any(
+            self.kids_item_is_authorized(item, source, profile)
+            for profile in profiles
+        )
+
     async def _ensure_kids_profile_defaults(self) -> None:
         now = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
@@ -504,9 +537,17 @@ class KidsDatabaseMixin:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 f"""
-                SELECT i.source_id,i.id,i.title,i.thumbnail_url,i.state,
-                       i.channel_id,i.channel_title,
-                       s.kind,s.reference,s.title,s.state,s.safety_verdict
+                SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict,
+                       s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
+                       s.age_suitability_json AS _source_age_suitability_json,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                           FROM catalog_source_profiles ps
+                           WHERE ps.source_id=s.id
+                       ), '') AS _profile_slugs
                 FROM catalog_items i
                 JOIN catalog_sources s ON s.id=i.source_id
                 WHERE i.source_id IN ({placeholders}) AND i.state='approved'
@@ -515,36 +556,22 @@ class KidsDatabaseMixin:
                 bounded_source_ids,
             )
             rows = await cur.fetchall()
+            columns = [description[0] for description in cur.description]
         result: dict[int, list[dict[str, Any]]] = {}
-        for (
-            source_id,
-            item_id,
-            title,
-            thumbnail_url,
-            state,
-            channel_id,
-            channel_title,
-            source_kind,
-            source_reference,
-            source_title,
-            source_state,
-            source_safety_verdict,
-        ) in rows:
+        for row in rows:
+            item, source, _candidate_json = _catalog_row_context(row, columns)
+            source_id = item["source_id"]
+            item_id = item["id"]
+            title = item.get("title")
+            thumbnail_url = item.get("thumbnail_url")
             thumbnail = str(thumbnail_url or "").strip()
-            item = {
-                "state": state,
-                "channel_id": channel_id,
-                "channel_title": channel_title,
-            }
-            source = {
-                "kind": source_kind,
-                "reference": source_reference,
-                "title": source_title,
-                "state": source_state,
-                "safety_verdict": source_safety_verdict,
-            }
+            profiles = _profile_slugs(item.pop("_profile_slugs", ""))
             if (
-                not _catalog_item_is_authorized(item, source)
+                not self.kids_item_is_authorized_for_any_profile(
+                    item,
+                    source,
+                    profiles,
+                )
                 or not _kids_thumbnail_is_proxyable(thumbnail)
             ):
                 continue
@@ -553,7 +580,7 @@ class KidsDatabaseMixin:
                     "id": int(item_id),
                     "title": str(title or ""),
                     "thumbnail_url": thumbnail,
-                    "state": str(state),
+                    "state": str(item.get("state") or ""),
                 }
             )
         return result
@@ -648,7 +675,8 @@ class KidsDatabaseMixin:
             try:
                 cur = await db.execute(
                     """
-                    SELECT id,kind,reference,title,state,safety_verdict,poster_item_id
+                    SELECT id,kind,reference,title,state,safety_verdict,poster_item_id,
+                           language,content_kind,age_suitability_json
                     FROM catalog_sources
                     WHERE id=?
                     """,
@@ -668,6 +696,9 @@ class KidsDatabaseMixin:
                             "state",
                             "safety_verdict",
                             "poster_item_id",
+                            "language",
+                            "content_kind",
+                            "age_suitability_json",
                         ],
                         source_row,
                     )
@@ -675,31 +706,39 @@ class KidsDatabaseMixin:
                 if not _kids_source_can_publish_poster(source):
                     raise ValueError("catalog source is not eligible for poster management")
                 if poster_item_id is not None:
-                    item = await (
-                        await db.execute(
-                            """
-                            SELECT source_id,state,thumbnail_url,channel_id,channel_title
-                            FROM catalog_items
-                            WHERE id=?
-                            """,
-                            (poster_item_id,),
-                        )
-                    ).fetchone()
-                    if item is None:
+                    item_cursor = await db.execute(
+                        """
+                        SELECT i.*,
+                               COALESCE((
+                                   SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                                   FROM catalog_source_profiles ps
+                                   WHERE ps.source_id=i.source_id
+                               ), '') AS _profile_slugs
+                        FROM catalog_items i
+                        WHERE i.id=?
+                        """,
+                        (poster_item_id,),
+                    )
+                    item_row = await item_cursor.fetchone()
+                    if item_row is None:
                         raise ValueError("poster item not found")
-                    if item[0] != source_id:
+                    item = dict(
+                        zip(
+                            [description[0] for description in item_cursor.description],
+                            item_row,
+                        )
+                    )
+                    profiles = _profile_slugs(item.pop("_profile_slugs", ""))
+                    if item["source_id"] != source_id:
                         raise ValueError("poster item belongs to a different source")
-                    if item[1] != "approved":
+                    if item["state"] != "approved":
                         raise ValueError("poster item is not approved")
-                    if not _kids_thumbnail_is_proxyable(item[2]):
+                    if not _kids_thumbnail_is_proxyable(item["thumbnail_url"]):
                         raise ValueError("poster item thumbnail is not proxyable")
-                    if not _catalog_item_is_authorized(
-                        {
-                            "state": item[1],
-                            "channel_id": item[3],
-                            "channel_title": item[4],
-                        },
+                    if not self.kids_item_is_authorized_for_any_profile(
+                        item,
                         source,
+                        profiles,
                     ):
                         raise ValueError("poster item is not authorized")
                 if source["poster_item_id"] == poster_item_id:
@@ -1174,6 +1213,181 @@ class KidsDatabaseMixin:
             correlation_id=f"{correlation_id}-profiles",
         )
 
+    async def catalog_item_safety_update(
+        self,
+        item_id: int,
+        *,
+        verdict: str,
+        language: str,
+        content_kind: str = "unknown",
+        age_suitability: dict[str, str],
+        reason: str,
+        actor: str,
+        correlation_id: str,
+        policy_version: str | None = None,
+        input_hash: str | None = None,
+        checked_at: str | None = None,
+        sync_backlog: bool = True,
+    ) -> dict[str, Any] | None:
+        verdict = str(verdict or "").strip().upper()
+        language = str(language or "").strip().lower()
+        content_kind = str(content_kind or "").strip().lower()
+        policy_version = (
+            self.kids_item_policy_version
+            if policy_version is None
+            else str(policy_version).strip()
+        )
+        if verdict not in KIDS_ITEM_VERDICTS:
+            raise ValueError("invalid item safety verdict")
+        if language not in KIDS_ITEM_LANGUAGES:
+            raise ValueError("invalid item language")
+        if content_kind not in KIDS_ITEM_CONTENT_KINDS:
+            raise ValueError("invalid item content kind")
+        age_suitability = normalize_age_suitability(age_suitability)
+        if not policy_version:
+            raise ValueError("invalid item policy version")
+        checked_at = checked_at or utc_now_iso()
+        try:
+            parsed_checked_at = datetime.fromisoformat(checked_at)
+        except (TypeError, ValueError):
+            parsed_checked_at = None
+        if parsed_checked_at is None or parsed_checked_at.tzinfo is None:
+            raise ValueError("invalid item safety checked_at")
+        age_suitability_json = json.dumps(
+            {age: age_suitability[age] for age in ("2", "6")},
+            separators=(",", ":"),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        now = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "SELECT * FROM catalog_items WHERE id=?",
+                    (item_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    await db.rollback()
+                    return None
+                columns = [description[0] for description in cur.description]
+                item = dict(zip(columns, row))
+                expected_hash = catalog_item_input_hash(item)
+                input_hash = expected_hash if input_hash is None else str(input_hash).strip()
+                if input_hash != expected_hash:
+                    raise ValueError("item safety input hash mismatch")
+                revision = await self._catalog_revision(db)
+                await db.execute(
+                    """
+                    UPDATE catalog_items
+                    SET language=?,content_kind=?,safety_verdict=?,safety_reason=?,
+                        safety_checked_at=?,safety_policy_version=?,safety_input_hash=?,
+                        age_suitability_json=?,actor=?,changed_at=?,reason=?,
+                        revision=?,correlation_id=?
+                    WHERE id=?
+                    """,
+                    (
+                        language,
+                        content_kind,
+                        verdict,
+                        str(reason or "")[:1000],
+                        checked_at,
+                        policy_version[:128],
+                        input_hash,
+                        age_suitability_json,
+                        str(actor or "")[:128],
+                        now,
+                        str(reason or "")[:1000],
+                        revision,
+                        str(correlation_id or "")[:128],
+                        item_id,
+                    ),
+                )
+                item.update(
+                    {
+                        "language": language,
+                        "content_kind": content_kind,
+                        "safety_verdict": verdict,
+                        "safety_reason": str(reason or "")[:1000],
+                        "safety_checked_at": checked_at,
+                        "safety_policy_version": policy_version[:128],
+                        "safety_input_hash": input_hash,
+                        "age_suitability_json": age_suitability_json,
+                    }
+                )
+                source_cur = await db.execute(
+                    """
+                    SELECT s.kind,s.reference,s.title,s.state,s.safety_verdict,
+                           s.language,s.content_kind,s.age_suitability_json
+                    FROM catalog_sources s
+                    JOIN catalog_items i ON i.source_id=s.id
+                    WHERE i.id=?
+                    """,
+                    (item_id,),
+                )
+                source_row = await source_cur.fetchone()
+                source = (
+                    dict(
+                        zip(
+                            (description[0] for description in source_cur.description),
+                            source_row,
+                        )
+                    )
+                    if source_row
+                    else {}
+                )
+                for lease_id, profile in await (
+                    await db.execute(
+                        """
+                        SELECT l.id,fs.profile
+                        FROM relay_leases l
+                        JOIN feed_sessions fs ON fs.id=l.feed_session_id
+                        WHERE l.item_id=? AND l.state='active'
+                        """,
+                        (item_id,),
+                    )
+                ).fetchall():
+                    if not self.kids_item_is_authorized(
+                        item,
+                        source,
+                        str(profile),
+                    ):
+                        await db.execute(
+                            """
+                            UPDATE relay_leases
+                            SET state='revoked',revoked_reason='item_safety_ineligible',
+                                heartbeat_at=?
+                            WHERE id=? AND state='active'
+                            """,
+                            (now, lease_id),
+                        )
+                await db.execute(
+                    """
+                    INSERT INTO kids_audit_events(
+                        event,entity_type,entity_id,actor,reason,revision,
+                        correlation_id,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "item_safety_changed",
+                        "item",
+                        item_id,
+                        str(actor or "")[:128],
+                        f"{verdict}: {str(reason or '')[:1000]}",
+                        revision,
+                        str(correlation_id or "")[:128],
+                        now,
+                    ),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        if sync_backlog:
+            await self.kids_resolve_sync_backlog()
+        return await self.catalog_get("item", item_id)
+
     async def catalog_item_refresh(
         self,
         item_id: int,
@@ -1220,11 +1434,24 @@ class KidsDatabaseMixin:
                     UPDATE catalog_items
                     SET title=?,source_id=?,channel_id=?,channel_title=?,thumbnail_url=?,
                         duration_seconds=?,visual_category=?,
+                        content_kind='unknown',language='unknown',
+                        safety_verdict='UNCERTAIN',safety_reason='metadata refreshed',
+                        safety_checked_at=NULL,safety_policy_version='',
+                        safety_input_hash='',age_suitability_json='{}',
                         actor='kids-ingest',changed_at=?,reason='metadata refreshed',
                         revision=?,correlation_id=?
                     WHERE id=?
                     """,
                     (*values, now, revision, correlation_id, item_id),
+                )
+                await db.execute(
+                    """
+                    UPDATE relay_leases
+                    SET state='revoked',revoked_reason='item_safety_ineligible',
+                        heartbeat_at=?
+                    WHERE item_id=? AND state='active'
+                    """,
+                    (now, item_id),
                 )
                 await db.execute(
                     """
@@ -1308,6 +1535,7 @@ class KidsDatabaseMixin:
                        s.safety_verdict AS _source_safety_verdict,
                        s.language AS _source_language,
                        s.content_kind AS _source_content_kind,
+                       s.age_suitability_json AS _source_age_suitability_json,
                        b.candidate_json AS _candidate_json,b.quality_height AS _backlog_quality_height
                 FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
                 JOIN catalog_source_profiles ps
@@ -1340,10 +1568,8 @@ class KidsDatabaseMixin:
             quality_height = item.pop("_backlog_quality_height", None)
             profile_completed_at = item.pop("_profile_completed_at", None)
             profile_history_at = item.pop("_profile_history_at", None)
-            source_language = item.pop("_source_language", None)
-            source_content_kind = item.pop("_source_content_kind", None)
             if (
-                _catalog_item_is_authorized(item, source)
+                self.kids_item_is_authorized(item, source, profile)
                 and _stored_candidate_meets_policy(
                     candidate_json,
                     quality_height,
@@ -1351,8 +1577,16 @@ class KidsDatabaseMixin:
                 )
             ):
                 if include_shelf_metadata:
-                    item["_source_language"] = source_language or "unknown"
-                    item["_source_content_kind"] = source_content_kind or "unknown"
+                    item["_source_language"] = (
+                        item.get("language")
+                        if item.get("language") not in {None, "", "unknown"}
+                        else source.get("language") or "unknown"
+                    )
+                    item["_source_content_kind"] = (
+                        item.get("content_kind")
+                        if item.get("content_kind") not in {None, "", "unknown"}
+                        else source.get("content_kind") or "unknown"
+                    )
                     item["_profile_completed_at"] = profile_completed_at
                     item["_profile_history_at"] = profile_history_at
                 result.append(item)
@@ -1447,26 +1681,18 @@ class KidsDatabaseMixin:
                     (day, profile, shelf, limit),
                 )
                 for ordinal, item_id in enumerate(values):
-                    if ordinal in stored:
-                        if stored[ordinal] == item_id:
-                            continue
-                        await db.execute(
-                            """
-                            UPDATE kids_daily_library
-                            SET item_id=?
-                            WHERE day=? AND profile=? AND shelf=? AND ordinal=?
-                            """,
-                            (item_id, day, profile, shelf, ordinal),
-                        )
-                    else:
-                        await db.execute(
-                            """
-                            INSERT INTO kids_daily_library(
-                                day,profile,shelf,ordinal,item_id,created_at
-                            ) VALUES(?,?,?,?,?,?)
-                            """,
-                            (day, profile, shelf, ordinal, item_id, now),
-                        )
+                    if ordinal in stored and stored[ordinal] == item_id:
+                        continue
+                    await db.execute(
+                        """
+                        INSERT INTO kids_daily_library(
+                            day,profile,shelf,ordinal,item_id,created_at
+                        ) VALUES(?,?,?,?,?,?)
+                        ON CONFLICT(day,profile,shelf,ordinal)
+                        DO UPDATE SET item_id=excluded.item_id
+                        """,
+                        (day, profile, shelf, ordinal, item_id, now),
+                    )
             await db.commit()
         return result
 
@@ -1550,8 +1776,9 @@ class KidsDatabaseMixin:
                     SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
                            s.title AS _source_title,s.state AS _source_state,
                            s.safety_verdict AS _source_safety_verdict,
-                           s.language AS _source_profile_language,
-                           s.age_suitability_json AS _source_profile_age_suitability_json,
+                           s.language AS _source_language,
+                           s.content_kind AS _source_content_kind,
+                           s.age_suitability_json AS _source_age_suitability_json,
                            b.candidate_json AS _candidate_json,
                            b.quality_height AS _backlog_quality_height
                     FROM catalog_items i JOIN catalog_sources s ON s.id=i.source_id
@@ -1591,18 +1818,11 @@ class KidsDatabaseMixin:
                         )
                     )
                 ordinal = 0
-                asset_items: list[dict[str, Any]] = []
                 for row in rows:
                     item, source, candidate_json = _catalog_row_context(row, columns)
                     quality_height = item.pop("_backlog_quality_height", None)
-                    source["language"] = item.pop("_source_profile_language", None)
-                    source["age_suitability_json"] = item.pop(
-                        "_source_profile_age_suitability_json",
-                        None,
-                    )
                     if not (
-                        _catalog_item_is_authorized(item, source)
-                        and _source_is_authorized_for_profile(source, profile)
+                        self.kids_item_is_authorized(item, source, profile)
                         and _stored_candidate_meets_policy(
                             candidate_json,
                             quality_height,
@@ -1610,30 +1830,20 @@ class KidsDatabaseMixin:
                         )
                     ):
                         continue
-                    asset_id = secrets.token_urlsafe(24)
                     await db.execute(
                         """
                         INSERT INTO feed_session_items(
                             feed_session_id,ordinal,item_id,asset_id
                         ) VALUES(?,?,?,?)
                         """,
-                        (session_id, ordinal, item["id"], asset_id),
-                    )
-                    asset_items.append(
-                        {
-                            "item_id": int(item["id"]),
-                            "asset_id": asset_id,
-                            "duration_seconds": max(
-                                0, int(item.get("duration_seconds", 0) or 0)
-                            ),
-                            "visual_category": str(
-                                item.get("visual_category") or "general"
-                            ),
-                        }
+                        (
+                            session_id,
+                            ordinal,
+                            item["id"],
+                            secrets.token_urlsafe(24),
+                        ),
                     )
                     ordinal += 1
-            else:
-                asset_items = []
             await db.commit()
         return {
             "id": session_id,
@@ -1643,7 +1853,6 @@ class KidsDatabaseMixin:
             "created_at": now_iso,
             "expires_at": expires_at,
             "source_id": source_id,
-            "items": asset_items,
         }
 
     async def kids_feed_session_binding(self, session_id: str) -> dict[str, Any] | None:
@@ -1675,11 +1884,20 @@ class KidsDatabaseMixin:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 """
-                SELECT s.id,s.kind,s.reference,s.title,s.avatar_url,s.poster_item_id,
-                       s.state,s.safety_verdict,
-                       i.id AS _item_id,i.video_id,i.title AS _item_title,
-                       i.channel_id,i.channel_title,i.state AS _item_state,
-                       i.thumbnail_url,
+                SELECT s.id AS _display_source_id,
+                       s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.avatar_url AS _display_avatar_url,
+                       s.poster_item_id AS _display_poster_item_id,
+                       s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict,
+                       i.id,i.video_id,i.title,i.channel_id,i.channel_title,i.state,
+                       i.thumbnail_url,i.language,i.content_kind,
+                       i.safety_verdict,i.safety_checked_at,
+                       i.safety_policy_version,i.safety_input_hash,
+                       i.age_suitability_json,
+                       s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
+                       s.age_suitability_json AS _source_age_suitability_json,
                        b.status AS _backlog_status,b.candidate_json AS _candidate_json,
                        b.quality_height AS _backlog_quality_height,
                        b.expires_at AS _backlog_expires_at
@@ -1700,49 +1918,21 @@ class KidsDatabaseMixin:
                 ),
             )
             rows = await cur.fetchall()
+            columns = [description[0] for description in cur.description]
 
         channels: dict[int, dict[str, Any]] = {}
         for row in rows:
-            (
-                source_id,
-                source_kind,
-                source_reference,
-                source_title,
-                avatar_url,
-                poster_item_id,
-                source_state,
-                source_safety_verdict,
-                item_id,
-                video_id,
-                item_title,
-                channel_id,
-                channel_title,
-                item_state,
-                thumbnail_url,
-                backlog_status,
-                candidate_json,
-                backlog_quality_height,
-                backlog_expires_at,
-            ) = row
+            item, source, candidate_json = _catalog_row_context(row, columns)
+            source_id = item.pop("_display_source_id")
+            avatar_url = item.pop("_display_avatar_url")
+            poster_item_id = item.pop("_display_poster_item_id")
+            backlog_status = item.pop("_backlog_status")
+            backlog_quality_height = item.pop("_backlog_quality_height")
+            backlog_expires_at = item.pop("_backlog_expires_at")
             if not _kids_channel_avatar_is_proxyable(avatar_url):
                 continue
-            item = {
-                "id": item_id,
-                "state": item_state,
-                "video_id": video_id,
-                "title": item_title,
-                "channel_id": channel_id,
-                "channel_title": channel_title,
-            }
-            source = {
-                "kind": source_kind,
-                "reference": source_reference,
-                "title": source_title,
-                "state": source_state,
-                "safety_verdict": source_safety_verdict,
-            }
             if (
-                not _catalog_item_is_authorized(item, source)
+                not self.kids_item_is_authorized(item, source, profile)
                 or backlog_status != "ready"
                 or not _stored_candidate_meets_policy(
                     candidate_json,
@@ -1757,9 +1947,9 @@ class KidsDatabaseMixin:
                 int(source_id),
                 {
                     "source_id": int(source_id),
-                    "kind": source_kind,
-                    "reference": source_reference,
-                    "title": str(source_title or "").strip(),
+                    "kind": source["kind"],
+                    "reference": source["reference"],
+                    "title": str(source["title"] or "").strip(),
                     "avatar_url": str(avatar_url or "").strip(),
                     "poster_item_id": (
                         int(poster_item_id) if poster_item_id is not None else None
@@ -1844,9 +2034,15 @@ class KidsDatabaseMixin:
                     SELECT f.asset_id,f.ordinal,
                            i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
                            i.thumbnail_url,i.duration_seconds,i.visual_category,i.state,
+                           i.language,i.content_kind,i.safety_verdict,
+                           i.safety_checked_at,i.safety_policy_version,
+                           i.safety_input_hash,i.age_suitability_json,
                            s.kind AS _source_kind,s.reference AS _source_reference,
                            s.title AS _source_title,s.state AS _source_state,
                            s.safety_verdict AS _source_safety_verdict,
+                           s.language AS _source_language,
+                           s.content_kind AS _source_content_kind,
+                           s.age_suitability_json AS _source_age_suitability_json,
                            b.candidate_json AS _candidate_json,
                            b.quality_height AS _backlog_quality_height
                     FROM feed_session_items f
@@ -1882,23 +2078,10 @@ class KidsDatabaseMixin:
                     break
                 for row in rows:
                     values = dict(zip(columns, row))
-                    item = {
-                        "id": values["item_id"],
-                        "state": values["state"],
-                        "video_id": values["video_id"],
-                        "title": values["title"],
-                        "channel_id": values["channel_id"],
-                        "channel_title": values["channel_title"],
-                    }
-                    source = {
-                        "kind": values["_source_kind"],
-                        "reference": values["_source_reference"],
-                        "title": values["_source_title"],
-                        "state": values["_source_state"],
-                        "safety_verdict": values["_source_safety_verdict"],
-                    }
+                    item, source, _ = _catalog_row_context(row, columns)
+                    item["id"] = item.pop("item_id")
                     if not (
-                        _catalog_item_is_authorized(item, source)
+                        self.kids_item_is_authorized(item, source, profile)
                         and _stored_candidate_meets_policy(
                             values["_candidate_json"],
                             values["_backlog_quality_height"],
@@ -1955,9 +2138,15 @@ class KidsDatabaseMixin:
                        fs.policy_version,fs.expires_at,fs.source_id AS session_source_id,
                        i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
                        i.thumbnail_url,i.duration_seconds,i.visual_category,i.state,
+                       i.language,i.content_kind,i.safety_verdict,
+                       i.safety_checked_at,i.safety_policy_version,
+                       i.safety_input_hash,i.age_suitability_json,
                        s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
                        s.safety_verdict AS _source_safety_verdict,
+                       s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
+                       s.age_suitability_json AS _source_age_suitability_json,
                        b.candidate_json AS _candidate_json,
                        b.quality_height AS _backlog_quality_height,
                        b.status AS _backlog_status,b.expires_at AS _backlog_expires_at,
@@ -1986,23 +2175,10 @@ class KidsDatabaseMixin:
         if not row:
             return None
         values = dict(zip(columns, row))
-        item = {
-            "id": values["item_id"],
-            "state": values["state"],
-            "video_id": values["video_id"],
-            "title": values["title"],
-            "channel_id": values["channel_id"],
-            "channel_title": values["channel_title"],
-        }
-        source = {
-            "kind": values["_source_kind"],
-            "reference": values["_source_reference"],
-            "title": values["_source_title"],
-            "state": values["_source_state"],
-            "safety_verdict": values["_source_safety_verdict"],
-        }
+        item, source, _ = _catalog_row_context(row, columns)
+        item["id"] = item.pop("item_id")
         if require_current_authorization and (
-            not _catalog_item_is_authorized(item, source)
+            not self.kids_item_is_authorized(item, source, values["profile"])
             or values["_backlog_status"] != "ready"
             or _parse_utc(values["_backlog_expires_at"]) is None
             or _parse_utc(values["_backlog_expires_at"])
@@ -2057,10 +2233,14 @@ class KidsDatabaseMixin:
                 """
                 SELECT f.feed_session_id,fs.profile,fs.policy_version,fs.expires_at,
                        i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,i.state,
+                       i.thumbnail_url,i.language,i.content_kind,i.safety_verdict,
+                       i.safety_checked_at,i.safety_policy_version,
+                       i.safety_input_hash,i.age_suitability_json,
                        s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
                        s.safety_verdict AS _source_safety_verdict,
                        s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
                        s.age_suitability_json AS _source_age_suitability_json,
                        b.status AS _backlog_status,b.candidate_json,
                        b.quality_height,b.codec,b.expires_at AS candidate_expires_at
@@ -2082,7 +2262,8 @@ class KidsDatabaseMixin:
             if not row:
                 await db.rollback()
                 return {"status": "not_found"}
-            values = dict(zip([description[0] for description in cur.description], row))
+            columns = [description[0] for description in cur.description]
+            values = dict(zip(columns, row))
             session_expiry = _parse_utc(values["expires_at"])
             if session_expiry is None or session_expiry <= now:
                 await db.rollback()
@@ -2104,26 +2285,10 @@ class KidsDatabaseMixin:
             }:
                 await db.rollback()
                 return {"status": "kill_switch"}
-            item = {
-                "id": values["item_id"],
-                "state": values["state"],
-                "video_id": values["video_id"],
-                "title": values["title"],
-                "channel_id": values["channel_id"],
-                "channel_title": values["channel_title"],
-            }
-            source = {
-                "kind": values["_source_kind"],
-                "reference": values["_source_reference"],
-                "title": values["_source_title"],
-                "state": values["_source_state"],
-                "safety_verdict": values["_source_safety_verdict"],
-                "language": values["_source_language"],
-                "age_suitability_json": values["_source_age_suitability_json"],
-            }
+            item, source, _ = _catalog_row_context(row, columns)
+            item["id"] = item.pop("item_id")
             if not (
-                _catalog_item_is_authorized(item, source)
-                and _source_is_authorized_for_profile(source, values["profile"])
+                self.kids_item_is_authorized(item, source, values["profile"])
             ):
                 await db.rollback()
                 return {"status": "ineligible"}
@@ -2197,10 +2362,14 @@ class KidsDatabaseMixin:
                        l.quality_height,l.expires_at,
                        fs.profile,
                        i.video_id,i.title,i.channel_id,i.channel_title,i.state AS item_state,
+                       i.thumbnail_url,i.language,i.content_kind,i.safety_verdict,
+                       i.safety_checked_at,i.safety_policy_version,
+                       i.safety_input_hash,i.age_suitability_json,
                        s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
                        s.safety_verdict AS _source_safety_verdict,
                        s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
                        s.age_suitability_json AS _source_age_suitability_json
                 FROM relay_leases l
                 JOIN feed_sessions fs ON fs.id=l.feed_session_id
@@ -2219,7 +2388,8 @@ class KidsDatabaseMixin:
             if not row:
                 await db.rollback()
                 return None
-            values = dict(zip([description[0] for description in cur.description], row))
+            columns = [description[0] for description in cur.description]
+            values = dict(zip(columns, row))
             if values["state"] != "active":
                 await db.rollback()
                 return None
@@ -2257,29 +2427,15 @@ class KidsDatabaseMixin:
                 )
                 await db.commit()
                 return None
-            item = {
-                "state": values["item_state"],
-                "video_id": values["video_id"],
-                "title": values["title"],
-                "channel_id": values["channel_id"],
-                "channel_title": values["channel_title"],
-            }
-            source = {
-                "kind": values["_source_kind"],
-                "reference": values["_source_reference"],
-                "title": values["_source_title"],
-                "state": values["_source_state"],
-                "safety_verdict": values["_source_safety_verdict"],
-                "language": values["_source_language"],
-                "age_suitability_json": values["_source_age_suitability_json"],
-            }
+            item, source, _ = _catalog_row_context(row, columns)
+            item["id"] = item.pop("item_id")
+            item["state"] = item.pop("item_state")
             try:
                 candidate = json.loads(str(values["candidate_json"]))
             except (TypeError, json.JSONDecodeError):
                 candidate = None
             if not (
-                _catalog_item_is_authorized(item, source)
-                and _source_is_authorized_for_profile(source, values["profile"])
+                self.kids_item_is_authorized(item, source, values["profile"])
                 and _stored_candidate_meets_policy(
                     values["candidate_json"],
                     values["quality_height"],
@@ -2407,6 +2563,136 @@ class KidsDatabaseMixin:
             await db.commit()
         return revoked
 
+    async def kids_item_assessment_candidates(
+        self,
+        *,
+        limit: int,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        bounded = max(0, min(int(limit), 20))
+        if bounded == 0:
+            return []
+        current = now or datetime.now(timezone.utc)
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT i.*,
+                       s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict,
+                       s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
+                       s.age_suitability_json AS _source_age_suitability_json,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                           FROM catalog_source_profiles ps
+                           WHERE ps.source_id=s.id
+                       ), '') AS _profile_slugs,
+                       CASE WHEN EXISTS (
+                           SELECT 1
+                           FROM kids_daily_library d
+                           WHERE d.item_id=i.id
+                             AND d.day=(SELECT MAX(day) FROM kids_daily_library)
+                       ) THEN 0 ELSE 1 END AS _daily_priority,
+                       CASE WHEN b.status='ready' THEN 0 ELSE 1 END AS _ready_priority
+                FROM catalog_items i
+                JOIN catalog_sources s ON s.id=i.source_id
+                LEFT JOIN kids_resolve_backlog b ON b.item_id=i.id
+                WHERE i.state='approved'
+                  AND s.state='approved'
+                  AND s.safety_verdict='SAFE'
+                  AND s.reference!=?
+                ORDER BY _daily_priority ASC,_ready_priority ASC,i.id ASC
+                """,
+                (KIDS_HOME_SOURCE_REFERENCE,),
+            )
+            rows = await cur.fetchall()
+            columns = [description[0] for description in cur.description]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item, source, _candidate_json = _catalog_row_context(row, columns)
+            profiles = _profile_slugs(item.pop("_profile_slugs", ""))
+            item.pop("_daily_priority", None)
+            item.pop("_ready_priority", None)
+            if not profiles or not any(
+                _source_is_authorized_for_profile(source, profile)
+                for profile in profiles
+            ):
+                continue
+            if _catalog_item_safety_is_current(
+                item,
+                policy_version=self.kids_item_policy_version,
+                recheck_seconds=self.kids_item_recheck_seconds,
+                now=current,
+            ):
+                continue
+            result.append(
+                {
+                    "item": item,
+                    "source": source,
+                    "profiles": profiles,
+                }
+            )
+            if len(result) >= bounded:
+                break
+        return result
+
+    async def kids_item_assessment_budget_take(
+        self,
+        daily_limit: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        limit = max(0, min(int(daily_limit), 200))
+        if limit == 0:
+            return False
+        current = now or datetime.now(timezone.utc)
+        current = (
+            current.replace(tzinfo=timezone.utc)
+            if current.tzinfo is None
+            else current.astimezone(timezone.utc)
+        )
+        day = current.date().isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            day_row = await (
+                await db.execute(
+                    "SELECT value FROM settings WHERE key='kids_item_assessment_budget_day'"
+                )
+            ).fetchone()
+            count_row = await (
+                await db.execute(
+                    "SELECT value FROM settings WHERE key='kids_item_assessment_budget_count'"
+                )
+            ).fetchone()
+            stored_day = str(day_row[0]) if day_row else ""
+            try:
+                count = max(0, int(count_row[0])) if count_row else 0
+            except (TypeError, ValueError):
+                count = 0
+            if stored_day != day:
+                count = 0
+            if count >= limit:
+                await db.commit()
+                return False
+            count += 1
+            await db.execute(
+                """
+                INSERT INTO settings(key,value) VALUES('kids_item_assessment_budget_day',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (day,),
+            )
+            await db.execute(
+                """
+                INSERT INTO settings(key,value) VALUES('kids_item_assessment_budget_count',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (str(count),),
+            )
+            await db.commit()
+        return True
+
     async def kids_resolve_sync_backlog(self, *, minimum_quality_height: int = 720) -> None:
         """Make eligibility changes immediately remove technical playback authority."""
         minimum_quality_height = _quality_height_or_default(minimum_quality_height)
@@ -2431,13 +2717,21 @@ class KidsDatabaseMixin:
             )
             cur = await db.execute(
                 """
-                SELECT b.item_id,b.status,b.candidate_json,
+                SELECT b.item_id,b.status,b.candidate_json AS _candidate_json,
                        b.quality_height AS _backlog_quality_height,
                        b.resolved_at AS _backlog_resolved_at,
                        b.expires_at AS _backlog_expires_at,
                        i.*,s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
-                       s.safety_verdict AS _source_safety_verdict
+                       s.safety_verdict AS _source_safety_verdict,
+                       s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
+                       s.age_suitability_json AS _source_age_suitability_json,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                           FROM catalog_source_profiles ps
+                           WHERE ps.source_id=s.id
+                       ), '') AS _profile_slugs
                 FROM kids_resolve_backlog b
                 LEFT JOIN catalog_items i ON i.id=b.item_id
                 LEFT JOIN catalog_sources s ON s.id=i.source_id
@@ -2449,21 +2743,10 @@ class KidsDatabaseMixin:
                 values = dict(zip(columns, row))
                 item_id = values["item_id"]
                 status = values["status"]
-                candidate_json = values["_candidate_json"] if "_candidate_json" in values else values["candidate_json"]
                 quality_height = values["_backlog_quality_height"]
                 resolved_at = _parse_utc(values["_backlog_resolved_at"])
-                item = {key: value for key, value in values.items() if key not in {
-                    "item_id", "status", "candidate_json", "_candidate_json",
-                    "_backlog_quality_height", "_backlog_resolved_at",
-                    "_backlog_expires_at",
-                }}
-                source = {
-                    "kind": values.get("_source_kind"),
-                    "reference": values.get("_source_reference"),
-                    "title": values.get("_source_title"),
-                    "state": values.get("_source_state"),
-                    "safety_verdict": values.get("_source_safety_verdict"),
-                }
+                item, source, candidate_json = _catalog_row_context(row, columns)
+                profiles = _profile_slugs(item.pop("_profile_slugs", ""))
                 if not _catalog_item_is_authorized(item, source):
                     await db.execute(
                         """
@@ -2481,6 +2764,33 @@ class KidsDatabaseMixin:
                         SET state='revoked',
                             revoked_reason=CASE
                                 WHEN trim(coalesce(revoked_reason,''))='' THEN 'catalog_ineligible'
+                                ELSE revoked_reason
+                            END,
+                            heartbeat_at=?
+                        WHERE item_id=? AND state='active'
+                        """,
+                        (now, item_id),
+                    )
+                elif (
+                    not _catalog_item_safety_is_current(
+                        item,
+                        policy_version=self.kids_item_policy_version,
+                        recheck_seconds=self.kids_item_recheck_seconds,
+                        now=now_datetime,
+                    )
+                    or not self.kids_item_is_authorized_for_any_profile(
+                        item,
+                        source,
+                        profiles,
+                    )
+                ):
+                    await db.execute(
+                        """
+                        UPDATE relay_leases
+                        SET state='revoked',
+                            revoked_reason=CASE
+                                WHEN trim(coalesce(revoked_reason,''))=''
+                                    THEN 'item_safety_ineligible'
                                 ELSE revoked_reason
                             END,
                             heartbeat_at=?
@@ -2601,7 +2911,20 @@ class KidsDatabaseMixin:
                     WHERE item_id IS NOT NULL
                       AND day=(SELECT MAX(day) FROM kids_daily_library)
                 )
-                SELECT item_id,video_id FROM (
+                SELECT ranked.item_id AS _candidate_item_id,
+                       ranked.video_id AS _candidate_video_id,
+                       i.*,s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict,
+                       s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
+                       s.age_suitability_json AS _source_age_suitability_json,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                           FROM catalog_source_profiles ps
+                           WHERE ps.source_id=s.id
+                       ), '') AS _profile_slugs
+                FROM (
                     SELECT item_id,video_id,daily_priority,shelf_priority,priority,due,
                            ROW_NUMBER() OVER (
                                PARTITION BY daily_priority,shelf_priority,priority,source_id
@@ -2639,14 +2962,35 @@ class KidsDatabaseMixin:
                         LEFT JOIN daily_items d ON d.item_id=b.item_id
                         WHERE b.status='ready' AND b.expires_at<=?
                     )
-                )
-                ORDER BY daily_priority ASC,shelf_priority ASC,priority ASC,
-                         source_position ASC,due ASC,item_id ASC
-                LIMIT ?
+                ) AS ranked
+                JOIN catalog_items i ON i.id=ranked.item_id
+                JOIN catalog_sources s ON s.id=i.source_id
+                ORDER BY ranked.daily_priority ASC,ranked.shelf_priority ASC,
+                         ranked.priority ASC,ranked.source_position ASC,
+                         ranked.due ASC,ranked.item_id ASC
                 """,
-                (now_iso, now_iso, refresh_at, bounded),
+                (now_iso, now_iso, refresh_at),
             )
-            rows = await cur.fetchall()
+            candidate_rows = await cur.fetchall()
+            candidate_columns = [description[0] for description in cur.description]
+            rows: list[tuple[Any, Any]] = []
+            for candidate_row in candidate_rows:
+                item, source, _candidate_json = _catalog_row_context(
+                    candidate_row,
+                    candidate_columns,
+                )
+                item_id = item.pop("_candidate_item_id")
+                video_id = item.pop("_candidate_video_id")
+                profiles = _profile_slugs(item.pop("_profile_slugs", ""))
+                if not self.kids_item_is_authorized_for_any_profile(
+                    item,
+                    source,
+                    profiles,
+                ):
+                    continue
+                rows.append((item_id, video_id))
+                if len(rows) >= bounded:
+                    break
             for item_id, _video_id in rows:
                 await db.execute(
                     """
@@ -2693,6 +3037,37 @@ class KidsDatabaseMixin:
         if practical_expiry is None:
             return
         async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict,
+                       s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
+                       s.age_suitability_json AS _source_age_suitability_json,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                           FROM catalog_source_profiles ps
+                           WHERE ps.source_id=s.id
+                       ), '') AS _profile_slugs
+                FROM catalog_items i
+                JOIN catalog_sources s ON s.id=i.source_id
+                WHERE i.id=?
+                """,
+                (item_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return
+            columns = [description[0] for description in cur.description]
+            item, source, _candidate_json = _catalog_row_context(row, columns)
+            profiles = _profile_slugs(item.pop("_profile_slugs", ""))
+            if not self.kids_item_is_authorized_for_any_profile(
+                item,
+                source,
+                profiles,
+            ):
+                return
             await db.execute(
                 """
                 UPDATE kids_resolve_backlog
@@ -2738,8 +3113,10 @@ class KidsDatabaseMixin:
         self,
         *,
         minimum_remaining_seconds: int = 300,
+        minimum_quality_height: int = 720,
         profile: str | None = None,
     ) -> dict[str, Any]:
+        minimum_quality_height = _quality_height_or_default(minimum_quality_height)
         now = (datetime.now(timezone.utc) + timedelta(seconds=max(0, minimum_remaining_seconds))).isoformat()
         async with aiosqlite.connect(self.db_path) as db:
             profile_filter = ""
@@ -2763,19 +3140,59 @@ class KidsDatabaseMixin:
                 tuple(args),
             )
             counts = {str(status): int(count) for status, count in await cur.fetchall()}
-            row = await (
-                await db.execute(
-                    f"""
-                    SELECT COUNT(*)
-                    FROM kids_resolve_backlog b
-                    JOIN catalog_items i ON i.id=b.item_id
-                    WHERE b.status='ready' AND b.expires_at>? {profile_filter}
-                    """,
-                    tuple([now, *args]),
+            ready_cur = await db.execute(
+                f"""
+                SELECT i.*,s.kind AS _source_kind,s.reference AS _source_reference,
+                       s.title AS _source_title,s.state AS _source_state,
+                       s.safety_verdict AS _source_safety_verdict,
+                       s.language AS _source_language,
+                       s.content_kind AS _source_content_kind,
+                       s.age_suitability_json AS _source_age_suitability_json,
+                       b.candidate_json AS _candidate_json,
+                       b.quality_height AS _backlog_quality_height,
+                       COALESCE((
+                           SELECT GROUP_CONCAT(ps.profile_slug, ',')
+                           FROM catalog_source_profiles ps
+                           WHERE ps.source_id=s.id
+                       ), '') AS _profile_slugs
+                FROM kids_resolve_backlog b
+                JOIN catalog_items i ON i.id=b.item_id
+                JOIN catalog_sources s ON s.id=i.source_id
+                WHERE b.status='ready' AND b.expires_at>? {profile_filter}
+                """,
+                tuple([now, *args]),
+            )
+            ready_rows = await ready_cur.fetchall()
+            ready_columns = [description[0] for description in ready_cur.description]
+        fresh_ready = 0
+        for ready_row in ready_rows:
+            item, source, candidate_json = _catalog_row_context(
+                ready_row,
+                ready_columns,
+            )
+            quality_height = item.pop("_backlog_quality_height", None)
+            profiles = (
+                [profile]
+                if profile
+                else _profile_slugs(item.pop("_profile_slugs", ""))
+            )
+            if profile:
+                item.pop("_profile_slugs", None)
+            if (
+                self.kids_item_is_authorized_for_any_profile(
+                    item,
+                    source,
+                    profiles,
                 )
-            ).fetchone()
+                and _stored_candidate_meets_policy(
+                    candidate_json,
+                    quality_height,
+                    minimum_quality_height,
+                )
+            ):
+                fresh_ready += 1
         counts.setdefault("failed", counts.get("retry", 0))
-        return {"counts": counts, "fresh_ready": int(row[0] if row else 0)}
+        return {"counts": counts, "fresh_ready": fresh_ready}
 
     async def kids_resolve_recent_rows(
         self,
@@ -2919,6 +3336,9 @@ class KidsDatabaseMixin:
             cur = await db.execute(
                 """
                 SELECT i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
+                       i.thumbnail_url,i.language,i.content_kind,i.safety_verdict,
+                       i.safety_checked_at,i.safety_policy_version,
+                       i.safety_input_hash,i.age_suitability_json,
                        b.candidate_json,b.expires_at,b.quality_height,b.codec,
                        s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
@@ -2947,31 +3367,14 @@ class KidsDatabaseMixin:
             cols = [d[0] for d in cur.description] if row else []
         if not row:
             return None
-        result = dict(zip(cols, row))
-        source = {
-            "kind": result.pop("_source_kind", None),
-            "reference": result.pop("_source_reference", None),
-            "title": result.pop("_source_title", None),
-            "state": result.pop("_source_state", None),
-            "safety_verdict": result.pop("_source_safety_verdict", None),
-            "language": result.pop("_source_language", None),
-            "age_suitability_json": result.pop(
-                "_source_age_suitability_json",
-                None,
-            ),
-        }
-        item = {
-            "state": "approved",
-            "video_id": result["video_id"],
-            "title": result["title"],
-            "channel_id": result["channel_id"],
-            "channel_title": result["channel_title"],
-        }
+        result, source, _ = _catalog_row_context(row, cols)
+        item = result.copy()
+        item["id"] = item.pop("item_id")
+        item["state"] = "approved"
         candidate_json = result["candidate_json"]
         quality_height = result["quality_height"]
         if (
-            not _catalog_item_is_authorized(item, source)
-            or not _source_is_authorized_for_profile(source, profile)
+            not self.kids_item_is_authorized(item, source, profile)
             or not _stored_candidate_meets_policy(
                 candidate_json,
                 quality_height,
@@ -2997,6 +3400,9 @@ class KidsDatabaseMixin:
             cur = await db.execute(
                 """
                 SELECT i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
+                       i.thumbnail_url,i.language,i.content_kind,i.safety_verdict,
+                       i.safety_checked_at,i.safety_policy_version,
+                       i.safety_input_hash,i.age_suitability_json,
                        s.kind AS _source_kind,s.reference AS _source_reference,
                        s.title AS _source_title,s.state AS _source_state,
                        s.safety_verdict AS _source_safety_verdict,
@@ -3016,30 +3422,11 @@ class KidsDatabaseMixin:
             cols = [d[0] for d in cur.description] if row else []
         if not row:
             return None
-        result = dict(zip(cols, row))
-        source = {
-            "kind": result.pop("_source_kind", None),
-            "reference": result.pop("_source_reference", None),
-            "title": result.pop("_source_title", None),
-            "state": result.pop("_source_state", None),
-            "safety_verdict": result.pop("_source_safety_verdict", None),
-            "language": result.pop("_source_language", None),
-            "age_suitability_json": result.pop(
-                "_source_age_suitability_json",
-                None,
-            ),
-        }
-        item = {
-            "state": "approved",
-            "video_id": result["video_id"],
-            "title": result["title"],
-            "channel_id": result["channel_id"],
-            "channel_title": result["channel_title"],
-        }
-        if not (
-            _catalog_item_is_authorized(item, source)
-            and _source_is_authorized_for_profile(source, profile)
-        ):
+        result, source, _ = _catalog_row_context(row, cols)
+        item = result.copy()
+        item["id"] = item.pop("item_id")
+        item["state"] = "approved"
+        if not self.kids_item_is_authorized(item, source, profile):
             return None
         return {"item_id": result["item_id"], "video_id": result["video_id"]}
 

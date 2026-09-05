@@ -17,11 +17,13 @@ import websockets
 from ..config import Settings
 from ..db import Database, utc_now_iso
 from .blocklists import BlocklistService
-from .kids_catalog import _source_is_authorized_for_profile
+from .kids_catalog import (
+    _source_is_authorized_for_profile,
+    normalize_age_suitability,
+)
 from .kids_classifier import (
     KidsClassificationError,
     OpenCodexKidsClassifier,
-    normalize_age_suitability,
 )
 from .kids_database import _kids_channel_avatar_is_proxyable
 from .judge import JudgeService
@@ -1128,12 +1130,9 @@ async def ingest_once(
         ):
             report.channels_screened += 1
             if not evidence:
-                decision = {
-                    "verdict": "UNCERTAIN",
-                    "language": "unknown",
-                    "content_kind": "unknown",
-                    "reason": "No usable channel video samples were available",
-                }
+                decision = _uncertain_channel_decision(
+                    "No usable channel video samples were available"
+                )
             else:
                 metadata = {
                     "kind": "channel",
@@ -1146,19 +1145,9 @@ async def ingest_once(
                 try:
                     decision = await classifier.classify(metadata)
                 except KidsClassificationError:
-                    decision = {
-                        "verdict": "UNCERTAIN",
-                        "language": "unknown",
-                        "content_kind": "unknown",
-                        "reason": "OpenCodex unavailable",
-                    }
+                    decision = _uncertain_channel_decision("OpenCodex unavailable")
                 except Exception:
-                    decision = {
-                        "verdict": "UNCERTAIN",
-                        "language": "unknown",
-                        "content_kind": "unknown",
-                        "reason": "classifier failure",
-                    }
+                    decision = _uncertain_channel_decision("classifier failure")
             updated_source, normalized = await apply_channel_classification(
                 db,
                 source,
