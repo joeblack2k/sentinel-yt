@@ -493,8 +493,8 @@
           </td>
         </tr>
         <tr id="editorial-row-{{ item.id }}" class="editorial-row" style="display:none; background:#f8fafc; border-bottom: 2px solid #cbd5e1;">
-          <td colspan="6" style="padding:12px 18px;">
-            <div id="editorial-box-{{ item.id }}" class="editorial-box" data-item-id="{{ item.id }}">
+          <td colspan="6" style="padding:10px 8px; box-sizing:border-box;">
+            <div id="editorial-box-{{ item.id }}" class="editorial-box" data-item-id="{{ item.id }}" style="width:100%; max-width:calc(100vw - 64px); box-sizing:border-box;">
               <div class="editorial-loading muted" style="font-size:13px;">Classificatie laden...</div>
             </div>
           </td>
@@ -802,6 +802,11 @@ applyQuickSourcesFilters();
       }
 
       row.style.display = 'table-row';
+      const wrap = row.closest('.table-wrap');
+      if (wrap) {
+        wrap.scrollLeft = 0;
+      }
+      row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       box.innerHTML = '<div class="editorial-loading muted" style="font-size:13px;">Classificatie laden...</div>';
 
       try {
@@ -832,7 +837,7 @@ applyQuickSourcesFilters();
     }
 
     box.innerHTML = `
-      <form class="editorial-form" data-item-id="${itemId}" style="display:flex; flex-direction:column; gap:12px;">
+      <form class="editorial-form" data-item-id="${itemId}" style="display:flex; flex-direction:column; gap:12px; width:100%; box-sizing:border-box;">
         <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
           <div style="display:flex; align-items:center; gap:8px;">
             <strong style="font-size:14.5px; font-weight:700; color:#13232f;">Redactionele Classificatie</strong>
@@ -840,10 +845,10 @@ applyQuickSourcesFilters();
           </div>
           <span class="editorial-status-msg" style="font-size:13.5px; font-weight:500;"></span>
         </div>
-        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:14px; align-items:start;">
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap:12px; align-items:start; width:100%; box-sizing:border-box;">
           <div>
             <label for="editorial-audience-${itemId}" style="display:block; font-size:13.5px; font-weight:600; margin-bottom:4px; color:#334155;">Doelgroep</label>
-            <select id="editorial-audience-${itemId}" name="target_audience" style="width:100%; padding:7px 10px; font-size:14px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1d2a32;">
+            <select id="editorial-audience-${itemId}" name="target_audience" style="width:100%; padding:7px 10px; font-size:14px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1d2a32; box-sizing:border-box;">
               <option value="preschool" ${targetAudience === 'preschool' ? 'selected' : ''}>Peuter / Kleuter (preschool)</option>
               <option value="school_age" ${targetAudience === 'school_age' ? 'selected' : ''}>Schoolkind (school_age)</option>
               <option value="mixed" ${targetAudience === 'mixed' ? 'selected' : ''}>Gemengd (mixed)</option>
@@ -852,7 +857,7 @@ applyQuickSourcesFilters();
           </div>
           <div>
             <label for="editorial-category-${itemId}" style="display:block; font-size:13.5px; font-weight:600; margin-bottom:4px; color:#334155;">Categorie</label>
-            <select id="editorial-category-${itemId}" name="category" style="width:100%; padding:7px 10px; font-size:14px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1d2a32;">
+            <select id="editorial-category-${itemId}" name="category" style="width:100%; padding:7px 10px; font-size:14px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1d2a32; box-sizing:border-box;">
               <option value="lego_build" ${category === 'lego_build' ? 'selected' : ''}>LEGO Bouwen (lego_build)</option>
               <option value="lego_other" ${category === 'lego_other' ? 'selected' : ''}>LEGO Overig (lego_other)</option>
               <option value="pokemon" ${category === 'pokemon' ? 'selected' : ''}>Pokémon (pokemon)</option>
@@ -866,7 +871,7 @@ applyQuickSourcesFilters();
           </div>
           <div style="grid-column: 1 / -1;">
             <label for="editorial-reason-${itemId}" style="display:block; font-size:13.5px; font-weight:600; margin-bottom:4px; color:#334155;">Toelichting / Reden</label>
-            <input type="text" id="editorial-reason-${itemId}" name="reason" value="${escapeHTML(reason)}" maxlength="1000" placeholder="Waarom deze classificatie?" required style="width:100%; padding:7px 10px; font-size:14px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1d2a32;">
+            <input type="text" id="editorial-reason-${itemId}" name="reason" value="${escapeHTML(reason)}" maxlength="1000" placeholder="Waarom deze classificatie?" required style="width:100%; padding:7px 10px; font-size:14px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#1d2a32; box-sizing:border-box;">
           </div>
         </div>
         <div style="display:flex; gap:10px; align-items:center; margin-top:4px;">
