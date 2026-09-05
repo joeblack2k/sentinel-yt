@@ -112,6 +112,7 @@
         <option value="approved">Approved</option>
         <option value="blocked">Blocked</option>
         <option value="revoked">Revoked</option>
+        <option value="discarded">Discarded</option>
         <option value="unknown">Unknown</option>
       </select>
     </div>
@@ -182,6 +183,7 @@
             data-reference="{{ (source.reference or '')|lower }}"
             data-kind="{{ source.kind|lower }}"
             data-state="{{ source.state|lower }}"
+            data-discarded="{{ 'true' if source.discard_reason else 'false' }}"
             data-verdict="{{ (source.safety_verdict or 'UNCERTAIN')|upper }}"
             data-profiles="{{ (source.profile_slugs or [])|join(',')|lower }}"
             data-samples="{{ source.safety_sample_count or 0 }}"
@@ -318,7 +320,10 @@
             </div>
           </td>
           <td class="state">
-            {% if source.state == 'approved' %}
+            {% if source.discard_reason %}
+              <span class="badge badge-revoked">Discarded</span>
+              <div class="muted discard-reason" style="font-size:11.5px; margin-top:2px; line-height:1.25;">{{ source.discard_reason }}</div>
+            {% elif source.state == 'approved' %}
               <span class="badge badge-approved">Approved</span>
             {% elif source.state == 'revoked' %}
               <span class="badge badge-revoked">Revoked</span>
@@ -345,8 +350,16 @@
                   <button type="button" class="btn-revoke" data-source-id="{{ source.id }}" data-state="revoked" title="Revoke and remove from Kids feed">
                     Revoke (Unsave)
                   </button>
+                {% endif %}
+                {% if not source.discard_reason %}
+                  <button type="button" class="btn-revoke btn-discard" data-source-id="{{ source.id }}" data-discard-type="language" title="Discard permanently due to unwanted language">
+                    Discard (Language)
+                  </button>
+                  <button type="button" class="btn-revoke btn-discard" data-source-id="{{ source.id }}" data-discard-type="interest" title="Discard permanently due to unwanted topic/interest">
+                    Discard (Interest)
+                  </button>
                 {% else %}
-                  <span class="muted" style="font-size:12px;">Revoked</span>
+                  <span class="muted" style="font-size:12px;">Discarded</span>
                 {% endif %}
               </div>
             {% endif %}
@@ -566,11 +579,17 @@ posterDialog.addEventListener('close', () => {
 });
 posterAutoButton.addEventListener('click', () => savePoster(null));
 
-async function changeState(url, state) {
+async function changeState(url, state, reason = null) {
+  const payload = {
+    state,
+    actor: 'parent-ui',
+    reason: reason || `Parent UI state transition to ${state}`,
+    correlation_id: correlation()
+  };
   const response = await fetch(url, {
     method: 'PATCH',
-    headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
-    body: JSON.stringify({state, actor: 'parent-ui', reason: `Parent UI state transition to ${state}`, correlation_id: correlation()})
+    headers: {'Content-Type': 'application/json', 'X-Correlation-ID': payload.correlation_id},
+    body: JSON.stringify(payload)
   });
   if (!response.ok) throw new Error(await response.text());
   location.reload();
@@ -692,7 +711,7 @@ document.querySelectorAll('.source-prof-cb').forEach((checkbox) => {
   });
 });
 
-document.querySelectorAll('.btn-revoke').forEach((button) => {
+document.querySelectorAll('.btn-revoke:not(.btn-discard)').forEach((button) => {
   button.addEventListener('click', async () => {
     const sourceId = button.dataset.sourceId;
     if (!sourceId) return;
@@ -708,6 +727,8 @@ document.querySelectorAll('.btn-revoke').forEach((button) => {
     }
   });
 });
+
+{% include "_discard_actions.html" %}
 
 // Filter & Sort Logic with URL Query Params synchronization
 function applyFilters() {
@@ -738,11 +759,21 @@ function applyFilters() {
     const rRef = row.dataset.reference || '';
     const rKind = row.dataset.kind || '';
     const rState = row.dataset.state || '';
+    const rDiscarded = row.dataset.discarded === 'true';
     const rVerdict = row.dataset.verdict || '';
     const rProfiles = (row.dataset.profiles || '').split(',');
 
     const matchSearch = !search || rTitle.includes(search) || rRef.includes(search);
-    const matchState = (state === 'all') || (rState === state);
+    let matchState = false;
+    if (state === 'all') {
+      matchState = !rDiscarded;
+    } else if (state === 'discarded') {
+      matchState = rDiscarded;
+    } else if (state === 'revoked') {
+      matchState = (rState === 'revoked' && !rDiscarded);
+    } else {
+      matchState = (rState === state);
+    }
     const matchVerdict = (verdict === 'all') ||
       (verdict === 'BLOCK' ? (rVerdict === 'BLOCK' || rVerdict === 'UNSAFE') : (rVerdict === verdict));
     const matchProfile = (profile === 'all') || rProfiles.includes(profile.toLowerCase());

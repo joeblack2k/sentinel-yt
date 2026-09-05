@@ -287,6 +287,7 @@
         <option value="approved">Approved</option>
         <option value="blocked">Blocked</option>
         <option value="revoked">Revoked</option>
+        <option value="discarded">Discarded</option>
         <option value="unknown">Unknown</option>
       </select>
     </div>
@@ -308,7 +309,8 @@
       </thead>
       <tbody id="kids-sources">
         {% for source in sources if sources is defined %}
-        <tr class="source-item-row" data-id="{{ source.id }}" data-title="{{ (source.title or '')|lower }}" data-ref="{{ (source.reference or '')|lower }}" data-state="{{ source.state|lower }}">
+        {% set is_system_source = source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
+        <tr class="source-item-row" data-id="{{ source.id }}" data-title="{{ (source.title or '')|lower }}" data-ref="{{ (source.reference or '')|lower }}" data-state="{{ source.state|lower }}" data-discarded="{{ 'true' if source.discard_reason else 'false' }}">
           <td>
             <div class="channel-avatar">
               {% if source.avatar_url %}
@@ -334,7 +336,7 @@
             </div>
           </td>
           <td>
-            {% if source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
+            {% if is_system_source %}
               <span class="muted" style="font-size:12px;">System ingest source</span>
             {% else %}
             <div class="profile-assignment-group" data-source-id="{{ source.id }}">
@@ -387,7 +389,10 @@
             </div>
           </td>
           <td class="state">
-            {% if source.state == 'approved' %}
+            {% if source.discard_reason %}
+              <span class="badge badge-revoked">Discarded</span>
+              <div class="muted discard-reason" style="font-size:11.5px; margin-top:2px; line-height:1.25;">{{ source.discard_reason }}</div>
+            {% elif source.state == 'approved' %}
               <span class="badge badge-approved">Approved</span>
             {% elif source.state == 'revoked' %}
               <span class="badge badge-revoked">Revoked</span>
@@ -398,12 +403,20 @@
             {% endif %}
           </td>
           <td style="text-align:right;">
-            {% if source.reference == '__youtube_kids_home__' or source.reference.startswith('__') %}
+            {% if is_system_source %}
               <span class="muted" style="font-size:12px;">-</span>
-            {% elif source.state != 'revoked' %}
-              <button type="button" class="btn-revoke" data-source-id="{{ source.id }}" data-state="revoked" title="Revoke access (removes from Kids app)">Revoke (Unsave)</button>
             {% else %}
-              <span class="muted" style="font-size:12px;">Revoked</span>
+              <div class="source-actions">
+                {% if source.state != 'revoked' %}
+                <button type="button" class="btn-revoke" data-source-id="{{ source.id }}" data-state="revoked" title="Revoke access (removes from Kids app)">Revoke (Unsave)</button>
+                {% endif %}
+                {% if not source.discard_reason %}
+                <button type="button" class="btn-revoke btn-discard" data-source-id="{{ source.id }}" data-discard-type="language" title="Discard permanently due to unwanted language">Discard (Language)</button>
+                <button type="button" class="btn-revoke btn-discard" data-source-id="{{ source.id }}" data-discard-type="interest" title="Discard permanently due to unwanted topic/interest">Discard (Interest)</button>
+                {% else %}
+              <span class="muted" style="font-size:12px;">Discarded</span>
+                {% endif %}
+              </div>
             {% endif %}
           </td>
         </tr>
@@ -552,11 +565,17 @@
 const statusNode = document.getElementById('kids-source-status');
 const correlation = () => `kids-ui-${Date.now()}`;
 
-async function changeState(url, state) {
+async function changeState(url, state, reason = null) {
+  const payload = {
+    state,
+    actor: 'parent-ui',
+    reason: reason || `Kids UI ${state}`,
+    correlation_id: correlation()
+  };
   const response = await fetch(url, {
     method: 'PATCH',
-    headers: {'Content-Type': 'application/json', 'X-Correlation-ID': correlation()},
-    body: JSON.stringify({state, actor: 'parent-ui', reason: `Kids UI ${state}`, correlation_id: correlation()})
+    headers: {'Content-Type': 'application/json', 'X-Correlation-ID': payload.correlation_id},
+    body: JSON.stringify(payload)
   });
   if (!response.ok) throw new Error(await response.text());
   location.reload();
@@ -633,7 +652,7 @@ document.querySelectorAll('.source-prof-cb').forEach((checkbox) => {
   });
 });
 
-document.querySelectorAll('[data-state]').forEach((button) => {
+document.querySelectorAll('button[data-state]:not(.btn-discard)').forEach((button) => {
   button.addEventListener('click', async () => {
     const row = button.closest('tr');
     const sourceId = button.dataset.sourceId || row?.dataset.id;
@@ -650,6 +669,8 @@ document.querySelectorAll('[data-state]').forEach((button) => {
     }
   });
 });
+
+{% include "_discard_actions.html" %}
 
 document.querySelectorAll('.avatar-upload').forEach(input => {
   input.addEventListener('change', async (e) => {
@@ -724,25 +745,35 @@ document.getElementById('quick-resolve-status')?.addEventListener('change', (e) 
 });
 
 // Client-side filtering for Quick Sources Table
-document.getElementById('quick-sources-search')?.addEventListener('input', (e) => {
-  const q = e.target.value.toLowerCase().trim();
+function applyQuickSourcesFilters() {
+  const q = (document.getElementById('quick-sources-search')?.value || '').toLowerCase().trim();
   const state = document.getElementById('quick-sources-state')?.value || 'all';
   document.querySelectorAll('#kids-sources tr.source-item-row').forEach(row => {
-    const matchQ = !q || (row.dataset.title || '').includes(q) || (row.dataset.ref || '').includes(q);
-    const matchS = state === 'all' || (state === 'candidate' ? (row.dataset.state === 'candidate' || row.dataset.state === 'pending') : row.dataset.state === state);
-    row.style.display = (matchQ && matchS) ? '' : 'none';
-  });
-});
+    const rTitle = row.dataset.title || '';
+    const rRef = row.dataset.ref || '';
+    const rState = row.dataset.state || '';
+    const rDiscarded = row.dataset.discarded === 'true';
 
-document.getElementById('quick-sources-state')?.addEventListener('change', (e) => {
-  const state = e.target.value;
-  const q = (document.getElementById('quick-sources-search')?.value || '').toLowerCase().trim();
-  document.querySelectorAll('#kids-sources tr.source-item-row').forEach(row => {
-    const matchQ = !q || (row.dataset.title || '').includes(q) || (row.dataset.ref || '').includes(q);
-    const matchS = state === 'all' || (state === 'candidate' ? (row.dataset.state === 'candidate' || row.dataset.state === 'pending') : row.dataset.state === state);
+    const matchQ = !q || rTitle.includes(q) || rRef.includes(q);
+    let matchS = false;
+    if (state === 'all') {
+      matchS = !rDiscarded;
+    } else if (state === 'discarded') {
+      matchS = rDiscarded;
+    } else if (state === 'revoked') {
+      matchS = (rState === 'revoked' && !rDiscarded);
+    } else if (state === 'candidate') {
+      matchS = (rState === 'candidate' || rState === 'pending');
+    } else {
+      matchS = (rState === state);
+    }
     row.style.display = (matchQ && matchS) ? '' : 'none';
   });
-});
+}
+
+document.getElementById('quick-sources-search')?.addEventListener('input', applyQuickSourcesFilters);
+document.getElementById('quick-sources-state')?.addEventListener('change', applyQuickSourcesFilters);
+applyQuickSourcesFilters();
 
   const escapeHTML = (str) => String(str).replace(/[&<>'"]/g, tag => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'

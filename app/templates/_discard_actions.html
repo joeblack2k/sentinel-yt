@@ -1,0 +1,21 @@
+document.querySelectorAll('.btn-discard').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const sourceId = button.dataset.sourceId;
+    const discardType = button.dataset.discardType;
+    if (!sourceId || !discardType) return;
+    const typeLabel = discardType === 'language' ? 'unwanted language' : 'unwanted interest';
+    if (!confirm(`Discard this source permanently for ${typeLabel}?`)) return;
+    button.disabled = true;
+    button.textContent = 'Discarding...';
+    const reason = discardType === 'language'
+      ? 'parent_discard:language: Parent discarded source due to language'
+      : 'parent_discard:interest: Parent discarded source due to interest';
+    try {
+      await changeState(`/api/kids/sources/${sourceId}/state`, 'revoked', reason);
+    } catch (error) {
+      alert(`Could not discard source: ${error.message || error}`);
+      button.disabled = false;
+      button.textContent = discardType === 'language' ? 'Discard (Language)' : 'Discard (Interest)';
+    }
+  });
+});

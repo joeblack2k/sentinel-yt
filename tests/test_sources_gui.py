@@ -109,3 +109,64 @@ def test_sources_template_includes_classification_controls_and_api_contract():
     assert 'correlation_id: correlationID' in html
     assert 'language: lang' in html
     assert 'content_kind: kind' in html
+
+
+def test_sources_template_renders_discarded_state_and_parent_discard_actions():
+    discard_source = source_row(
+        10,
+        "UC-discarded",
+        title="Discarded Channel",
+        state="revoked",
+        safety_verdict="SAFE",
+        safety_reason="Channel content passed safety policy v1",
+        discard_reason="parent_discard:language: Parent discarded source due to language",
+    )
+    retained_revoked = source_row(
+        11,
+        "UC-retained",
+        title="Retained Age-Only Channel",
+        state="revoked",
+        safety_verdict="SAFE",
+        safety_reason="Safe but unsaved by parent",
+        discard_reason="",
+    )
+    active_approved = source_row(
+        12,
+        "UC-approved",
+        title="Approved Channel",
+        state="approved",
+        safety_verdict="SAFE",
+    )
+
+    html = render_sources([discard_source, retained_revoked, active_approved])
+
+    # Discarded state badge and parent discard reason visible separately from safety verdict/reason
+    assert 'data-discarded="true"' in html
+    assert 'class="badge badge-revoked">Discarded</span>' in html
+    assert 'parent_discard:language: Parent discarded source due to language' in html
+    assert 'Channel content passed safety policy v1' in html
+    assert 'class="badge badge-safe">SAFE</span>' in html
+
+    # Filter dropdown contains explicit 'discarded' option
+    assert '<option value="discarded">Discarded</option>' in html
+
+    # Existing-row discard buttons by language and interest
+    assert 'data-discard-type="language"' in html
+    assert 'data-discard-type="interest"' in html
+    assert 'Discard (Language)' in html
+    assert 'Discard (Interest)' in html
+
+    # JS contract: PATCH /api/kids/sources/${sourceId}/state with state revoked, actor parent-ui, parent_discard:
+    assert 'await changeState(`/api/kids/sources/${sourceId}/state`, \'revoked\', reason);' in html
+    assert "parent_discard:language: Parent discarded source due to language" in html
+    assert "parent_discard:interest: Parent discarded source due to interest" in html
+    assert "actor: 'parent-ui'" in html
+    assert "state," in html
+
+    # Default filter hides data-discarded rows when state is 'all'
+    assert "if (state === 'all') {" in html
+    assert "matchState = !rDiscarded;" in html
+    assert "} else if (state === 'discarded') {" in html
+    assert "matchState = rDiscarded;" in html
+    assert "} else if (state === 'revoked') {" in html
+    assert "matchState = (rState === 'revoked' && !rDiscarded);" in html
