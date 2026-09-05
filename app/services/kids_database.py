@@ -1898,7 +1898,7 @@ class KidsDatabaseMixin:
                        s.language AS _source_language,
                        s.content_kind AS _source_content_kind,
                        s.age_suitability_json AS _source_age_suitability_json,
-                       b.status AS _backlog_status,b.candidate_json AS _candidate_json,
+                       b.candidate_json AS _candidate_json,
                        b.quality_height AS _backlog_quality_height,
                        b.expires_at AS _backlog_expires_at
                 FROM catalog_sources s
@@ -1926,14 +1926,12 @@ class KidsDatabaseMixin:
             source_id = item.pop("_display_source_id")
             avatar_url = item.pop("_display_avatar_url")
             poster_item_id = item.pop("_display_poster_item_id")
-            backlog_status = item.pop("_backlog_status")
             backlog_quality_height = item.pop("_backlog_quality_height")
             backlog_expires_at = item.pop("_backlog_expires_at")
             if not _kids_channel_avatar_is_proxyable(avatar_url):
                 continue
             if (
                 not self.kids_item_is_authorized(item, source, profile)
-                or backlog_status != "ready"
                 or not _stored_candidate_meets_policy(
                     candidate_json,
                     backlog_quality_height,
@@ -2077,28 +2075,26 @@ class KidsDatabaseMixin:
                 if not rows:
                     break
                 for row in rows:
-                    values = dict(zip(columns, row))
-                    item, source, _ = _catalog_row_context(row, columns)
-                    item["id"] = item.pop("item_id")
+                    item, source, candidate_json = _catalog_row_context(row, columns)
                     if not (
                         self.kids_item_is_authorized(item, source, profile)
                         and _stored_candidate_meets_policy(
-                            values["_candidate_json"],
-                            values["_backlog_quality_height"],
+                            candidate_json,
+                            item["_backlog_quality_height"],
                             minimum_quality_height,
                         )
                     ):
                         continue
                     page.append(
                         {
-                            "asset_id": values["asset_id"],
-                            "ordinal": int(values["ordinal"]),
-                            "thumbnail_url": values["thumbnail_url"] or "",
+                            "asset_id": item["asset_id"],
+                            "ordinal": int(item["ordinal"]),
+                            "thumbnail_url": item["thumbnail_url"] or "",
                             "duration_seconds": max(
-                                0, int(values["duration_seconds"] or 0)
+                                0, int(item["duration_seconds"] or 0)
                             ),
                             "visual_category": str(
-                                values["visual_category"] or "general"
+                                item["visual_category"] or "general"
                             ),
                         }
                     )
@@ -2174,17 +2170,15 @@ class KidsDatabaseMixin:
             columns = [description[0] for description in cur.description] if row else []
         if not row:
             return None
-        values = dict(zip(columns, row))
-        item, source, _ = _catalog_row_context(row, columns)
-        item["id"] = item.pop("item_id")
+        values, source, candidate_json = _catalog_row_context(row, columns)
         if require_current_authorization and (
-            not self.kids_item_is_authorized(item, source, values["profile"])
+            not self.kids_item_is_authorized(values, source, values["profile"])
             or values["_backlog_status"] != "ready"
             or _parse_utc(values["_backlog_expires_at"]) is None
             or _parse_utc(values["_backlog_expires_at"])
             <= now + timedelta(seconds=max(0, int(minimum_remaining_seconds)))
             or not _stored_candidate_meets_policy(
-                values["_candidate_json"],
+                candidate_json,
                 values["_backlog_quality_height"],
                 minimum_quality_height,
             )
@@ -2206,7 +2200,7 @@ class KidsDatabaseMixin:
             "thumbnail_url": values["thumbnail_url"] or "",
             "duration_seconds": max(0, int(values["duration_seconds"] or 0)),
             "visual_category": str(values["visual_category"] or "general"),
-            "candidate_json": values["_candidate_json"],
+            "candidate_json": candidate_json,
             "quality_height": values["_backlog_quality_height"],
             "codec": values["codec"] or "",
         }
@@ -2263,7 +2257,7 @@ class KidsDatabaseMixin:
                 await db.rollback()
                 return {"status": "not_found"}
             columns = [description[0] for description in cur.description]
-            values = dict(zip(columns, row))
+            values, source, _ = _catalog_row_context(row, columns)
             session_expiry = _parse_utc(values["expires_at"])
             if session_expiry is None or session_expiry <= now:
                 await db.rollback()
@@ -2285,10 +2279,8 @@ class KidsDatabaseMixin:
             }:
                 await db.rollback()
                 return {"status": "kill_switch"}
-            item, source, _ = _catalog_row_context(row, columns)
-            item["id"] = item.pop("item_id")
             if not (
-                self.kids_item_is_authorized(item, source, values["profile"])
+                self.kids_item_is_authorized(values, source, values["profile"])
             ):
                 await db.rollback()
                 return {"status": "ineligible"}
@@ -2389,7 +2381,7 @@ class KidsDatabaseMixin:
                 await db.rollback()
                 return None
             columns = [description[0] for description in cur.description]
-            values = dict(zip(columns, row))
+            values, source, _ = _catalog_row_context(row, columns)
             if values["state"] != "active":
                 await db.rollback()
                 return None
@@ -2427,8 +2419,7 @@ class KidsDatabaseMixin:
                 )
                 await db.commit()
                 return None
-            item, source, _ = _catalog_row_context(row, columns)
-            item["id"] = item.pop("item_id")
+            item = values.copy()
             item["state"] = item.pop("item_state")
             try:
                 candidate = json.loads(str(values["candidate_json"]))
@@ -2567,12 +2558,11 @@ class KidsDatabaseMixin:
         self,
         *,
         limit: int,
-        now: datetime | None = None,
     ) -> list[dict[str, Any]]:
         bounded = max(0, min(int(limit), 20))
         if bounded == 0:
             return []
-        current = now or datetime.now(timezone.utc)
+        current = datetime.now(timezone.utc)
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
                 """
@@ -2626,13 +2616,7 @@ class KidsDatabaseMixin:
                 now=current,
             ):
                 continue
-            result.append(
-                {
-                    "item": item,
-                    "source": source,
-                    "profiles": profiles,
-                }
-            )
+            result.append({"item": item, "source": source})
             if len(result) >= bounded:
                 break
         return result
@@ -2640,19 +2624,11 @@ class KidsDatabaseMixin:
     async def kids_item_assessment_budget_take(
         self,
         daily_limit: int,
-        *,
-        now: datetime | None = None,
     ) -> bool:
         limit = max(0, min(int(daily_limit), 200))
         if limit == 0:
             return False
-        current = now or datetime.now(timezone.utc)
-        current = (
-            current.replace(tzinfo=timezone.utc)
-            if current.tzinfo is None
-            else current.astimezone(timezone.utc)
-        )
-        day = current.date().isoformat()
+        day = datetime.now(timezone.utc).date().isoformat()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("BEGIN IMMEDIATE")
             day_row = await (
@@ -2740,12 +2716,11 @@ class KidsDatabaseMixin:
             rows = await cur.fetchall()
             columns = [d[0] for d in cur.description]
             for row in rows:
-                values = dict(zip(columns, row))
-                item_id = values["item_id"]
-                status = values["status"]
-                quality_height = values["_backlog_quality_height"]
-                resolved_at = _parse_utc(values["_backlog_resolved_at"])
                 item, source, candidate_json = _catalog_row_context(row, columns)
+                item_id = item["item_id"]
+                status = item["status"]
+                quality_height = item["_backlog_quality_height"]
+                resolved_at = _parse_utc(item["_backlog_resolved_at"])
                 profiles = _profile_slugs(item.pop("_profile_slugs", ""))
                 if not _catalog_item_is_authorized(item, source):
                     await db.execute(
@@ -2771,19 +2746,11 @@ class KidsDatabaseMixin:
                         """,
                         (now, item_id),
                     )
-                elif (
-                    not _catalog_item_safety_is_current(
-                        item,
-                        policy_version=self.kids_item_policy_version,
-                        recheck_seconds=self.kids_item_recheck_seconds,
-                        now=now_datetime,
-                    )
-                    or not self.kids_item_is_authorized_for_any_profile(
+                elif not self.kids_item_is_authorized_for_any_profile(
                         item,
                         source,
                         profiles,
-                    )
-                ):
+                    ):
                     await db.execute(
                         """
                         UPDATE relay_leases
@@ -2830,7 +2797,7 @@ class KidsDatabaseMixin:
                             """,
                             (now, item_id),
                         )
-                    elif _parse_utc(values["_backlog_expires_at"]) != usable_until:
+                    elif _parse_utc(item["_backlog_expires_at"]) != usable_until:
                         await db.execute(
                             """
                             UPDATE kids_resolve_backlog
@@ -3369,7 +3336,6 @@ class KidsDatabaseMixin:
             return None
         result, source, _ = _catalog_row_context(row, cols)
         item = result.copy()
-        item["id"] = item.pop("item_id")
         item["state"] = "approved"
         candidate_json = result["candidate_json"]
         quality_height = result["quality_height"]
@@ -3424,7 +3390,6 @@ class KidsDatabaseMixin:
             return None
         result, source, _ = _catalog_row_context(row, cols)
         item = result.copy()
-        item["id"] = item.pop("item_id")
         item["state"] = "approved"
         if not self.kids_item_is_authorized(item, source, profile):
             return None
