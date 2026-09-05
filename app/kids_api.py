@@ -742,7 +742,13 @@ async def kids_shelves(
     response_shelves: list[dict[str, Any]] = []
     base_url = str(request.base_url).rstrip("/")
     for shelf in active_shelf_ids:
-        shelf_items = shelf_items_by_name[shelf]
+        shelf_items = _kids_shelf_round_robin(
+            shelf_items_by_name[shelf],
+            profile=profile_row["slug"],
+            shelf=shelf,
+            day=day,
+            limit=len(shelf_items_by_name[shelf]),
+        )
         ordered_item_ids = [int(item["id"]) for item in shelf_items]
         page: dict[str, Any] = {"items": [], "next_offset": None}
         session_id: str | None = None

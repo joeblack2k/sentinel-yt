@@ -490,6 +490,7 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
             "/v1/kids/playback-sessions",
             json={"asset_id": first["shelves"][0]["items"][0]["id"]},
         ).status_code == 200
+        original_tails = {}
         for shelf in first["shelves"]:
             next_page = client.get(
                 "/v1/kids/feed",
@@ -498,11 +499,11 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
             assert next_page.status_code == 200
             assert len(next_page.json()["items"]) == 3
             assert next_page.json()["next_cursor"] is None
+            original_tails[shelf["id"]] = next_page.json()["items"]
             assert first_assets.isdisjoint(
                 item["id"] for item in next_page.json()["items"]
             )
 
-        first_ids = _asset_item_ids(db_path, first)
         day = datetime.now(timezone.utc).date().isoformat()
         initial_rows = _daily_rows(db_path, day, "noah")
         assert len(initial_rows) == 4 * 72
@@ -519,8 +520,14 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
         second_response = client.get("/v1/kids/shelves", params={"profile": "noah"})
         assert second_response.status_code == 200
         second_ids = _asset_item_ids(db_path, second_response.json())
-        assert second_ids == first_ids
-        tail_item_ids = []
+        current_rows = _daily_rows(db_path, day, "noah")
+        occupied = {row for row in initial_rows if row[2] is not None}
+        assert occupied.issubset(current_rows)
+        for shelf in first["shelves"]:
+            old_tail = client.get("/v1/kids/feed", params={"cursor": shelf["next_cursor"], "limit": KIDS_SHELF_PAGE_SIZE})
+            assert old_tail.status_code == 200
+            assert old_tail.json()["items"] == original_tails[shelf["id"]]
+        tail_item_ids = [item_id for ids in second_ids.values() for item_id in ids]
         for shelf in second_response.json()["shelves"]:
             if shelf["next_cursor"]:
                 tail = client.get(
@@ -545,6 +552,47 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
             KIDS_PROFILE_SHELF_IDS["felix"][:-1]
         )
         assert all(len(shelf["items"]) == KIDS_SHELF_PAGE_SIZE for shelf in felix["shelves"])
+
+
+def test_new_session_interleaves_sources_in_existing_daily_slots(tmp_path, monkeypatch):
+    db_path = tmp_path / "sentinel.db"
+    db = asyncio.run(_seed_shelf_catalog(db_path, [
+        (index, "en", "entertainment", ["noah"]) for index in range(1, 19)
+    ]))
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE catalog_items SET source_id=1, "
+            "channel_id=(SELECT reference FROM catalog_sources WHERE id=1), "
+            "channel_title=(SELECT title FROM catalog_sources WHERE id=1) WHERE id<=16"
+        )
+    for item_id in range(2, 17):
+        asyncio.run(db.catalog_item_safety_update(
+            item_id, verdict="SAFE", language="en", content_kind="entertainment",
+            age_suitability={"2": "UNSUITABLE", "6": "SUITABLE"},
+            reason="Reassess changed fixture metadata", actor="test",
+            correlation_id=f"regroup-{item_id}", sync_backlog=False,
+        ))
+    day = datetime.now(timezone.utc).date().isoformat()
+    asyncio.run(db.kids_daily_library_get_or_create(
+        day=day, profile="noah", shelf_limit=72,
+        proposed_item_ids={"fun-en": list(range(1, 19))},
+    ))
+    occupied = {row for row in _daily_rows(db_path, day, "noah") if row[2] is not None}
+    module = _load_app(tmp_path, monkeypatch)
+    _mock_upstream(monkeypatch, module, [])
+    with TestClient(module.app) as client:
+        response = client.get("/v1/kids/shelves", params={"profile": "noah"})
+        assert response.status_code == 200
+        shelf = next(s for s in response.json()["shelves"] if s["id"] == "fun-en")
+        ids = _asset_item_ids(db_path, response.json())["fun-en"]
+        assert 17 in ids[:3] and 18 in ids[:3]
+        assert shelf["next_cursor"] is not None
+        tail = client.get("/v1/kids/feed", params={"cursor": shelf["next_cursor"]})
+        assert tail.status_code == 200
+        ids += _item_ids_for_assets(db_path, [item["id"] for item in tail.json()["items"]])
+        assert len(ids) == len(set(ids)) == 18
+        assert set(ids) == set(range(1, 19))
+        assert occupied.issubset(_daily_rows(db_path, day, "noah"))
 
 
 def test_again_history_is_profile_bound_and_accepts_started(tmp_path, monkeypatch):
@@ -613,6 +661,8 @@ def test_shelves_fill_initially_empty_daily_slots_without_reordering(tmp_path, m
         assert {
             item_id for shelf_ids in filled_ids.values() for item_id in shelf_ids
         } == {item["id"] for item in first_items}
+        day = datetime.now(timezone.utc).date().isoformat()
+        occupied = [row for row in _daily_rows(db_path, day, "noah") if row[2] is not None]
 
         asyncio.run(
             _ready_item(
@@ -626,7 +676,8 @@ def test_shelves_fill_initially_empty_daily_slots_without_reordering(tmp_path, m
         extended = client.get("/v1/kids/shelves", params={"profile": "noah"})
         extended_ids = _asset_item_ids(db_path, extended.json())
         for shelf, item_ids in filled_ids.items():
-            assert extended_ids[shelf][: len(item_ids)] == item_ids
+            assert set(item_ids).issubset(extended_ids[shelf])
+        assert set(occupied).issubset(_daily_rows(db_path, day, "noah"))
         assert sum(map(len, extended_ids.values())) == sum(
             map(len, filled_ids.values())
         ) + 1
