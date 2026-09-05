@@ -228,10 +228,7 @@ def normalize_candidate(
     audio_url = candidate.get("audio_url")
     if not isinstance(media_url, str) or not isinstance(audio_url, str) or media_url == audio_url:
         return None
-    expiries = [_signed_stream_expiry(media_url), _signed_stream_expiry(audio_url)]
     required = {"media_url", "audio_url", "quality_height", "codec", "video_headers", "audio_headers"}
-    if any(expiry is None for expiry in expiries):
-        return None
     resolved_datetime = datetime.fromisoformat(resolved_at)
     earliest_expiry = candidate_expiry(
         candidate,
