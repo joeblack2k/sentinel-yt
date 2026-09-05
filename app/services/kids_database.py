@@ -3005,7 +3005,6 @@ class KidsDatabaseMixin:
         quality_height: int,
         codec: str,
         resolved_at: str,
-        expires_at: str,
         minimum_quality_height: int = 720,
     ) -> None:
         if (

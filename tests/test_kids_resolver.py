@@ -253,7 +253,6 @@ async def persist_ready_candidate(db: Database, item_id: int, quality_height: in
         quality_height=quality_height,
         codec="avc1.640028",
         resolved_at=payload["resolved_at"],
-        expires_at=payload["expires_at"],
     )
 
 
@@ -455,7 +454,6 @@ async def test_resolver_queue_persists_success_expiry_backoff_and_bounded_claim(
         quality_height=720,
         codec="avc1.4d401f",
         resolved_at=datetime.now(timezone.utc).isoformat(),
-        expires_at=expires_at,
     )
     assert (await db.kids_resolve_summary())["fresh_ready"] == 1
     await db.kids_resolve_failure(item_id=claimed[1]["item_id"], reason_code="backend_unavailable")
@@ -492,7 +490,6 @@ async def test_backlog_sync_extends_legacy_ready_expiry_within_signed_limits(tmp
         quality_height=720,
         codec="avc1.4d401f",
         resolved_at=resolved_at.isoformat(),
-        expires_at=signed_expiry.isoformat(),
     )
     with sqlite3.connect(db.db_path) as connection:
         connection.execute(
@@ -909,7 +906,6 @@ async def test_kids_resolve_success_rejects_quality_below_configured_minimum(tmp
         quality_height=720,
         codec="avc1.640028",
         resolved_at=payload["resolved_at"],
-        expires_at=payload["expires_at"],
         minimum_quality_height=1080,
     )
 
@@ -1007,7 +1003,6 @@ async def test_feed_orders_newly_probed_candidates_first(tmp_path):
         quality_height=1080,
         codec="avc1.640028",
         resolved_at=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
-        expires_at=expiry.isoformat(),
     )
     await db.kids_resolve_success(
         item_id=newer["id"],
@@ -1015,7 +1010,6 @@ async def test_feed_orders_newly_probed_candidates_first(tmp_path):
         quality_height=1080,
         codec="avc1.640028",
         resolved_at=datetime.now(timezone.utc).isoformat(),
-        expires_at=expiry.isoformat(),
     )
 
     feed = await db.kids_eligible_feed_list(300)

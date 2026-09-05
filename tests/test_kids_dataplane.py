@@ -121,7 +121,6 @@ async def seed_catalog(db_path, *, qualities=(720, 1080)) -> Database:
             quality_height=quality,
             codec="avc1.640028",
             resolved_at=datetime.now(timezone.utc).isoformat(),
-            expires_at=expires_at.isoformat(),
         )
     return db
 
@@ -208,7 +207,6 @@ async def add_ready_source_item(
         quality_height=720,
         codec="avc1.640028",
         resolved_at=datetime.now(timezone.utc).isoformat(),
-        expires_at=expires_at.isoformat(),
     )
     return source, item
 

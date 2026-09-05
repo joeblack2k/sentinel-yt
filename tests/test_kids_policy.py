@@ -116,7 +116,6 @@ async def persist_ready(db: Database, item_id: int, quality_height: int = 1080) 
         quality_height=quality_height,
         codec="avc1.640028",
         resolved_at=resolved_at,
-        expires_at=expires_at,
     )
 
 

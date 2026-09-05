@@ -526,7 +526,6 @@ async def run_once(
                     quality_height=quality_height,
                     codec=str(candidate["codec"]),
                     resolved_at=_iso(resolved_at),
-                    expires_at=_iso(expires_at),
                     minimum_quality_height=settings.kids_resolver_min_quality_height,
                 )
                 counts["ready"] += 1

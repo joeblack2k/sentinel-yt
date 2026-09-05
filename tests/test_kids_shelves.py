@@ -298,7 +298,6 @@ async def _ready_item(
         quality_height=720,
         codec="avc1.640028",
         resolved_at=datetime.now(timezone.utc).isoformat(),
-        expires_at=expires_at.isoformat(),
     )
     return source, item
 
