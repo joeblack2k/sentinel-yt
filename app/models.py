@@ -12,6 +12,15 @@ class ControlStateRequest(BaseModel):
 CatalogState = Literal["candidate", "approved", "blocked", "revoked", "unknown"]
 
 
+class KidsEditorialRequest(BaseModel):
+    target_audience: Literal["preschool", "school_age", "mixed", "unknown"]
+    category: Literal[
+        "lego_build", "lego_other", "pokemon", "science_nature",
+        "language_learning", "stories_animation", "music", "other", "unknown",
+    ]
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 class CatalogSourceRequest(BaseModel):
     kind: Literal["channel", "playlist"]
     reference: str = Field(min_length=1, max_length=256)

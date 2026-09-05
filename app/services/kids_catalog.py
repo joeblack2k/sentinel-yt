@@ -18,7 +18,7 @@ KIDS_ITEM_VERDICTS = frozenset({"SAFE", "UNSAFE", "UNCERTAIN"})
 KIDS_ITEM_CONTENT_KINDS = frozenset({"learning", "entertainment", "mixed", "unknown"})
 KIDS_AGE_SUITABILITY_VALUES = frozenset({"SUITABLE", "UNSUITABLE", "UNCERTAIN"})
 KIDS_PROFILE_SHELF_IDS = {
-    "noah": ("new", "learning-nl", "fun-en", "fun-nl", "again"),
+    "noah": ("new", "lego-build", "learning-nl", "fun-en", "fun-nl", "again"),
     "felix": ("new", "learning-nl", "fun-nl", "again"),
 }
 KIDS_SHELF_TARGET = 72
@@ -344,18 +344,40 @@ def _kids_shelf_language_rank(shelf: str, language: str) -> int | None:
     return None
 
 
+def _kids_editorial_allowed(item: dict[str, Any], profile: str, shelf: str | None) -> bool:
+    if shelf == "again":
+        return True
+    try:
+        editorial = json.loads(item.get("editorial_classification_json") or "null")
+    except (ValueError, TypeError):
+        editorial = None
+    if not isinstance(editorial, dict) or editorial.get("input_hash") != catalog_item_input_hash(item):
+        editorial = {}
+    if profile == "noah" and editorial.get("target_audience") == "preschool":
+        return False
+    if shelf == "lego-build":
+        return profile == "noah" and editorial.get("category") == "lego_build"
+    if profile == "noah" and editorial.get("category") == "lego_build":
+        return False
+    return True
+
+
 def _kids_shelf_candidate_allowed(
     item: dict[str, Any],
     *,
     profile: str,
     shelf: str,
 ) -> bool:
+    if not _kids_editorial_allowed(item, profile, shelf):
+        return False
     raw_completed_at = item.get("_profile_completed_at")
     completed_at = _parse_utc(raw_completed_at)
     if shelf == "again":
         return completed_at is not None
     if str(raw_completed_at or "").strip():
         return False
+    if shelf == "lego-build":
+        return True
     if shelf == "new":
         language = str(item.get("_source_language") or "unknown").strip().lower()
         return (

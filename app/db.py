@@ -365,6 +365,8 @@ class Database(KidsDatabaseMixin):
                 await db.execute(
                     "ALTER TABLE catalog_items ADD COLUMN age_suitability_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            if "editorial_classification_json" not in item_cols:
+                await db.execute("ALTER TABLE catalog_items ADD COLUMN editorial_classification_json TEXT")
             # Existing catalog rows predate source identity fields; backfill them
             # from the already-approved source instead of invalidating the catalog.
             await db.execute(

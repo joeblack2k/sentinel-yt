@@ -473,6 +473,11 @@ async def run_once(
                     sync_backlog=False,
                 )
                 counts["assessed"] += 1
+                if decision.get("editorial") is not None:
+                    await db.kids_item_editorial(
+                        int(item["id"]), decision["editorial"],
+                        input_hash=catalog_item_input_hash(item),
+                    )
                 if decision["verdict"] == "UNCERTAIN":
                     counts["assessment_uncertain"] += 1
                 await db.set_setting("kids_resolver_classifier_status", "ready")

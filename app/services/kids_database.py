@@ -16,6 +16,7 @@ from .kids_catalog import (
     KIDS_ITEM_VERDICTS,
     KIDS_HOME_SOURCE_REFERENCE,
     _kids_shelf_candidate_allowed,
+    _kids_editorial_allowed,
     _catalog_item_is_authorized_for_profile,
     _catalog_item_is_authorized,
     _catalog_item_safety_is_current,
@@ -1525,6 +1526,43 @@ class KidsDatabaseMixin:
             cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in rows]
 
+    async def kids_item_editorial(self, item_id: int, classification: dict[str, Any] | None = None, *, input_hash: str | None = None) -> dict[str, Any] | None:
+        from ..models import KidsEditorialRequest
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute("SELECT * FROM catalog_items WHERE id=?", (item_id,))).fetchone()
+            if row is None:
+                return None
+            if classification is None:
+                return {"item_id": item_id, "classification": json.loads(row["editorial_classification_json"] or "null")}
+            value = KidsEditorialRequest.model_validate(classification).model_dump()
+            current_hash = catalog_item_input_hash(dict(row))
+            previous = json.loads(row["editorial_classification_json"] or "null")
+            if input_hash is not None and (
+                input_hash != current_hash or isinstance(previous, dict) and previous.get("origin") == "parent"
+            ):
+                return {"item_id": item_id, "classification": previous}
+            origin = "classifier" if input_hash is not None else "parent"
+            value.update(origin=origin, input_hash=current_hash, version="kids-editorial-v1")
+            if value == previous:
+                return {"item_id": item_id, "classification": previous}
+            await db.execute("UPDATE catalog_items SET editorial_classification_json=? WHERE id=?", (json.dumps(value), item_id))
+            await db.execute(
+                "UPDATE kids_daily_library SET item_id=NULL "
+                "WHERE item_id=? AND profile='noah' AND shelf!='again'",
+                (item_id,),
+            )
+            revision = await self._catalog_revision(db)
+            await db.execute(
+                "INSERT INTO kids_audit_events(event,entity_type,entity_id,actor,reason,revision,correlation_id,created_at) "
+                "VALUES('editorial_classification','item',?,?,?,?,?,?)",
+                (str(item_id), origin, value["reason"], revision, "", utc_now_iso()),
+            )
+            await db.commit()
+        return {"item_id": item_id, "classification": value}
+
     async def catalog_items_list(self, minimum_remaining_seconds: int = 300) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             cur = await db.execute(
@@ -1691,6 +1729,19 @@ class KidsDatabaseMixin:
                     int(item_id) if item_id is not None else None
                 )
             existing_owner: dict[int, str] = {}
+            relevant_ids = proposed_ids | {
+                item_id for slots in existing.values() for item_id in slots.values()
+                if item_id is not None
+            }
+            editorial_items: dict[int, dict[str, Any]] = {}
+            if relevant_ids:
+                cur = await db.execute(
+                    "SELECT id,video_id,title,channel_id,channel_title,thumbnail_url,editorial_classification_json "
+                    "FROM catalog_items WHERE id IN (" + ",".join("?" for _ in relevant_ids) + ")",
+                    tuple(relevant_ids),
+                )
+                columns = [column[0] for column in cur.description]
+                editorial_items = {int(row[0]): dict(zip(columns, row)) for row in await cur.fetchall()}
             completed_ids = {
                 int(row[0]) for row in await (await db.execute(
                     "SELECT DISTINCT i.id FROM catalog_items i "
@@ -1703,7 +1754,7 @@ class KidsDatabaseMixin:
                 if shelf == "again":
                     continue
                 for item_id in existing.get(shelf, {}).values():
-                    if item_id is not None:
+                    if item_id is not None and _kids_editorial_allowed(editorial_items.get(item_id, {}), profile, shelf):
                         existing_owner.setdefault(item_id, shelf)
             result: dict[str, list[int | None]] = {}
             used_item_ids = set(existing_owner) | set(proposed.get("again", []))
@@ -1722,6 +1773,7 @@ class KidsDatabaseMixin:
                     for item_id in proposed[shelf]
                     if item_id not in used_item_ids
                     and (shelf == "again" or item_id not in completed_ids)
+                    and _kids_editorial_allowed(editorial_items.get(item_id, {}), profile, shelf)
                 )
                 for ordinal, item_id in enumerate(values):
                     if item_id is not None:
@@ -2091,6 +2143,7 @@ class KidsDatabaseMixin:
                 cur = await db.execute(
                     """
                     SELECT f.asset_id,f.ordinal,
+                           i.editorial_classification_json,
                            i.id AS item_id,i.video_id,i.title,i.channel_id,i.channel_title,
                            i.thumbnail_url,i.duration_seconds,i.visual_category,i.state,
                            i.language,i.content_kind,i.safety_verdict,
@@ -2145,6 +2198,7 @@ class KidsDatabaseMixin:
                     item, source, candidate_json = _catalog_row_context(row, columns)
                     if not (
                         self.kids_item_is_authorized(item, source, profile)
+                        and _kids_editorial_allowed(item, profile, session_shelf_id)
                         and _stored_candidate_meets_policy(
                             candidate_json,
                             item["_backlog_quality_height"],

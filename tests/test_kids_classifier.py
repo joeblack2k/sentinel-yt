@@ -6,6 +6,29 @@ from app.services.kids_classifier import KidsClassificationError, OpenCodexKidsC
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("category", ["lego_build", "invented"])
+async def test_video_editorial_is_validated_without_extra_requests(category):
+    requests = []
+    def handler(request):
+        requests.append(request.url.path)
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "gemini-kids"}]})
+        result = {
+            "verdict": "SAFE", "language": "en", "content_kind": "learning",
+            "age_suitability": {"2": "UNSUITABLE", "6": "SUITABLE"},
+            "reason": "building", "confidence": 95,
+            "editorial": {"target_audience": "school_age", "category": category, "reason": "Physical assembly"},
+        }
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(result)}}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        classifier = OpenCodexKidsClassifier(base_url="http://test/v1", model="gemini-kids", client=client)
+        result = await classifier.classify({"kind": "video"})
+    assert result["verdict"] == "SAFE"
+    assert ("editorial" in result) == (category == "lego_build")
+    assert requests == ["/v1/models", "/v1/chat/completions"]
+
+
+@pytest.mark.asyncio
 async def test_classifier_checks_exact_model_and_returns_strict_safe_result():
     model_checks = 0
 

@@ -95,7 +95,7 @@ def test_shelf_languages_kinds_and_source_diversity():
         now=datetime(2026, 9, 5, tzinfo=timezone.utc),
     )
 
-    assert set(noah) == {"new", "learning-nl", "fun-en", "fun-nl"}
+    assert set(noah) == {"new", "lego-build", "learning-nl", "fun-en", "fun-nl"}
     assert set(felix) == {"new", "learning-nl", "fun-nl"}
     assert all(
         item["_source_language"] in {"nl", "mixed"}
@@ -112,7 +112,8 @@ def test_shelf_languages_kinds_and_source_diversity():
         and item["_source_content_kind"] in {"entertainment", "mixed"}
         for item in noah["fun-nl"] + felix["fun-nl"]
     )
-    assert all(selected for selected in noah.values())
+    assert not noah["lego-build"]
+    assert all(selected for shelf, selected in noah.items() if shelf != "lego-build")
     assert all(selected for selected in felix.values())
     assert 19 not in {
         item["id"]
@@ -467,6 +468,7 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
         )
         assert [shelf["icon"] for shelf in first["shelves"]] == [
             "sparkles",
+            "square.stack.3d.up.fill",
             "book.fill",
             "globe",
             "star.fill",
@@ -489,6 +491,7 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
             len(shelf["items"]) == KIDS_SHELF_PAGE_SIZE
             and shelf["next_cursor"]
             for shelf in first["shelves"]
+            if shelf["id"] != "lego-build"
         )
         first_assets = {
             item["id"]
@@ -508,6 +511,9 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
         ).status_code == 200
         original_tails = {}
         for shelf in first["shelves"]:
+            if shelf["next_cursor"] is None:
+                assert not shelf["items"]
+                continue
             next_page = client.get(
                 "/v1/kids/feed",
                 params={"cursor": shelf["next_cursor"], "limit": KIDS_SHELF_PAGE_SIZE},
@@ -522,7 +528,7 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
 
         day = datetime.now(timezone.utc).date().isoformat()
         initial_rows = _daily_rows(db_path, day, "noah")
-        assert len(initial_rows) == 4 * 72
+        assert len(initial_rows) == 5 * 72
 
         _, new_item = asyncio.run(
             _ready_item(
@@ -540,6 +546,8 @@ def test_shelves_api_is_array_opaque_stable_and_profile_sized(tmp_path, monkeypa
         occupied = {row for row in initial_rows if row[2] is not None}
         assert occupied.issubset(current_rows)
         for shelf in first["shelves"]:
+            if shelf["next_cursor"] is None:
+                continue
             old_tail = client.get("/v1/kids/feed", params={"cursor": shelf["next_cursor"], "limit": KIDS_SHELF_PAGE_SIZE})
             assert old_tail.status_code == 200
             assert old_tail.json()["items"] == original_tails[shelf["id"]]
@@ -696,6 +704,116 @@ def test_completion_moves_existing_daily_owner_to_again(tmp_path, monkeypatch):
         ).json())
         assert "again" not in felix
         assert item["id"] in {i for ids in felix.values() for i in ids}
+
+
+def test_editorial_update_preserves_safety_and_is_audited(tmp_path, monkeypatch):
+    db_path = tmp_path / "sentinel.db"
+    db = asyncio.run(_seed_shelf_catalog(db_path, [(1, "nl", "learning", ["noah"])]))
+    item = asyncio.run(db.catalog_items_list())[0]
+    module = _load_app(tmp_path, monkeypatch)
+    _mock_upstream(monkeypatch, module, [])
+    path = f"/api/kids/items/{item['id']}/editorial"
+    with TestClient(module.app) as client:
+        assert client.get(path).json()["classification"] is None
+        from app.services.kids_catalog import catalog_item_input_hash
+        suggested = {"target_audience": "school_age", "category": "lego_build", "reason": "Physical assembly"}
+        stale = asyncio.run(db.kids_item_editorial(item["id"], suggested, input_hash="obsolete"))
+        assert stale["classification"] is None
+        automatic_first = asyncio.run(db.kids_item_editorial(
+            item["id"], suggested, input_hash=catalog_item_input_hash(item),
+        ))
+        assert automatic_first["classification"]["origin"] == "classifier"
+        response = client.put(path, json={"target_audience": "school_age", "category": "lego_build", "reason": "Real LEGO assembly"})
+        assert response.status_code == 200
+        assert response.json()["classification"]["origin"] == "parent"
+        assert client.get(path).json() == response.json()
+        revision = asyncio.run(db.catalog_revision())
+        assert client.put(path, json={"target_audience": "school_age", "category": "lego_build", "reason": "Real LEGO assembly"}).json() == response.json()
+        assert asyncio.run(db.catalog_revision()) == revision
+        automatic = asyncio.run(db.kids_item_editorial(
+            item["id"], {"target_audience": "preschool", "category": "music", "reason": "Automatic suggestion"},
+            input_hash=catalog_item_input_hash(item),
+        ))
+        assert automatic == response.json()
+        assert client.put(path, json={"target_audience": "school_age", "category": "invented", "reason": "invalid"}).status_code == 422
+        assert client.get("/api/kids/items/999999/editorial").status_code == 404
+    updated = asyncio.run(db.catalog_items_list())[0]
+    for field in ("state", "safety_verdict", "safety_input_hash", "safety_policy_version"):
+        assert updated[field] == item[field]
+    events = asyncio.run(db.kids_audit_events(20))
+    assert any(event["event"] == "editorial_classification" for event in events)
+
+
+def test_editorial_change_relocates_existing_daily_video(tmp_path, monkeypatch):
+    db_path = tmp_path / "sentinel.db"
+    db = asyncio.run(_seed_shelf_catalog(db_path, [(1, "nl", "learning", ["noah", "felix"])]))
+    item = asyncio.run(db.catalog_items_list())[0]
+    module = _load_app(tmp_path, monkeypatch)
+    _mock_upstream(monkeypatch, module, [])
+    with TestClient(module.app) as client:
+        before = _asset_item_ids(db_path, client.get("/v1/kids/shelves?profile=noah").json())
+        assert item["id"] in {i for ids in before.values() for i in ids}
+        assert before["lego-build"] == []
+        path = f"/api/kids/items/{item['id']}/editorial"
+        assert client.put(path, json={"target_audience": "school_age", "category": "lego_build", "reason": "Physical LEGO assembly"}).status_code == 200
+        stale = asyncio.run(db.kids_daily_library_get_or_create(
+            day=datetime.now(timezone.utc).date().isoformat(), profile="noah",
+            shelf_limit=72, proposed_item_ids=before,
+        ))
+        assert all(item["id"] not in ids for ids in stale.values())
+        after = _asset_item_ids(db_path, client.get("/v1/kids/shelves?profile=noah").json())
+        assert after["lego-build"] == [item["id"]]
+        assert all(item["id"] not in ids for shelf, ids in after.items() if shelf != "lego-build")
+        assert client.put(path, json={"target_audience": "preschool", "category": "stories_animation", "reason": "Preschool story"}).status_code == 200
+        noah = _asset_item_ids(db_path, client.get("/v1/kids/shelves?profile=noah").json())
+        felix = _asset_item_ids(db_path, client.get("/v1/kids/shelves?profile=felix").json())
+        assert all(item["id"] not in ids for ids in noah.values())
+        assert item["id"] in {i for ids in felix.values() for i in ids}
+
+
+def test_stale_editorial_does_not_reserve_lego_daily_slot(tmp_path):
+    db_path = tmp_path / "sentinel.db"
+    db = asyncio.run(_seed_shelf_catalog(db_path, [(1, "nl", "learning", ["noah"])]))
+    item = asyncio.run(db.catalog_items_list())[0]
+    asyncio.run(db.kids_item_editorial(item["id"], {
+        "target_audience": "school_age", "category": "lego_build", "reason": "Assembly",
+    }))
+    args = {"day": "2026-09-05", "profile": "noah", "shelf_limit": 72}
+    first = asyncio.run(db.kids_daily_library_get_or_create(
+        **args, proposed_item_ids={"lego-build": [item["id"]], "learning-nl": []},
+    ))
+    assert item["id"] in first["lego-build"]
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("UPDATE catalog_items SET title=? WHERE id=?", ("Changed metadata", item["id"]))
+    after = asyncio.run(db.kids_daily_library_get_or_create(
+        **args, proposed_item_ids={"lego-build": [], "learning-nl": [item["id"]]},
+    ))
+    assert item["id"] not in after["lego-build"]
+    assert item["id"] in after["learning-nl"]
+
+
+def test_editorial_shelf_membership_is_video_specific():
+    from app.services.kids_catalog import _kids_shelf_candidate_allowed, catalog_item_input_hash
+
+    item = _item(1, 1, language="nl", content_kind="learning")
+    def classify(audience, category):
+        item["editorial_classification_json"] = json.dumps({
+            "target_audience": audience, "category": category,
+            "input_hash": catalog_item_input_hash(item),
+        })
+    classify("preschool", "stories_animation")
+    assert not _kids_shelf_candidate_allowed(item, profile="noah", shelf="new")
+    assert _kids_shelf_candidate_allowed(item, profile="felix", shelf="new")
+    classify("school_age", "lego_build")
+    assert _kids_shelf_candidate_allowed(item, profile="noah", shelf="lego-build")
+    assert not _kids_shelf_candidate_allowed(item, profile="felix", shelf="lego-build")
+    classify("school_age", "lego_other")
+    assert not _kids_shelf_candidate_allowed(item, profile="noah", shelf="lego-build")
+    item["editorial_classification_json"] = None
+    assert not _kids_shelf_candidate_allowed(item, profile="noah", shelf="lego-build")
+    classify("school_age", "lego_build")
+    item["title"] = "Changed metadata"
+    assert not _kids_shelf_candidate_allowed(item, profile="noah", shelf="lego-build")
 
 
 def test_shelves_fill_initially_empty_daily_slots_without_reordering(tmp_path, monkeypatch):

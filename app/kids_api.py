@@ -22,6 +22,7 @@ from .models import (
     CatalogSourceRequest,
     CatalogTransitionRequest,
     KidsDataplaneEventRequest,
+    KidsEditorialRequest,
     KidsKillSwitchRequest,
     KidsPlaybackSessionRequest,
     KidsSourceClassificationRequest,
@@ -49,6 +50,7 @@ KIDS_PROFILE_AVATAR_MAX_BYTES = 10 * 1024 * 1024
 KIDS_CHANNEL_ART_MAX_BYTES = 8 * 1024 * 1024
 KIDS_SHELF_ICONS = {
     "new": "sparkles",
+    "lego-build": "square.stack.3d.up.fill",
     "learning-nl": "book.fill",
     "fun-en": "globe",
     "fun-nl": "star.fill",
@@ -1510,6 +1512,22 @@ async def api_kids_set_kill_switch(payload: KidsKillSwitchRequest, request: Requ
 @router.get("/api/kids/audit")
 async def api_kids_audit(request: Request, limit: int = 100) -> dict[str, Any]:
     return {"events": await request.app.state.runtime.db.kids_audit_events(limit)}
+
+
+@router.get("/api/kids/items/{item_id}/editorial")
+async def kids_item_editorial_get(item_id: int, request: Request) -> dict[str, Any]:
+    result = await request.app.state.runtime.db.kids_item_editorial(item_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return result
+
+
+@router.put("/api/kids/items/{item_id}/editorial")
+async def kids_item_editorial_put(item_id: int, payload: KidsEditorialRequest, request: Request) -> dict[str, Any]:
+    result = await request.app.state.runtime.db.kids_item_editorial(item_id, payload.model_dump())
+    if result is None:
+        raise HTTPException(status_code=404, detail="catalog item not found")
+    return result
 
 
 @router.post("/api/kids/watch-events", status_code=202)

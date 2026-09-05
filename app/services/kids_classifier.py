@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .kids_catalog import normalize_age_suitability
+from ..models import KidsEditorialRequest
 
 
 class KidsClassificationError(RuntimeError):
@@ -95,6 +96,13 @@ class OpenCodexKidsClassifier:
                                 "use UNSUITABLE for clearly inappropriate developmental level and UNCERTAIN when "
                                 "evidence is incomplete. "
                                 "Choose UNCERTAIN whenever evidence is incomplete."
+                                " For kind video, also return editorial with target_audience "
+                                "preschool, school_age, mixed, or unknown; category lego_build, lego_other, "
+                                "pokemon, science_nature, language_learning, stories_animation, music, other, or unknown; "
+                                "and a short reason. Noah is nearly seven: toddler songs/basic preschool stories "
+                                "are preschool even when safe. lego_build requires real hands/people physically "
+                                "assembling LEGO as the main activity, not cartoons, gameplay, stop motion, "
+                                "unboxing alone or finished-model showcases. Use unknown without adequate evidence."
                             ),
                         },
                         {"role": "user", "content": user_content},
@@ -122,7 +130,14 @@ class OpenCodexKidsClassifier:
             confidence = int(result.get("confidence", 0))
             if not 0 <= confidence <= 100:
                 raise ValueError("invalid confidence")
+            editorial = None
+            if metadata.get("kind") == "video" and result.get("editorial") is not None:
+                try:
+                    editorial = KidsEditorialRequest.model_validate(result["editorial"]).model_dump()
+                except ValueError:
+                    pass
             return {
+                **({"editorial": editorial} if editorial is not None else {}),
                 "verdict": verdict,
                 "language": language,
                 "content_kind": content_kind,
